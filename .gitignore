@@ -1,0 +1,8 @@
+.env
+.env.oc
+db/
+__pycache__/
+*.pyc
+.venv/
+.omo/
+.codegraph
