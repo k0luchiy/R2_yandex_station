@@ -38,7 +38,16 @@ from typing import Final
 
 import httpx
 
-from core.backends.base import ChatMessage, Choice, ToolCall, ToolSchema
+from core.backends.base import (
+    BackendError,
+    BackendErrorEnvelope,
+    BackendProtocolError,
+    BackendStatusError,
+    ChatMessage,
+    Choice,
+    ToolCall,
+    ToolSchema,
+)
 from core.backends.config_loader import BackendSpec
 
 __all__ = [
@@ -63,32 +72,6 @@ REDACTED: Final = "[redacted]"
 #: `YandexGPTProvider` compared `cfg.yandex_auth_mode.lower() == "iam"`, so that
 #: spelling must keep working or a live deployment silently changes auth scheme.
 IAM_MODES: Final[frozenset[str]] = frozenset({"iam", "iam_token"})
-
-
-class BackendError(Exception):
-    """This backend could not produce a reply, so the caller should fall back.
-
-    `httpx.TimeoutException` is deliberately NOT wrapped: the brain
-    distinguishes it to stop retrying.
-    """
-
-
-class BackendStatusError(BackendError):
-    """The provider answered with a non-2xx status that survived any retry."""
-
-    def __init__(self, backend: str, status_code: int, detail: str = "") -> None:
-        super().__init__(f"backend {backend!r}: HTTP {status_code} ({detail})" if detail else f"backend {backend!r}: HTTP {status_code}")
-        self.backend = backend
-        self.status_code = status_code
-        self.detail = detail
-
-
-class BackendProtocolError(BackendError):
-    """A 2xx body that is not a usable chat-completion response."""
-
-
-class BackendErrorEnvelope(BackendProtocolError):
-    """A 2xx body whose payload is an error envelope rather than a reply (C1)."""
 
 
 def _authorization(spec: BackendSpec) -> str:
