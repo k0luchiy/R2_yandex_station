@@ -5,8 +5,11 @@ import httpx
 
 from app.config import Config
 from core import policies, render
+from core.backends.base import Choice
+from core.backends.config_loader import load_backend_specs
+from core.backends.openai_compatible import BackendError
+from core.backends.registry import build_chain
 from core.memory import Memory
-from core.providers.factory import get_provider
 from core.tools.base import ToolContext
 from core.tools.registry import build_registry
 from core.tools.telegram_tool import send_message
@@ -165,29 +168,35 @@ class Brain:
         await self.memory.append_message(app_id, "assistant", text, self.cfg.max_history)
         return text, False
 
-    async def _call_llm(self, messages: list[dict]):
-        primary = get_provider(self.cfg.llm_provider, self.cfg)
+    async def _call_llm(self, messages: list[dict]) -> Choice:
+        """One LLM call with function calling, walking the configured chain.
+
+        The chain in ``config/backends.json`` replaces the old
+        ``llm_provider``/``fallback_provider`` pair: one backend per entry, in
+        order, and a failure moves to the NEXT backend rather than retrying the
+        same one -- the deadline is per call, so a second attempt on the same
+        host would spend budget this turn no longer has. ``BackendError``
+        (refused, overloaded, malformed body) and ``httpx.HTTPError``
+        (``httpx.TimeoutException`` included) are the two families that mean
+        "try the next one"; anything else is a bug and must surface.
+        """
+        chain, specs = load_backend_specs(self.cfg)
+        backends = build_chain(specs, chain)
+        tools = self.registry.schemas()
         last_error: Exception | None = None
-        for attempt in (1, 2):
-            try:
-                return await primary.chat(
-                    messages,
-                    tools=self.registry.schemas(),
-                    max_tokens=self.cfg.llm_max_tokens,
-                    timeout=self.cfg.llm_timeout,
-                )
-            except Exception as exc:
-                last_error = exc
-                self.logger.warning("primary LLM failed (attempt %d): %r", attempt, exc)
-                if isinstance(exc, httpx.TimeoutException):
-                    break
-        fallback = self.cfg.fallback_provider
-        if fallback and fallback.strip() and fallback.strip().lower() != self.cfg.llm_provider.strip().lower():
-            fb = get_provider(fallback, self.cfg)
-            return await fb.chat(
-                messages,
-                tools=self.registry.schemas(),
-                max_tokens=self.cfg.llm_max_tokens,
-                timeout=self.cfg.llm_timeout,
-            )
+        try:
+            for backend in backends:
+                try:
+                    return await backend.complete(
+                        messages,
+                        tools,
+                        max_tokens=self.cfg.llm_max_tokens,
+                        timeout=self.cfg.llm_timeout,
+                    )
+                except (BackendError, httpx.HTTPError) as exc:
+                    last_error = exc
+                    self.logger.warning("LLM backend %s failed: %r", backend.name, exc)
+        finally:
+            for backend in backends:
+                await backend.aclose()
         raise RuntimeError(f"all LLM providers failed: {last_error!r}")

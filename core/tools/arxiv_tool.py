@@ -4,7 +4,9 @@ from datetime import datetime, timezone
 import httpx
 
 from app.config import Config
-from core.providers.factory import get_provider
+from core.backends.config_loader import load_backend_specs
+from core.backends.openai_compatible import BackendError
+from core.backends.registry import build_chain
 from core.tools.base import ToolContext, ToolResult
 
 SCHEMA = {
@@ -73,10 +75,7 @@ async def arxiv_fetch(query: str, max_results: int = 5, days: int | None = None)
 
 
 async def summarize_entries(cfg: Config, query: str, entries: list[dict]) -> str:
-    provider = get_provider(cfg.llm_provider, cfg)
-    model = None
-    if provider.name == "yandexgpt":
-        model = cfg.yandex_model_big_uri
+    chain, specs = load_backend_specs(cfg)
     body = "\n\n".join(
         f"{i}. {e['title']}\n{e['summary'][:900]}" for i, e in enumerate(entries, 1)
     )
@@ -89,12 +88,23 @@ async def summarize_entries(cfg: Config, query: str, entries: list[dict]) -> str
         {"role": "system", "content": system},
         {"role": "user", "content": f"Тема: {query}\n\nСтатьи:\n{body}"},
     ]
+    # The model now comes from the spec (the `gpt://folder/model` URI for
+    # YandexGPT), which replaces the old `cfg.yandex_model_big_uri` override.
+    backends = build_chain(specs, chain)
     try:
-        choice = await provider.chat(messages, max_tokens=1200, temperature=0.4, timeout=60.0, model=model)
-        if choice.content and choice.content.strip():
-            return choice.content.strip()
-    except Exception:
-        pass
+        for backend in backends:
+            try:
+                choice = await backend.complete(
+                    messages, max_tokens=1200, temperature=0.4, timeout=60.0
+                )
+            except (BackendError, httpx.HTTPError):
+                continue
+            if choice.content and choice.content.strip():
+                return choice.content.strip()
+            break
+    finally:
+        for backend in backends:
+            await backend.aclose()
     return "\n".join(f"• {e['title']} — {e['link']}" for e in entries)
 
 
