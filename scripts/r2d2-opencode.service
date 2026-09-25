@@ -1,0 +1,22 @@
+[Unit]
+Description=R2D2 opencode server (the brain backend for the R2D2 Alice skill)
+Documentation=file:///home/koluchiy/Documents/R2_yandex_station/docs/08-deployment.md
+After=network.target
+# The launcher exits 1 when R2D2_OC_PASSWORD is blank. With an unbounded
+# Restart=always that would reprint the refusal every 3 s forever, so the burst
+# is capped: three refusals in a minute stop the unit and wait for an operator
+# (`systemctl --user reset-failed r2d2-opencode` after fixing .env.oc).
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+WorkingDirectory=/home/koluchiy/r2d2-workspace
+EnvironmentFile=/home/koluchiy/Documents/R2_yandex_station/.env.oc
+Environment=OPENCODE_LOG_LEVEL=warn
+ExecStart=/home/koluchiy/Documents/R2_yandex_station/scripts/opencode_serve.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
