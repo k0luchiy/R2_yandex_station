@@ -146,11 +146,19 @@ def split_model(model: str) -> tuple[str, str]:
     """`(providerID, modelID)` for a configured model string, split on the FIRST `/`.
 
     `opencode/space-bunny-free` -> `("opencode", "space-bunny-free")` and
-    `a/b/c` -> `("a", "b/c")`; a bare id defaults to opencode's own provider,
+    `a/b/c` -> `("a", "b/c")`. A bare id defaults to opencode's own provider,
     because every Zen model in `config/backends.json` is named `<provider>/<id>`.
+
+    A *missing* provider defaults the same way, and that includes the leading
+    `/` of a `"/x"` typo: an empty `providerID` in the turn body is a request the
+    server rejects, and this is the only provider the deployment has, so
+    inferring it is strictly better than shipping `("", "x")` on the wire. The
+    function is total -- no input yields an empty provider.
     """
     provider, separator, model_id = model.partition("/")
-    return (DEFAULT_PROVIDER_ID, provider) if not separator else (provider, model_id)
+    if not separator:
+        return DEFAULT_PROVIDER_ID, provider
+    return provider or DEFAULT_PROVIDER_ID, model_id
 
 
 def required_text(entry: object, key: str, context: str) -> str:
