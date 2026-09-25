@@ -56,7 +56,7 @@ from typing import Final
 import httpx
 
 from app.config import Config
-from core import policies, render, routing
+from core import metrics, policies, render, routing
 from core.async_worker import Worker
 from core.backends.base import Choice
 from core.backends.config_loader import BackendChain, BackendSpec, load_backend_specs
@@ -186,11 +186,13 @@ class Brain:
         return await self.process(body)
 
     async def process(self, body: dict) -> dict:
-        try:
-            text, end = await self._handle(body)
-        except Exception:
-            self.logger.exception("handle failed")
-            text, end = ERROR_TEXT, False
+        with metrics.turn(self.logger) as rec:
+            try:
+                text, end = await self._handle(body)
+            except Exception:
+                self.logger.exception("handle failed")
+                rec.path = metrics.PATH_ERROR
+                text, end = ERROR_TEXT, False
         return render.alice_response(self._speakable(text), end_session=end)
 
     async def _handle(self, body: dict) -> tuple[str, bool]:
@@ -348,6 +350,7 @@ class Brain:
         )
 
     async def _chain_turn(self, app_id: str, command: str, dangerous: bool) -> tuple[str, bool]:
+        rec = metrics.current()
         await self.memory.append_message(app_id, "user", command, self.cfg.max_history)
         history = await self.memory.load_history(app_id)
         messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history]
@@ -362,13 +365,12 @@ class Brain:
                 }
             )
 
-        choice = await self._call_llm(messages)
-        self.logger.info(
-            "llm %s: msgs=%d tools=%s content_len=%d",
-            choice.provider,
-            len(messages),
-            [t.name for t in choice.tool_calls],
-            len(choice.content or ""),
+        choice = await rec.measure(self._call_llm(messages))
+        rec.answered(
+            route=metrics.ROUTE_FALLBACK,
+            model=choice.provider,
+            msgs=len(messages),
+            tools=[t.name for t in choice.tool_calls],
         )
         if choice.tool_calls:
             tool_call = choice.tool_calls[0]
@@ -378,6 +380,7 @@ class Brain:
             if result.tg_send:
                 asyncio.create_task(send_message(self.cfg, result.tg_send))
             if result.is_async and result.job:
+                rec.escalated = True
                 await self.worker.enqueue(result.job)
             if result.needs_confirm and result.pending:
                 await self.memory.set_pending(app_id, result.pending)
