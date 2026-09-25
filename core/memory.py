@@ -143,6 +143,22 @@ class Memory:
             )
             await self._db.commit()
 
+    async def all_pending_ids(self) -> list[str]:
+        """Every application that has a pending action of any kind.
+
+        A feature that owns one kind of row (the opencode permission broker) has to
+        find its rows again after a restart, and the row is its own source of truth:
+        an ask can outlive the session binding it was raised in, and outlive the
+        session on the server. Callers re-read each row with `get_pending` under
+        their own lock, so this returns the population and nothing more.
+        """
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT application_id FROM pending_actions ORDER BY application_id"
+            )
+            rows = await cur.fetchall()
+        return [str(row["application_id"]) for row in rows]
+
     async def create_job(self, params: dict) -> str:
         job_id = uuid.uuid4().hex[:12]
         now = time.time()
