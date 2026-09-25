@@ -1,0 +1,18 @@
+{
+  "chain": ["opencode", "zen", "yandexgpt", "openrouter"],
+  "backends": [
+    {"name": "opencode", "kind": "opencode_session", "base_url": "http://127.0.0.1:4599",
+     "username": "${R2D2_OC_USERNAME}", "password": "${R2D2_OC_PASSWORD}",
+     "voice_agent": "r2d2-voice", "task_agent": "r2d2-agent",
+     "fast_model": "opencode/space-bunny-free", "task_model": "opencode/space-bunny-free",
+     "summarize_model": "opencode/space-bunny-free", "timeout": 3.2},
+    {"name": "zen", "kind": "openai_compatible", "base_url": "https://opencode.ai/zen/v1",
+     "api_key": "${R2D2_ZEN_KEY}", "model": "space-bunny-free", "auth_style": "bearer"},
+    {"name": "openrouter", "kind": "openai_compatible", "base_url": "https://openrouter.ai/api/v1",
+     "api_key": "${OPENROUTER_API_KEY}", "model": "inclusionai/ling-3.0-flash:free", "auth_style": "bearer"},
+    {"name": "yandexgpt", "kind": "openai_compatible",
+     "base_url": "https://llm.api.cloud.yandex.net/foundationModels/v1",
+     "api_key": "${YANDEX_API_KEY}", "model": "gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite-5",
+     "auth_style": "yandex", "auth_mode": "api_key"}
+  ]
+}
