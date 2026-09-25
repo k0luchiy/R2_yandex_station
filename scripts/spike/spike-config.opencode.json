@@ -1,0 +1,47 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "opencode/space-bunny-free",
+  "permission": {
+    "*": "deny",
+    "websearch": "allow",
+    "webfetch": "allow"
+  },
+  "agent": {
+    "spike-deny": {
+      "description": "SPIKE: denies everything. Used to prove agent-scoped permission isolation.",
+      "mode": "primary",
+      "permission": {
+        "*": "deny"
+      }
+    },
+    "spike-ask": {
+      "description": "SPIKE: asks before bash. Used to raise a permission request over SSE.",
+      "mode": "primary",
+      "permission": {
+        "*": "allow",
+        "bash": "ask"
+      }
+    },
+    "spike-voice": {
+      "description": "SPIKE: no tools at all. Voice-like.",
+      "mode": "primary",
+      "tools": {
+        "bash": false,
+        "write": false,
+        "edit": false,
+        "read": false
+      },
+      "permission": {
+        "*": "deny"
+      }
+    },
+    "spike-bashonly": {
+      "description": "SPIKE: every tool denied except bash, which asks. Used to A/B the per-message `tools` key.",
+      "mode": "primary",
+      "permission": {
+        "*": "deny",
+        "bash": "ask"
+      }
+    }
+  }
+}
