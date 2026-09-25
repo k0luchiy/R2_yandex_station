@@ -379,7 +379,7 @@ cwd сервера?
 | `mimo-v2.6-flash-free` | 0.861 | нет | 403 free tier can only be used from within OpenCode |
 | `nemotron-3-ultra-free` | 0.905 | нет | 403 free tier can only be used from within OpenCode |
 | `nemotron-3.5-lightning-free` | 0.824 | нет | 403 free tier can only be used from within OpenCode |
-| `muse-spark-1.3` | 60.04 | нет | не ответил вовсе, обрыв на 60 с |
+| `muse-spark-1.3` | 60.044 | нет | не ответил вовсе, обрыв на таймауте 60 с |
 | `gpt-5.4-nano` | 16.39 | нет | 402 Upstream request failed: Insufficient account funds |
 | `qwen3.8-flash` | 0.972 | нет | 402 Insufficient account funds |
 | `gemini-3.5-flash-lite` | 1.036 | нет | 402 Insufficient account funds |
