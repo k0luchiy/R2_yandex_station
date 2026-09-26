@@ -116,10 +116,20 @@ MODEL: Final = "opencode/space-bunny-free"
 MODEL_ID: Final = "space-bunny-free"
 
 APP_ID: Final = "alice-app-1"
-TG_APP_ID: Final = "tg:4242"
+#: Somebody else's application id. A private skill has one human, so this exists
+#: only to prove that binding one chat to `APP_ID` does not answer a stranger's ask.
+OTHER_APP_ID: Final = "alice-app-2"
 SKILL_ID: Final = "skill-abc"
 USER_ID: Final = "user-xyz"
 CHAT_ID: Final = "4242"
+#: The operator's declaration of WHICH HUMAN the Telegram chat belongs to, in the
+#: form `R2D2_TG_APPLICATION_ID` is read in: one `chat_id=application_id` pair per
+#: chat. The chat is the owner's own, so the pair names the same person their Alice
+#: turns do -- which is the whole point (section 10).
+TG_BINDING: Final = f"{CHAT_ID}={APP_ID}"
+#: A chat this deployment does not bind: the "second chat id" the identity model
+#: has to stay honest about, rather than mint an id for.
+OTHER_CHAT_ID: Final = "7777"
 QUESTION: Final = "что такое квантовые точки"
 #: A word the fake treats as "this needs the agent", not as content.
 DIGEST: Final = "собери digest статей про RAG"
@@ -416,6 +426,7 @@ def install(
         "alice_user_id": USER_ID,
         "telegram_bot_token": TELEGRAM_TOKEN,
         "telegram_chat_id": CHAT_ID,
+        "r2d2_tg_application_id": TG_BINDING,
         "backends_path": str(backends),
         "db_path": str(tmp_path / "sessions.db"),
         "r2d2_workspace": str(workspace),
@@ -1209,3 +1220,154 @@ async def test_the_app_package_never_manages_the_server_process() -> None:
     # killing one would put a live server's lifetime inside a webhook's lifetime
     assert not forbidden, f"{sorted(forbidden)} in {sorted(sources)}"
     assert not [name for name, text in sources.items() if "subprocess" in text]
+
+
+# ---------------------------------------------------------------------------
+# 10. One human, one identity -- and it is declared, not derived
+# ---------------------------------------------------------------------------
+#
+# The permission handshake is a two-channel conversation: opencode stops a turn, R2D2
+# asks in Telegram, the human answers in Telegram. Both halves are keyed by
+# `application_id`, and the broker reads the pending row with the id of the turn
+# that RAISED the ask. So the answer can only arrive if a Telegram turn carries
+# the same id as the Alice turn of the same person.
+#
+# It used not to: `/tg/webhook` built `f"tg:{chat_id}"` for itself. A `да` therefore
+# found no pending row, was answered as an ordinary question, and created a SECOND
+# opencode session for a human who already had one -- see `qa/live-run.md` §4c.
+# The binding is now declared in the environment (`r2d2_tg_application_id`), and an
+# undeclared chat has no identity at all rather than an invented one.
+
+
+async def test_an_alice_turn_and_a_telegram_turn_are_the_same_person(stack: Stack) -> None:
+    # Given a question asked out loud, and then the same person typing it
+    await stack.ask(QUESTION)
+    await stack.say_telegram(QUESTION)
+    # Then exactly one opencode session exists for that human ...
+    assert stack.asked("POST", "/session") == 1
+    assert {entry["title"] for entry in stack.fake.sessions.values()} == {
+        f"r2d2:alice:{APP_ID}"
+    }
+    # ... one binding row, carrying the id the owner's Alice turns already used ...
+    memory: Memory = stack.app.state.memory
+    bindings = await memory.all_oc_sessions()
+    assert [binding.application_id for binding in bindings] == [APP_ID]
+    # ... and both turns went to that one session
+    assert {turn.session_id for turn in stack.turns()} == set(stack.fake.sessions)
+
+
+async def test_a_yes_in_telegram_answers_the_ask_the_alice_turn_raised(stack: Stack) -> None:
+    # Given an ask this person's agent raised on their Alice-side session
+    memory: Memory = stack.app.state.memory
+    store = stack.app.state.route.wiring.store
+    session_id = await store.resolve(APP_ID)
+    await memory.set_pending(
+        APP_ID,
+        {
+            "kind": "opencode_permission",
+            "session_id": session_id,
+            "permission_id": "perm_alice_side",
+            "title": "echo привет",
+            "always": ["echo *"],
+            "requested_at": time.time(),
+        },
+    )
+    # When they answer in the channel they were asked in
+    await stack.say_telegram("да")
+    # Then the one-time approval lands on the server, and only once
+    assert stack.fake.answers() == ["once"]
+    assert stack.fake.permission_answers[0][0] == session_id
+    # And the row is closed, so the same word cannot approve a second time
+    assert await memory.get_pending(APP_ID) is None
+    # And the user was told it was accepted
+    await stack.telegram.wait_for(APPROVED_TEXT)
+
+
+async def test_a_telegram_chat_with_no_declared_identity_answers_nothing_and_says_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serve_in_process: FakeOpencode,
+    telegram: Telegram, caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Given a deployment whose binding names a DIFFERENT chat, so this one has no
+    # identity -- the misconfiguration, not the default
+    install(tmp_path, monkeypatch, r2d2_tg_application_id=f"{OTHER_CHAT_ID}={APP_ID}")
+    fake = serve_in_process
+    app = build_app()
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://r2d2.test"
+        ) as http:
+            body = json_of(
+                await http.post(
+                    "/tg/webhook", json={"message": {"chat": {"id": int(CHAT_ID)}, "text": "да"}}
+                )
+            )
+            memory: Memory = app.state.memory
+            bindings = await memory.all_oc_sessions()
+    # Then Telegram is answered, so the webhook does not retry
+    assert body == {"ok": True}
+    # And the operator is told WHICH variable to set -- silently dropping a message
+    # is the failure mode this replaces
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert [w for w in warnings if main_module.TG_APPLICATION_ID_VAR in w], warnings
+    # And no identity was invented: no session, no binding, and nothing was created
+    assert fake.sessions == {}
+    assert bindings == []
+
+
+async def test_the_binding_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Given the operator's declaration in the environment, not in a test double
+    monkeypatch.setenv("R2D2_TG_APPLICATION_ID", f"{CHAT_ID}={APP_ID}")
+    # When the configuration is loaded the way the app loads it
+    cfg = Config.load()
+    # Then the chat resolves to that human's application id
+    assert cfg.r2d2_tg_application_id == f"{CHAT_ID}={APP_ID}"
+    assert main_module.tg_application_id(cfg, int(CHAT_ID)) == APP_ID
+    # And a chat the declaration does not name resolves to nothing at all
+    assert main_module.tg_application_id(cfg, int(OTHER_CHAT_ID)) is None
+
+
+async def test_a_yes_answers_the_ask_of_this_person_and_nobody_elses(stack: Stack) -> None:
+    # Given an ask pending under ANOTHER application id, and one of this person's
+    memory: Memory = stack.app.state.memory
+    session_id = await stack.app.state.route.wiring.store.resolve(APP_ID)
+    for app_id, permission_id in ((OTHER_APP_ID, "perm_stranger"), (APP_ID, "perm_own")):
+        await memory.set_pending(
+            app_id,
+            {
+                "kind": "opencode_permission",
+                "session_id": session_id if app_id == APP_ID else "ses_stranger",
+                "permission_id": permission_id,
+                "title": "echo привет",
+                "always": ["echo *"],
+                "requested_at": time.time(),
+            },
+        )
+    # When this person answers in Telegram
+    await stack.say_telegram("да")
+    # Then their own ask is approved, on their own session, and only that one
+    assert [(s, p, a) for s, p, a in stack.fake.permission_answers] == [
+        (session_id, "perm_own", {"response": "once"})
+    ]
+    # And the other row is untouched, so the binding does not blur identities
+    stranger = await memory.get_pending(OTHER_APP_ID)
+    assert stranger is not None and stranger["permission_id"] == "perm_stranger"
+
+
+def test_a_second_chat_is_bound_by_declaration_and_a_mistake_binds_nothing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Given a declaration naming two chats, so a second human is possible
+    cfg = Config(r2d2_tg_application_id=f"{CHAT_ID}={APP_ID}, {OTHER_CHAT_ID}={OTHER_APP_ID}")
+    # When each chat is resolved
+    assert main_module.tg_application_id(cfg, int(CHAT_ID)) == APP_ID
+    assert main_module.tg_application_id(cfg, int(OTHER_CHAT_ID)) == OTHER_APP_ID
+    # Then a chat nobody declared resolves to nothing, and no id is derived from it
+    assert main_module.tg_application_id(cfg, 1) is None
+    # And given a declaration with a token this build cannot read ...
+    broken = Config(r2d2_tg_application_id="alice-main")
+    with caplog.at_level(logging.WARNING, logger="r2d2"):
+        # When the chat it was meant for arrives
+        assert main_module.tg_application_id(broken, int(CHAT_ID)) is None
+    # Then the operator is told WHICH variable holds the mistake
+    assert main_module.TG_APPLICATION_ID_VAR in caplog.text
+    assert "alice-main" in caplog.text

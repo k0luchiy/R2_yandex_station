@@ -60,6 +60,16 @@ class Config:
     r2d2_cli_path: str = "/home/koluchiy/.r2d2/r2d2_do.py"
     r2d2_event_poll_interval: float = 2.0
 
+    # Which human a Telegram chat belongs to, as `chat_id=application_id` pairs --
+    # see `app/main.py:tg_application_id`, which is the only reader. It is a
+    # DECLARATION because the two channels have to be the same person: one
+    # application id is one opencode session and one pending permission question,
+    # and `/tg/webhook` used to mint `tg:<chat_id>` for itself, which gave that
+    # person a second session and put every answer where no question had been
+    # asked. Left empty, a Telegram chat has no identity at all and nothing is
+    # minted for it.
+    r2d2_tg_application_id: str = ""
+
     @classmethod
     def load(cls) -> "Config":
         kwargs = {}

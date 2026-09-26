@@ -21,6 +21,13 @@ code execution on somebody's laptop. Everything below follows from that.
   sweep find it after a crash, what keeps it out of the shell confirmation
   `core/brain.py` writes into the same one-row-per-user table, and what makes the
   row -- not a session binding -- the population the sweep enumerates.
+* **Both halves of the conversation are keyed by ONE `application_id`.** The row is
+  written under the id of the turn that raised the ask, so the answer is only ever
+  read under that same id -- which is why the Telegram ingress resolves its chat to
+  a *declared* application id (`app/main.py:tg_application_id`) instead of deriving
+  one from the chat id. A derived id is not merely a second session: it is an answer
+  delivered to a session the question was never asked in, and a second identity for
+  one human, whose two sessions then hold two halves of one conversation.
 * **A replayed event does not extend the window.** A second `permission.asked` for
   an already-pending permission keeps the original `requested_at`; a second ask for a
   *different* permission refuses the one it evicts, which by then nobody can answer.
@@ -261,9 +268,11 @@ class PermissionBroker:
         Everything else -- a refusal, a timeout, a 500, a `200 false`, a 404 -- is
         `rejected`, because the caller asks "may this tool run?" and only one answer
         to that may ever be yes; `unrelated` means there was no ask of ours, so the
-        caller carries on as before. The words are `core/policies.py`'s call, DENY
-        before AFFIRM ("да, не надо" is a refusal), and the row is cleared even when
-        the POST fails, so a server that forgot the session cannot re-ask for ever.
+        caller carries on as before. The words are `core/policies.py`'s call, matched
+        as whole words on the affirmative side -- `да` is a substring of `дай`, and a
+        sentence is not an answer -- with DENY read before AFFIRM ("да, не надо" is a
+        refusal). The row is cleared even when the POST fails, so a server that forgot
+        the session cannot re-ask for ever.
         """
         verdict = confirmation_verdict(text)
         if verdict is None:

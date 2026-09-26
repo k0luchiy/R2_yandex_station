@@ -34,8 +34,10 @@ is the failure mode here, not a crash.
 """
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Final
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -55,6 +57,49 @@ logger = logging.getLogger("r2d2")
 
 #: What the owner runs when the gate below reports the server unreachable.
 LAUNCHER = "scripts/opencode_serve.sh"
+#: The variable that declares which human a Telegram chat belongs to. Named in the
+#: warning a chat with no binding gets, because the whole point of not inventing
+#: an identity is that the operator is told exactly which knob is missing.
+TG_APPLICATION_ID_VAR: Final = "R2D2_TG_APPLICATION_ID"
+#: What separates the `chat_id=application_id` pairs of that declaration.
+TG_BINDING_SEPARATORS: Final = re.compile(r"[,\s]+")
+
+
+def tg_application_id(cfg: Config, chat_id: int) -> str | None:
+    """The `application_id` this Telegram chat was bound to, or `None` for no binding.
+
+    **The binding is declared, never derived.** One human is one `application_id`,
+    and that id is what owns their single opencode session and their single pending
+    permission question -- so a Telegram turn and an Alice turn of the same person
+    have to arrive under the same one, or the answer to «да» is delivered to a
+    session the question was never asked in. `/tg/webhook` used to build
+    `f"tg:{chat_id}"` for itself, which is the live defect in `qa/live-run.md` §4c.
+
+    `cfg.r2d2_tg_application_id` holds `chat_id=application_id` pairs separated by
+    commas or whitespace; a single-user deployment has exactly one, and a second
+    chat id is bound by declaring a second pair rather than by being invented. An
+    id may not contain a separator -- it is an opaque Alice `application_id`, and a
+    space in one would silently truncate the binding.
+
+    `None` is the honest answer for a chat nobody declared, and the caller must
+    refuse the turn on it rather than fall back to anything. A token this build
+    cannot read is a WARNING naming the variable; it binds nothing, so one typo
+    cannot be mistaken for a declaration.
+    """
+    for token in TG_BINDING_SEPARATORS.split(cfg.r2d2_tg_application_id.strip()):
+        if not token:
+            continue
+        declared_chat, separator, app_id = token.partition("=")
+        if not separator or not declared_chat.isdigit() or not app_id.strip():
+            logger.warning(
+                "telegram: %s carries a token this build cannot read (%r); it expects "
+                "chat_id=application_id, and this token binds nothing",
+                TG_APPLICATION_ID_VAR, token,
+            )
+            continue
+        if int(declared_chat) == chat_id:
+            return app_id.strip()
+    return None
 
 
 async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
@@ -195,13 +240,32 @@ def build_app() -> FastAPI:
             and cfg.telegram_chat_id_int
             and chat_id == cfg.telegram_chat_id_int
         ):
+            app_id = tg_application_id(cfg, int(chat_id))
+            if app_id is None:
+                # No declared identity means no session to share, no pending row to
+                # answer and nobody to answer to. Minting `tg:<chat_id>` here is the
+                # defect this replaced: a second opencode session for one person,
+                # and a «да» that landed in a session the question was never asked
+                # in. Dropping the message keeps the pending ask refusable by the
+                # sweep, which is the direction every ambiguous path must fail in.
+                logger.warning(
+                    "telegram: chat %s is not bound to an application_id, so this message is "
+                    "not answered; set %s='%s=<the application_id your Alice turns use>'. No "
+                    "identity is invented here: a second one would be a second session for one "
+                    "person, and could not answer the permission question that person was asked",
+                    chat_id, TG_APPLICATION_ID_VAR, chat_id,
+                )
+                return {"ok": True}
             fake = {
                 "meta": {"interfaces": {}},
                 "request": {"type": "SimpleUtterance", "command": text},
                 "session": {
                     "new": True,
-                    "application": {"application_id": f"tg:{chat_id}"},
-                    "user": {"user_id": f"tg:{chat_id}"},
+                    # Both identity fields carry the bound id, not the chat id: the brain
+                    # falls back to `user_id` when `application_id` is absent, so a chat
+                    # id in either one could become an identity again.
+                    "application": {"application_id": app_id},
+                    "user": {"user_id": app_id},
                 },
                 "version": "1.0",
             }

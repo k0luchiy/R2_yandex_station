@@ -448,22 +448,62 @@ async def test_an_undecidable_reply_leaves_the_ask_exactly_where_it_was(
     assert telegram.texts() == [QUESTION.format(title=TITLE)]
 
 
-async def test_a_word_that_merely_starts_with_ne_is_a_refusal(
-    broker, memory: Memory, server: FakeOpencode
+async def test_a_sentence_containing_an_affirmation_is_not_an_approval(
+    broker, memory: Memory, server: FakeOpencode, telegram: Telegram
 ):
-    """`DENY_WORDS` in `core/policies.py` holds the bare "не", so ANY word containing
-    those two letters denies -- "неопределённое", "некоторый", "невозможно". That is
-    blunt, and it is also the safe direction: the cost of reading an ordinary
-    sentence as a refusal is one more question, and the cost of the reverse is a
-    command the user never agreed to run."""
+    """The live defect from `qa/live-run.md` §4d, on the broker's own path.
+
+    `confirmation_verdict` used to look for its words as SUBSTRINGS, so `да` inside
+    `дай` read as an approval: while a permission was pending, the broker posted a
+    one-time approval in answer to a sentence that was not an answer. An approval
+    is the one irreversible thing this module does, so the affirmative side is
+    matched on whole words only -- and the ask must survive a message that is not
+    an answer, so the real `да` after it still works.
+    """
     # Given: a pending ask
     await ask(broker)
-    # When: the user says something that is not a refusal at all
+    # When: the user says something that merely contains `да`
+    verdict = await broker.resolve_from_text(APP, "дай сводку")
+    # Then: nothing was approved and nothing was refused
+    assert verdict == "unrelated"
+    assert server.requests == []
+    record = await memory.get_pending(APP)
+    assert record is not None and record["permission_id"] == PERMISSION_ID
+    # And the only message the user ever got is the question that is still open
+    assert telegram.texts() == [QUESTION.format(title=TITLE)]
+    # And the ask is still answerable: a whole word is still an approval
+    assert await broker.resolve_from_text(APP, "да") == "approved"
+    assert server.answers() == [{"response": "once"}]
+
+
+async def test_a_word_that_merely_starts_with_ne_is_not_an_approval(
+    broker, memory: Memory, server: FakeOpencode
+):
+    """The blunt side of the same rule, and what replaced it.
+
+    `DENY_WORDS` holds the bare "не", so the old substring reader denied ANY word
+    containing those two letters -- "неопределённое", "некоторый", "невозможно" --
+    and, worse, the same bluntness reached the affirmative side: "конечно" and
+    "понедельник" were refusals because `не` is inside them. Whole-word reading
+    makes such a sentence neither, which leaves the ask pending and lets the
+    timeout refuse it -- the safe direction -- and makes the words a user actually
+    means approve and refuse again.
+    """
+    # Given: a pending ask
+    await ask(broker)
+    # When: the user says something that is not an answer at all
     verdict = await broker.resolve_from_text(APP, "что-то неопределённое")
-    # Then: it is refused, not approved
-    assert verdict == "rejected"
+    # Then: it is neither approved nor refused, and the ask is still answerable
+    assert verdict == "unrelated"
+    assert server.requests == []
+    assert (await memory.get_pending(APP))["permission_id"] == PERMISSION_ID
+    # And the word the user means still refuses
+    assert await broker.resolve_from_text(APP, "не надо") == "rejected"
     assert server.answers() == [{"response": "reject"}]
-    assert await memory.get_pending(APP) is None
+    # And the word that only CONTAINED it approves again
+    await ask(broker)
+    assert await broker.resolve_from_text(APP, "конечно") == "approved"
+    assert server.answers() == [{"response": "reject"}, {"response": "once"}]
 
 
 async def test_a_denial_anywhere_in_the_sentence_beats_an_affirmation(
