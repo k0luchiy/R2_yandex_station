@@ -1,0 +1,31 @@
+backend 'zen': ${R2D2_ZEN_KEY} is unset, 'api_key' stays empty
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 1.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 2.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 4.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 5.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 5.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 5.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 5.0s
+opencode sse: stream for session ses_f23bb5dbeffePCgTNtG36cby0v failed (ReadTimeout: ), reconnecting in 5.0s
+# session=ses_f23bb5dbeffePCgTNtG36cby0v  window=60.0s
+# shipped spec: timeout=3.2s event_read_timeout=30.0s
+
+label: PRE-FIX (read=timeout)
+read_timeout_s: 3.2
+wall_s: 60.21
+connected_s: 28.98
+blind_s: 31.23
+blind_pct: 51.9
+connects: 0
+permission_asked: 0
+frames: {}
+
+label: SHIPPED (read=event_read_timeout)
+read_timeout_s: 30.0
+wall_s: 60.21
+connected_s: 60.21
+blind_s: 0.0
+blind_pct: 0.0
+connects: 0
+permission_asked: 0
+frames: {}

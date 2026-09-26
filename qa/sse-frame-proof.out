@@ -1,0 +1,8 @@
+HTTP 200 from GET /event
+(main: window 22.0s elapsed, stream still open)
+(decoded: window 22.0s elapsed, stream still open)
+
+OFFLINE: decode_frame() on a verbatim wire line
+  wire line has an 'event:' field? False
+  decode_frame(<no event name>, ...) -> type='message'
+  decode_frame('permission.asked', ...) -> type='permission.asked', permission_id='per_x'
