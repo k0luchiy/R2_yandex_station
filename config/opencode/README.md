@@ -74,7 +74,7 @@ as "the shim is enabled" while enabling nothing.
 | `*` | `deny` | `ask` |
 | `read` | allow except `*.env` | allow except `*.env` |
 | `glob`, `grep` | allow | allow |
-| `bash` | deny, except the 12 allowlisted commands | ask, except the 12 allowlisted commands |
+| `bash` | ask, except the 12 allowlisted commands | ask, except the 12 allowlisted commands |
 | `edit` | `deny` | `ask` |
 | `task`, `skill`, `lsp`, `question` | `deny` | `ask` |
 | `webfetch`, `websearch` | `deny` | allow |
@@ -83,6 +83,35 @@ as "the shim is enabled" while enabling nothing.
 
 `bash`, `edit` and `external_directory` are never `allow` on either agent, and
 `test_guard_rejects_a_config_that_widens_an_agent` fails the moment one is.
+
+## C5b — why the voice `bash` catch-all is `ask`, not `deny`
+
+A `deny` here was the safe-looking choice and it was measured harmful. When
+`r2d2-voice` attempts a raw command, opencode stores a tool refusal whose
+`state.error` enumerates the voice agent's whole matrix, `bash: deny` included.
+The two agents share one session, so the next turn's agent reads that dump,
+concludes the terminal is closed to it too, and refuses commands its own matrix
+permits — five consecutive turns refusing `echo`, `ls`, `r2d2_do shell` and
+`read`, with no recovery (`qa/live-run-v6.md` §D9, `qa/live-run-v7.md` §E). The
+stored record is deleted by the sweep, but the **prose** the refusing agent wrote
+in its place survives, and prose is conversation. A prompt rule telling the agent
+to ignore a foreign rule enumeration was measured failing twice; the owner chose
+to remove the deny at the source instead.
+
+With `ask` there is no stored refusal: a raw attempt raises `permission.asked`,
+R2D2's broker turns it into a Telegram question, and `да` is answered as
+`{"response":"once"}` — one command, never `always` (C5). The price is a
+behaviour change users must be told about: **a stray raw-`bash` attempt by the
+voice agent now interrupts the user with a Telegram question instead of failing
+silently.** It does not cost Alice's 4.5 s: the voice turn is bounded by
+`asyncio.wait_for` and falls into the deadline branch, and the question is sent
+by the per-session `GET /event` reader, off her clock. Measured twice on a real
+stack — 3.665 s and 4.13 s wall, the ack ahead of the question both times
+(`qa/live-run-v8.md`).
+
+`test_voice_bash_asks_where_it_used_to_refuse` pins the value, and
+`test_the_shell_denies_are_refusals_and_they_come_last` plus
+`shell_deny_violations` pin the backstop that survives it.
 
 ### The 12 allowlisted commands
 
@@ -105,6 +134,9 @@ stand in front of it, and neither is opencode:
 1. `r2d2-voice` cannot reach it — three `deny` rules for the `shell` subcommand
    come last in the voice `bash` block, its prompt forbids it outright, and
    such a request is escalated with the `[[NEEDS_AGENT]]` sentinel instead.
+   That block's catch-all is `ask` (C5b), so these three rules are now the ONLY
+   thing refusing it in opencode, and their position after the allowlist is what
+   makes them win under "last match wins".
 2. `r2d2-agent` can, and the shim's own `risk_level` gate is the gate: it exits
    2 without executing, the prompt makes the agent relay the question verbatim,
    and the command runs only after the user agrees. R2D2's permission broker

@@ -30,7 +30,7 @@
         "glob": "allow",
         "grep": "allow",
         "bash": {
-          "*": "deny",
+          "*": "ask",
           "/home/koluchiy/.r2d2/r2d2_do.py *": "allow",
           "python3 /home/koluchiy/.r2d2/r2d2_do.py *": "allow",
           "/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *": "allow",

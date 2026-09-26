@@ -21,6 +21,11 @@ assertion:
   is the only thing worth asserting against; `tools` is only shape-checked.
 
 Nothing here talks to a server, so the suite is deterministic and offline.
+
+allow: SIZE_OK -- 466 pure LOC, 44 tests. Every test file in this repo is 257-751
+pure LOC and a test module grows with the number of behaviours it pins; splitting
+the two permission-matrix checkers from the prompt and install tests would give
+each half a file that cannot say what the other half forbids.
 """
 
 from __future__ import annotations
@@ -69,6 +74,15 @@ READ_ONLY_PROBES = frozenset(
         "date",
     }
 )
+#: The catch-all of a `bash` block, and the only key the blocks are required to
+#: open with -- opencode takes the LAST matching rule, so a catch-all that is not
+#: first is not a default but dead text.
+CATCH_ALL = "*"
+#: The one call that can destroy something, in the three spellings the shim may be
+#: addressed by, derived from `R2D2_DO_FORMS` so a moved shim moves these too. The
+#: voice agent's `bash` catch-all is `ask`, so these three `deny`s are the only
+#: thing between a spoken request and `r2d2_do shell`.
+SHELL_PATTERNS = tuple(f"{form[: -len(' *')]} shell *" for form in R2D2_DO_FORMS)
 
 # Every permission key this opencode build exposes (measured in todo 1, listed
 # in the plan's "Critical context facts").  A key the config does not name
@@ -371,6 +385,92 @@ def test_voice_bash_allowlist_is_the_shim_plus_read_only_probes():
     # an extra command cannot be added without a test noticing
     allowed = {rule for rule, action in bash.items() if action == "allow"}
     assert allowed == set(R2D2_DO_FORMS) | READ_ONLY_PROBES
+
+
+def test_voice_bash_asks_where_it_used_to_refuse():
+    # Given: the owner removed the hard deny from the voice catch-all on purpose
+    bash = load()["agent"][VOICE]["permission"]["bash"]
+    # When/Then: a command outside the allowlist is a QUESTION. `deny` is what
+    # opencode stores as a tool refusal whose `state.error` prints this whole
+    # matrix, and in the session shared with `r2d2-agent` that dump was read as
+    # the READER's own rules: five consecutive turns spent refusing `echo`, `ls`,
+    # `r2d2_do shell` and `read` -- four commands the reader's matrix allows
+    # (`qa/live-run-v6.md` D9, `qa/live-run-v7.md` E). The price is a Telegram
+    # question the user must answer, which is stated in docs/09-security.md.
+    # `allow` is not on the table: NEVER_ALLOWED is what refuses that.
+    assert bash[CATCH_ALL] == "ask"
+    assert bash[CATCH_ALL] not in ("deny", "allow")
+    # and the agent's own catch-all is untouched by that decision
+    assert load()["agent"][AGENT]["permission"]["bash"][CATCH_ALL] == "ask"
+    assert load()["agent"][AGENT]["permission"][CATCH_ALL] == "ask"
+
+
+def shell_deny_violations(bash: object) -> list[str]:
+    """Every way the voice `bash` block can stop refusing `r2d2_do shell`.
+
+    Pure, so the mutation test below can feed it a reordered copy. Both halves are
+    needed and neither is redundant: the rules must EXIST and be `deny` (a narrow
+    `ask` there would put the one destructive call to the user instead of refusing
+    it), and they must come AFTER the `r2d2_do.py *` allows -- opencode keeps the
+    LAST matching rule, so a `deny` placed first is overwritten by the allow of the
+    very shim it was meant to veto.
+    """
+    if not isinstance(bash, dict):
+        return [f"voice bash: must be an object of one rule per pattern, got {type(bash).__name__}"]
+    bad: list[str] = []
+    if next(iter(bash), None) != CATCH_ALL:
+        bad.append("voice bash: the catch-all is not the first key, so later rules are not the last match")
+    keys = list(bash)
+    for pattern in SHELL_PATTERNS:
+        if pattern not in bash:
+            bad.append(f"voice bash: {pattern!r} has no rule at all")
+        elif bash[pattern] != "deny":
+            bad.append(f"voice bash: {pattern!r} is {bash[pattern]!r}, not 'deny'")
+    for pattern in SHELL_PATTERNS:
+        for form in R2D2_DO_FORMS:
+            if pattern in keys and form in keys and keys.index(form) > keys.index(pattern):
+                bad.append(
+                    f"voice bash: {form!r} is allow and comes after {pattern!r}, so the allow is "
+                    "the last match and the shell subcommand is not refused"
+                )
+    return bad
+
+
+def test_the_shell_denies_are_refusals_and_they_come_last():
+    # Given: the shipped block, and the same block with the three shell denies moved
+    # in front of the shim allows -- the inversion "last match wins" makes lethal
+    bash = load()["agent"][VOICE]["permission"]["bash"]
+    ahead = [CATCH_ALL, *SHELL_PATTERNS]
+    reordered = {key: bash[key] for key in [*ahead, *(k for k in bash if k not in ahead)]}
+    # When/Then: the shipped order passes and the inverted one is named for each of
+    # the three spellings, so the ordering is asserted as load-bearing rather than
+    # left to a comment nobody reads
+    assert shell_deny_violations(bash) == []
+    violations = shell_deny_violations(reordered)
+    assert violations
+    assert all("last match" in reason for reason in violations)
+    assert {p for p in SHELL_PATTERNS if any(repr(p) in reason for reason in violations)} == set(
+        SHELL_PATTERNS
+    )
+
+
+@pytest.mark.parametrize("action", ["ask", "allow", "delete"])
+def test_the_guard_bites_on_every_way_the_shim_gets_through(action):
+    # Given: a block where one shell deny is softened to `action`, and one where it
+    # is gone -- what a careless merge leaves behind, and the two ways `shell` opens
+    bash = load()["agent"][VOICE]["permission"]["bash"]
+    pattern = SHELL_PATTERNS[0]
+    mutated = dict(bash)
+    del mutated[pattern]
+    if action != "delete":
+        mutated[pattern] = action
+    # When/Then: each is named, against that pattern, with the value that caused it
+    violations = shell_deny_violations(mutated)
+    named = [reason for reason in violations if repr(pattern) in reason]
+    assert named, violations
+    assert any(action in reason for reason in named) if action != "delete" else any(
+        "no rule at all" in reason for reason in named
+    )
 
 
 # ---------------------------------------------------------------------------

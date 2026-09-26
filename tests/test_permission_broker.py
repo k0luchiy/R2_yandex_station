@@ -885,8 +885,9 @@ async def test_a_started_then_stopped_broker_leaves_no_task_behind(broker, teleg
 async def test_in_deny_mode_the_broker_says_it_is_inert_and_arms_nothing(
     broker, monkeypatch, caplog
 ):
-    """`EVENT_MODE == "deny"`: the agent config already refuses `bash`/`edit`, so a
-    broker that kept sweeping would be answering for a server that never asks."""
+    """`EVENT_MODE == "deny"`: `edit`/`external_directory` are refused outright and a
+    `bash` ask could not be answered by anyone, so a broker that kept sweeping would
+    be answering for a server whose questions have no route back."""
     from core import permissions
 
     # Given: the deny-mutation mode
