@@ -226,6 +226,16 @@ def transcript_sweep(records: Sequence[MessageRecord], *, sentinel: str) -> Tran
     something the model should be reading back. The alternative -- trusting that
     the model never quotes its own instruction -- is the exact dependence this
     fix exists to remove.
+
+    **A tool-permission refusal is NOT swept, and that is measured.** opencode
+    stores a refusal as a `tool` part with `state.status == "error"` whose
+    `state.error` enumerates the effective rules -- the matrix of the agent that
+    was refused, which in a shared session is not the reader's (contract U8).
+    `list_messages` reads TEXT parts only, so that message arrives here with
+    `text == ""` and there is nothing to match: this sweep cannot see a refusal,
+    and the reader that could is `core/opencode`, not this module. What stops a
+    stored refusal from being read as a statement about the reader's own tools is
+    a rule in BOTH agent prompts, which also holds on the turns no sweep runs on.
     """
     _require_sentinel(sentinel)
     signal_ids = tuple(

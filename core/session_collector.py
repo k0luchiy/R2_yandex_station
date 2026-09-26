@@ -36,6 +36,12 @@ The properties this module exists to hold:
   deadline nobody can know whether the late turn will answer or ask for the
   agent, and the collector needs a marker -- hence the last message the session
   held before this turn's work was submitted is recorded in the job.
+* **A permission refusal in the transcript is not this module's business.** A
+  refusal is a `tool` part, `list_messages` reads text parts only, and the reader
+  that could see it belongs to `core/opencode`. What keeps one agent's refusal
+  from reading as a ban on the other's tools is a rule in both agent prompts.
+  This sweep stays the one artefact it was built for, and `_collect_later` says
+  why deleting a refusal would cost the user more than it saves.
 """
 
 from __future__ import annotations
@@ -153,6 +159,20 @@ class SessionCollector:
         answered `true` and compressed nothing, so no summariser could have saved
         it). The escalation hint is not lost with the message: it is already part
         of the task text submitted above.
+
+        The same paragraph is why this sweep does NOT delete a tool-permission
+        refusal, which opencode stores in the shared session with the refused
+        agent's whole effective matrix spelled out in it (contract U8). Two
+        reasons, and the first is not a choice: `list_messages` reads a message's
+        text parts, and a refusal is a `tool` part, so it arrives as `text == ""`
+        -- this sweep cannot see one however it is written. The second is a
+        choice: a refusal is the record that opencode refused a command the user
+        asked for, and deleting a whole message to remove a list of rules would
+        take that record with it, which is the one thing this module is not
+        allowed to do to a user's history. The reading is prevented where the
+        reading happens instead -- a rule in both agent prompts, which also holds
+        on the turns this sweep never runs on, such as a voice turn that was
+        refused and then answered without escalating.
 
         Finding the marker costs one GET on a path that has already spent the
         whole voice budget, and it is bounded: a server that will not answer here

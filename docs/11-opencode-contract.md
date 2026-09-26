@@ -38,6 +38,7 @@
 | U5 | Может ли `POST /session` задать рабочий каталог? | **Да — query-параметром `?directory=`, не телом.** | `ADOPTED:` строка U5 |
 | U6 | Реальная задержка `POST /session/:id/message`? | `space-bunny-free`: **p50 1.667 с**, p95 2.247 с. `muse-spark-1.3-contributor-free` **недоступен** (403). | `ADOPTED:` строка U6 |
 | U7 | Чем на самом деле ограничивается инструмент агента — `permission` или чем-то ещё? | **Видимостью, и только `deny` её отнимает.** `ask` не спрашивает ничего для инструмента, который сам не спрашивает. | `ADOPTED:` строка U7 |
+| U8 | Что opencode пишет в общую на человека сессию, когда отказывает в вызове инструмента? | **Часть `tool` с `state.status: "error"`, а `state.error` перечисляет действующие правила разрешений — матрицу того агента, которому отказали. Текстовой части в таком сообщении нет вовсе.** | `ADOPTED:` строка U8 |
 
 ---
 
@@ -496,6 +497,102 @@ R2D2, и проговорено в [09-security.md](09-security.md) §8.6.
 `/home/koluchiy/.opencode/bin/opencode`. `~/.config/opencode/`, `auth.json`,
 `opencode.db` и чужие сессии не читались и не менялись; в вывод `GET /config`
 попадает ключ MCP-сервера, поэтому этот маршрут в доказательство не включён.
+
+---
+
+## U8 — что opencode пишет в общую сессию при отказе в инструменте
+
+**Вопрос.** Сессия на человека одна и ею пользуются оба агента, а матрицы
+разрешений у них разные (U1, U7). Когда opencode отказывает агенту в вызове
+инструмента, он пишет причину отказа в эту общую историю — и второй агент её
+читает. Что именно лежит в сообщении, в какой части оно лежит и что из этого
+может вычистить R2D2, — от этого зависит выбор между тремя вариантами.
+
+**Где смотрели.** Живой `opencode serve` v1.18.32 на порту **4614** (throwaway),
+`OPENCODE_CONFIG_DIR=/tmp/r2d2-d9/opencode` с двумя агентами R2D2 и изолированные
+`XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME`, рабочий
+каталог `/tmp/r2d2-d9/workspace`. `~/.r2d2/`, `~/.config/opencode/`, порт 4599 и
+чужие сессии не читались и не менялись.
+
+**Наблюдение 1 — отказ это `tool`-часть, а не текст.** Голосовой агент вызвал
+`bash` с командой вне своего белого списка, opencode отказал и сохранил сообщение
+`msg_0dc6c234a001iSnbaBxS08nCF1` дословно так:
+
+```json
+{
+  "id": "prt_0dc6c39b8001HZK2wNIzb34H5c",
+  "sessionID": "ses_f2393e965ffeFgLClrZ3rOgMEQ",
+  "messageID": "msg_0dc6c234a001iSnbaBxS08nCF1",
+  "type": "tool",
+  "callID": "call_function_3rkcv34hpeet_1",
+  "tool": "bash",
+  "state": {
+    "status": "error",
+    "input": {
+      "command": "ls -la /tmp/r2d2-d9/workspace"
+    },
+    "error": "The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{\"permission\":\"*\",\"action\":\"allow\",\"pattern\":\"*\"},{\"permission\":\"*\",\"action\":\"deny\",\"pattern\":\"*\"},{\"permission\":\"*\",\"action\":\"deny\",\"pattern\":\"*\"},{\"permission\":\"bash\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"bash\",\"pattern\":\"/home/koluchiy/.r2d2/r2d2_do.py *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"python3 /home/koluchiy/.r2d2/r2d2_do.py *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"upower *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"cat /sys/class/power_supply/*\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"df *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"free *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"uname *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"hostname *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"ps *\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"uptime\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"date\",\"action\":\"allow\"},{\"permission\":\"bash\",\"pattern\":\"/home/koluchiy/.r2d2/r2d2_do.py shell *\",\"action\":\"deny\"},{\"permission\":\"bash\",\"pattern\":\"python3 /home/koluchiy/.r2d2/r2d2_do.py shell *\",\"action\":\"deny\"},{\"permission\":\"bash\",\"pattern\":\"/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py shell *\",\"action\":\"deny\"}]",
+    "time": {
+      "start": 1790404475369,
+      "end": 1790404475610
+    }
+  }
+}
+```
+
+Запрос при этом лежит в `state.input` (то есть **что именно было запрещено, R2D2
+знает**), а перечисленные правила — в `state.error`. Части сообщения:
+`step-start`, `reasoning`, `tool`, `step-finish`. **Ни одной части `type: "text"`
+в сообщении нет.**
+
+**Наблюдение 2 — перечисленные правила принадлежат отказанному агенту.** В дампе
+есть `{"permission":"bash","pattern":"*","action":"deny"}` — это правило
+`r2d2-voice`; у `r2d2-agent` тот же ключ `bash` начинается с `"*": "ask"`, и
+`opencode debug agent r2d2-agent` показывает `bash: true`. `r2d2-agent` в этой же
+сессии сразу после отказа вызвал `glob` четыре раза и получил результат каждого
+раза, то есть **инструменты у него были и остались**. Поэтому вред дампа не в том,
+что он кого-то действительно ограничивает: он в том, что читающий агент принимает
+чужие правила за свои. Условие детерминировано (текст в общей истории остаётся
+навсегда), а вред зависит от того, как модель его прочитает.
+
+**Наблюдение 3 — `GET /session/:id/message` этого не показывает.** `MessageRecord`
+(`core/opencode/wire.py`) собирает `text` **только** из частей `type: "text"`,
+поэтому отказанный ход приходит к вызывающему с `text == ""`:
+
+```json
+{
+  "id": "msg_0dc6c234a001iSnbaBxS08nCF1",
+  "role": "assistant",
+  "agent": "r2d2-voice",
+  "modelID": "space-bunny-free",
+  "providerID": "opencode"
+}
+```
+
+**Наблюдение 4 — пустой текст не отличает отказ от успеха.** В той же сессии
+четыре **успешных** вызова `glob` сохранены так же: `step-start`, `tool` со
+`state.status: "completed"`, `step-finish`, и тоже без текстовой части. Значит
+«ассистентское сообщение с пустым текстом» — это и отказ, и успешный ход с
+инструментами, и удалять такие сообщения нельзя: вместе с отказом уйдёт и запись
+обо всём, что сработало.
+
+**Наблюдение 5 — отказ переживает всё, что есть у R2D2.** `routing.transcript_sweep`
+удаляет сообщения с маркером шлюза и по определению не видит отказ (наблюдение 3);
+`POST /session/:id/summarize` отвечает `true` и ничего не сжимает (замерено в
+первом прогоне). Ни один механизм в этом репозитории отказ не убирает.
+
+**ADOPTED:** отказ **не вычищать**, а запретить его читать как своё. Дамп правил —
+контрольная информация opencode о том агенте, которому он отказал, и в общей
+истории она остаётся навсегда; удалять её нечем (R2D2 её не видит, наблюдение 3) и
+нечего (запись об отказе принадлежит пользователю, наблюдение 4). Единственное
+место, где решается исход, — как агент читает этот текст, поэтому правило живёт в
+**промпте обоих агентов** в [09-security.md](09-security.md) §8.8 и проверяется
+офлайн в `tests/test_r2d2_opencode_config.py`: отказ в истории — это чужая
+матрица, opencode проверяет каждый вызов по твоим правилам, и отказ, оставшийся в
+истории, не является причиной не вызывать инструменты, которые тебе разрешены.
+Правило, а не чистка, выбрано ещё и потому, что чистка не покрывает ветку
+`path=deadline` (свип уходит, пока голосовой ход ещё пишет) и ход агента, который
+идёт **после** свипа.
 
 ---
 

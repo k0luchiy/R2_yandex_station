@@ -431,6 +431,98 @@ def test_agent_prompt_states_the_confirmation_and_honesty_contract():
 
 
 # ---------------------------------------------------------------------------
+# prompts -- one session, two permission matrices
+# ---------------------------------------------------------------------------
+
+#: The one persistent opencode session per human is deliberately shared by both
+#: agents, and opencode writes its ENFORCEMENT state into that shared history:
+#: a refused tool call is stored as a `tool` part whose `state.error` prints the
+#: effective rules -- the refused agent's matrix, not the reader's.  The reader
+#: then concluded the refusal was about itself and stopped calling tools its own
+#: matrix allows (`qa/live-run-postfix.md`, D9), so each prompt must say, in its
+#: own words, all seven of these.  Keyword level on purpose, like the sentinel
+#: test above: deleting a rule fails, rewording the sentence around it does not.
+REFUSAL_RULE: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"отказ\w*"), "name the artefact -- a refusal left in the session"),
+    (re.compile(r"правил\w* разрешени"), "name what the refusal prints -- the permission rules"),
+    (
+        re.compile(r"которому отказали|чужому вызову"),
+        "attribute those rules to the agent that was REFUSED",
+    ),
+    (re.compile(r"не\s+твои|не\s+свои"), "say they are not the reader's own matrix"),
+    (
+        re.compile(r"проверяет\s+каждый\s+твой\s+вызов\s+по\s+твоим\s+правилам"),
+        "say the reader's own calls are checked against the reader's own rules",
+    ),
+    (
+        re.compile(r"не\s+означает|не\s+является\s+причиной"),
+        "forbid reading a stored refusal as a ban on the reader's tools",
+    ),
+    (
+        re.compile(r"инструмент\w*,?\s+которы\w+\s+тебе\s+разрешен"),
+        "name the tools the reader may still use",
+    ),
+)
+
+
+def refusal_violations(agent_name: str, prompt: object) -> list[str]:
+    """Every way a prompt can leave a shared-session refusal readable as a self-ban.
+
+    Pure: takes one prompt, returns the reasons D9 is still open for that agent.
+    The mutation test below feeds it a prompt with the rule deleted, which is the
+    only honest way to show the guard is not vacuous.
+    """
+    if not isinstance(prompt, str):
+        return [f"{agent_name}: prompt must be a string, got {type(prompt).__name__}"]
+    lowered = prompt.lower()
+    return [
+        f"{agent_name}: the prompt does not {what}"
+        for pattern, what in REFUSAL_RULE
+        if not pattern.search(lowered)
+    ]
+
+
+def test_both_prompts_say_a_foreign_refusal_is_not_their_own_rule():
+    # Given: ONE session, shared by two agents with different permission
+    # matrices, into which opencode stores a refused tool call together with the
+    # refused agent's whole effective matrix.  The live run measured what that
+    # does: the other agent read the dump as a statement about itself and refused
+    # every tool, including the ones its own matrix allows.
+    config = load()
+    # When/Then: BOTH prompts carry the rule, in the words that fix it -- the
+    # failure is mirrored (the voice agent refused its own allowlisted shim after
+    # one denied call), so a rule in only one of them leaves the other poisoned
+    for name, agent in config["agent"].items():
+        assert refusal_violations(name, agent["prompt"]) == []
+
+
+def test_a_refusal_of_my_own_is_still_mine_to_obey():
+    # Given: the rule above could be read as "refusals are ignorable"
+    prompt = load()["agent"][AGENT]["prompt"].lower()
+    # When/Then: a refusal the reader receives ITSELF stays binding, so the fix
+    # does not become an instruction to work around opencode
+    assert re.search(r"отказ,\s+который\s+получишь\s+ты\s+сам", prompt)
+    assert re.search(r"это\s+уже\s+твоё\s+правило", prompt)
+    # and the pre-existing "do not bypass an ask" rule is untouched
+    assert "не обходи разрешения" in prompt
+
+
+def test_guard_rejects_a_prompt_whose_refusal_rule_was_deleted():
+    # Given: a prompt whose rule about a shared-session refusal is gone -- what a
+    # bad merge or a careless rewrite leaves behind, and the exact state the
+    # shipped file was in before this defect was fixed
+    prompt = load()["agent"][AGENT]["prompt"]
+    stripped = "\n".join(line for line in prompt.split("\n") if "чужому вызову" not in line)
+    assert stripped != prompt, "the shipped prompt has no rule to delete"
+    # Then: every fact the deleted rule carried is reported, so the guard can
+    # fail -- an assertion that cannot fail is a hole, not a test
+    violations = refusal_violations(AGENT, stripped)
+    assert len(violations) == len(REFUSAL_RULE)
+    assert all(AGENT in violation for violation in violations)
+
+
+
+# ---------------------------------------------------------------------------
 # C1 -- exactly one model, and it is the only one that works
 # ---------------------------------------------------------------------------
 
