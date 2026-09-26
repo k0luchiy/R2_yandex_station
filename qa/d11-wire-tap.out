@@ -1,0 +1,30 @@
+D11 wire tap -- opencode 1.18.32, GET /event at http://127.0.0.1:4613, directory /tmp/r2d2-d11/workspace
+
+session: ses_f237204c2ffew0YlIQMRoGkbrk
+attempt 1: POST /session/{id}/prompt_async -> HTTP 204
+POST /session/{id}/permissions/{per_id} -> HTTP 200 body 'true'
+
+== THE WIRE ==
+lines read:                       88
+lines starting with 'data:':      44
+lines starting with 'event:':     0
+lines starting with ':' (comment):0
+blank dispatch lines:             44
+bodies recorded:                  44
+first three raw lines:            ['data: {"id":"evt_0dc8df5060016UzTVXQwd1vYWS","type":"server.', '', 'data: {"id":"evt_0dc8dfb3e001rIn7ffyNRi3DlH","type":"session']
+bodies by their own "type":     {'server.connected': 1, 'session.created': 1, 'session.updated': 5, 'message.updated': 10, 'message.part.updated': 12, 'session.status': 6, 'session.diff': 3, 'permission.asked': 1, 'permission.replied': 1, 'message.part.delta': 2, 'session.idle': 1, 'server.heartbeat': 1}
+decode_frame() types, as shipped: {'message': 44}
+
+== VERBATIM BODIES, AS THE SERVER SENT THEM ==
+--- server.connected
+data: {"id":"evt_0dc8df5060016UzTVXQwd1vYWS","type":"server.connected","properties":{}}
+--- permission.asked
+data: {"id":"evt_0dc8e0d96001ENniA8TFQh84Kv","type":"permission.asked","properties":{"id":"per_0dc8e0d950015YF13XN1QQAEcz","sessionID":"ses_f237204c2ffew0YlIQMRoGkbrk","permission":"bash","patterns":["echo R2D2D11TAP"],"metadata":{"command":"echo R2D2D11TAP"},"always":["echo *"],"tool":{"messageID":"msg_0dc8dfc20001Ay94pxsy3GeYG4","callID":"call_function_rds009nllcpm_1"}}}
+--- permission.replied
+data: {"id":"evt_0dc8e0ddf001LGahccPzDQvuh7","type":"permission.replied","properties":{"sessionID":"ses_f237204c2ffew0YlIQMRoGkbrk","requestID":"per_0dc8e0d950015YF13XN1QQAEcz","reply":"once"}}
+--- session.idle
+data: {"id":"evt_0dc8e15b70018OjNOY8rXtt22q","type":"session.idle","properties":{"sessionID":"ses_f237204c2ffew0YlIQMRoGkbrk"}}
+--- message.part.delta
+data: {"id":"evt_0dc8e1571001BFI36rsRcdO7ul","type":"message.part.delta","properties":{"sessionID":"ses_f237204c2ffew0YlIQMRoGkbrk","messageID":"msg_0dc8e0f0a001ph7zUZCNIhzq4F","partID":"prt_0dc8e1567001rUrLg9he5sRlNi","field":"text","delta":"Raw output: `R2D2"}}
+--- server.heartbeat
+data: {"id":"evt_0dc8e1c44001tbKs2xV3zMvYOZ","type":"server.heartbeat","properties":{}}

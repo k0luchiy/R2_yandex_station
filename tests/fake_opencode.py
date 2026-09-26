@@ -41,7 +41,8 @@ the server never filters by `sessionID` -- the READER filters, and a fake that
 filtered for it would hide exactly the defect the filter exists to prevent. A
 subscriber gets `server.connected` first, then whatever is pushed; the stream ends
 when the test says so (`close_streams`) or after `stream_idle_s`, so a forgotten
-reader cannot hold a test open for ever.
+reader cannot hold a test open for ever. Every frame it pushes is shaped like the
+live one: the name in the body's `"type"`, and no `event:` line (D11).
 """
 
 from __future__ import annotations
@@ -499,8 +500,16 @@ def _json(document: Any, status_code: int = 200) -> JSONResponse:
 
 
 def _frame(kind: str, properties: dict[str, Any]) -> bytes:
-    """One SSE frame: an `event:` line, one `data:` line, then the blank separator."""
-    return f"event: {kind}\ndata: {json.dumps({'properties': properties})}\n\n".encode()
+    """One SSE frame, in the shape the live server actually sends: the event name is a
+    top-level `"type"` of the JSON body and there is NO `event:` line.
+
+    A 30-minute tap of `GET /event` on 1.18.32 recorded 1090 `data:` lines and 0
+    `event:` lines (`qa/d11-wire-tap.py` for the shorter confirmation), so a fake that
+    emitted an `event:` line would exercise a shape the server never sends -- which is
+    exactly how D11 stayed invisible behind a green suite.
+    """
+    body = json.dumps({"id": f"evt_{_next_event_id()}", "type": kind, "properties": properties})
+    return f"data: {body}\n\n".encode()
 
 
 def _forever() -> StreamingResponse:
@@ -518,6 +527,15 @@ def _next_message_id() -> str:
     global _sequence
     _sequence += 1
     return f"msg_{_sequence}"
+
+
+_events = 0
+
+
+def _next_event_id() -> str:
+    global _events
+    _events += 1
+    return f"{_events}"
 
 
 _sequence = 0

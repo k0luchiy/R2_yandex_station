@@ -1,0 +1,9 @@
+session: ses_f23636b4affeKBBhLUpXQYUfuR
+attempt 1: prompt_async sent
+
+BROKER REACHED: True
+event types the reader dispatched: ['server.connected', 'session.updated', 'message.updated', 'message.part.updated', 'session.updated', 'session.status', 'message.updated', 'session.updated', 'session.diff', 'message.updated', 'session.status', 'message.part.updated', 'message.part.updated', 'message.part.updated', 'permission.asked']
+pending row: {"kind": "opencode_permission", "session_id": "ses_f23636b4affeKBBhLUpXQYUfuR", "permission_id": "per_0dc9ca36c001Bi63vwPoFbtNIE", "title": "echo R2D2D11E2E", "always": ["echo *"], "requested_at": 1790407648.1118462}
+question the broker would send: ['Нужно подтверждение: echo R2D2D11E2E. Ответь в телеграм «да» или «нет».']
+resolve_from_text('да') -> approved
+the marker R2D2D11E2E is in the transcript: True

@@ -239,6 +239,15 @@ long the reader stays connected. `docs/11-opencode-contract.md` U4's line
 the unit tests cannot see it because they feed the decoder synthetic frames
 that do carry an `event:` line.
 
+**RESOLVED.** `decode_frame` now reads the body's `"type"`, with the `event:`
+field taking precedence when a server does send one; the U4 claim is corrected in
+`docs/11-opencode-contract.md` with the numbers above, and the rule is written
+down in `docs/11-opencode-backend.md` §8.0. The frames in
+`tests/test_sse_wire_frame.py` are verbatim bodies from `qa/d11-wire-tap.out` (44
+`data:` lines, 0 `event:` lines on a scratch server of the same build), nine of
+that module's tests fail against the decoder described above, and
+`tests/fake_opencode.py` no longer emits the `event:` line the server never sends.
+
 ### 4c — the identity half of D3 is proven, and no second session was minted
 
 ```

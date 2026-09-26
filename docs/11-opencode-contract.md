@@ -34,7 +34,7 @@
 | U1 | Изолирует ли `OPENCODE_CONFIG_DIR` агентов и `permission`, не ломая Zen-ключ? | **Частично.** Агенты и правила из скретч-конфига применяются, но поверх них по-прежнему видны 11 агентов и 15 провайдеров глобального конфига. Zen-ключ работает. | `ADOPTED:` строка U1 |
 | U2 | `system` в теле сообщения — per-message или session-persistent? | **Per-message.** Каждое user-сообщение хранит своё поле `system`. | `ADOPTED:` строка U2 |
 | U3 | Какую форму принимает параметр `tools`? | `Record<string, boolean>` — объект «имя инструмента → включён». | `ADOPTED:` строка U3 |
-| U4 | Точные строки SSE `event.type` для permission и завершения хода? | `permission.asked` / `permission.replied`; **события «конец хода» не существует** — ход закрывает `session.idle`. | `ADOPTED:` строка U4 |
+| U4 | Точные строки SSE `event.type` для permission и завершения хода? | `permission.asked` / `permission.replied`; **события «конец хода» не существует** — ход закрывает `session.idle`. **Имя приходит в теле JSON, полем `"type"`: `event:`-строки в потоке нет (1090 `data:` и 0 `event:` за 30 мин).** | `ADOPTED:` строка U4; коррекция D11 в разделе U4 |
 | U5 | Может ли `POST /session` задать рабочий каталог? | **Да — query-параметром `?directory=`, не телом.** | `ADOPTED:` строка U5 |
 | U6 | Реальная задержка `POST /session/:id/message`? | `space-bunny-free`: **p50 1.667 с**, p95 2.247 с. `muse-spark-1.3-contributor-free` **недоступен** (403). | `ADOPTED:` строка U6 |
 | U7 | Чем на самом деле ограничивается инструмент агента — `permission` или чем-то ещё? | **Видимостью, и только `deny` её отнимает.** `ask` не спрашивает ничего для инструмента, который сам не спрашивает. | `ADOPTED:` строка U7 |
@@ -220,6 +220,73 @@ user-сообщениях.
 Дополнительно в других прогонах наблюдались `server.heartbeat`, `session.created`,
 `tui.toast.show`, `catalog.updated`, `integration.updated`, `plugin.added`,
 `reference.updated` — то есть поток несёт и служебные, и чужие сессионные события.
+
+### U4-коррекция (D11) — поля `event:` на проводе нет
+
+Ранее в коде по U4 было записано «opencode всегда присылает `event:`-строку».
+**Провод это опровергает.** Отдельный замер `GET /event` на этой же сборке 1.18.32,
+30 минут на сервере владельца, построчный счёт полей:
+
+```
+1090  data:
+1091  <blank>
+   0  event:      ← строки `event:` в потоке нет вообще
+ 109  кадров с "type":"server.heartbeat"
+```
+
+Короткое подтверждение на скретч-сервере того же бинаря — `qa/d11-wire-tap.py`,
+вывод в `qa/d11-wire-tap.out`:
+
+```
+lines starting with 'data:':      44
+lines starting with 'event:':      0
+lines starting with ':' (comment): 0
+bodies by their own "type":      server.connected, permission.asked,
+                                 permission.replied, session.idle,
+                                 message.part.delta, server.heartbeat, session.updated,
+                                 message.updated, message.part.updated, session.status,
+                                 session.diff, session.created
+decode_frame() types, as shipped: {'message': 44}
+```
+
+Итог, который и есть суть D11: **имя события приходит в теле JSON, верхнеуровневым
+полем `"type"`**, а не в SSE-поле `event:`. Отсюда и `server.heartbeat`: его тело —
+`{"id":"evt_...","type":"server.heartbeat","properties":{}}`, пустой `properties`
+объект, без `sessionID`, поэтому фильтр сессии отбрасывает его на DEBUG и оператор
+его не видит.
+
+Ниже, в разделе «Событие запроса разрешения», все тела приведены дословно — и в них
+`"type"` стоит вторым ключом, после `"id"`. Это и есть настоящая форма кадра:
+
+```json
+{"id":"evt_0dc8e0d96001ENniA8TFQh84Kv","type":"permission.asked","properties":
+  {"id":"per_0dc8e0d950015YF13XN1QQAEcz","sessionID":"ses_f237204c2ffew0YlIQMRoGkbrk",
+   "permission":"bash","patterns":["echo R2D2D11TAP"],
+   "metadata":{"command":"echo R2D2D11TAP"},"always":["echo *"],
+   "tool":{"messageID":"msg_0dc8dfc20001Ay94pxsy3GeYG4",
+           "callID":"call_function_rds009nllcpm_1"}}}
+```
+
+**Почему это не было видно в тестах.** Юнит-тесты `tests/test_sse.py` кормили
+декодер рукописными кадрами, у которых `event:`-строка есть, — то есть формой,
+которую сервер не присылает никогда. 906 зелёных тестов ничего не говорили о
+проводе. Настоящие кадры теперь зафиксированы дословно в
+`tests/test_sse_wire_frame.py`, и девять из его тестов падают на прежнем декодере.
+
+**Правило разбора, зафиксированное кодом** (`core/opencode/sse_frames.py`):
+
+1. поле `event:` кадра, если оно есть и непустое, — выигрывает: это единственное
+   место, где спецификация SSE позволяет серверу назвать событие, и сервер,
+   который назвал, не додумывается;
+2. иначе `"type"` тела — то, что делает opencode 1.18.32, и единственный путь
+   настоящего кадра;
+3. иначе `SSE_DEFAULT_EVENT` (`"message"`), чтобы кадр без имени декодировался, а
+   не ронял поток.
+
+Кадр, назвавший себя в обоих местах по-разному, берёт `event:` и пишет WARNING:
+расхождения в этом протоколе не бывает, а молчаливый выбор одного из двух имён —
+это ровно тот способ, которым живой на вид поток перестаёт что-либо раздавать.
+
 
 **Событие запроса разрешения, дословно:**
 

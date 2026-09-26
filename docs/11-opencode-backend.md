@@ -848,10 +848,48 @@ TEXT_DELTA: Final = "message.part.delta"
 #: the pre-agreed degradations, kept typed so they stay reachable.
 EventMode: TypeAlias = Literal["sse", "poll", "deny"]
 EVENT_MODE: Final[EventMode] = "sse"
-#: SSE's own type for a frame that carried no `event:` line; opencode always sends
-#: one, so an unnamed frame is decoded rather than discarded.
+#: SSE's own type for a frame that named itself in neither place. opencode names
+#: every frame in its body and never in the `event:` field (U4, re-measured), so
+#: this is the shape of a frame from a third server, not of opencode's -- decoded
+#: rather than discarded, because an unnamed frame is still a frame.
 SSE_DEFAULT_EVENT: Final = "message"
 ```
+
+### 8.0 Откуда берётся имя события (D11)
+
+Имя приходит **из тела JSON**, верхнеуровневым полем `"type"`, а не из SSE-строки
+`event:`. Это измерено, а не выведено: замер `GET /event` на 1.18.32 дал 1090 строк
+`data:` и **ноль** строк `event:` за 30 минут, а короткое подтверждение на скретч-
+сервере — 44 `data:` и 0 `event:` (`qa/d11-wire-tap.py`, `qa/d11-wire-tap.out`).
+Все имена из таблицы выше — `server.connected`, `permission.asked`,
+`permission.replied`, `session.idle`, `message.part.delta` — лежат в поле `"type"`.
+
+Настоящий кадр выглядит так; строки `event:` в нём нет вообще:
+
+```text
+data: {"id":"evt_0dc8e0d96001ENniA8TFQh84Kv","type":"permission.asked","properties":{"id":"per_0dc8e0d950015YF13XN1QQAEcz", … }}
+```
+
+Поэтому `decode_frame` читает имя в таком порядке:
+
+1. **поле `event:` кадра, если оно есть и непустое, — выигрывает.** Это единственное
+   место, где спецификация SSE позволяет серверу назвать событие; сервер, который
+   назвал, не додумывается, даже если тело говорит другое;
+2. **иначе `"type"` тела** — то, что делает эта сборка, и единственный путь
+   настоящего кадра;
+3. **иначе `SSE_DEFAULT_EVENT`** — кадр, не назвавший себя нигде, декодируется
+   («безымянный кадр всё ещё кадр»), и падать тут нельзя: этот разбор стоит в
+   читателе, который отвечает на запросы разрешений.
+
+Порядок зафиксирован пятью тестами в `tests/test_sse_wire_frame.py`: только
+`event:`, только `"type"`, оба и совпадают, оба и расходятся, ни одного. Кадр, назвавший
+себя в обоих местах по-разному, берёт `event:` и пишет WARNING.
+
+**Почему это было не видно.** Юнит-тесты кормили декодер кадрами с `event:`-строкой —
+формой, которой сервер не присылает никогда, — поэтому 906 зелёных тестов ничего не
+говорили о проводе. `tests/fake_opencode.py` теперь тоже шлёт настоящую форму, и
+настоящие тела из замера лежат в тестах дословно; девять тестов падают на прежнем
+декодере.
 
 | `event_mode` | Что работает | Что это значит операционно | Кто отвечает на `permission.asked` |
 |---|---|---|---|

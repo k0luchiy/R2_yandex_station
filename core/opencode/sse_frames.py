@@ -5,6 +5,14 @@ rather than guessed (`docs/11-opencode-contract.md` U4, spike correction C5). Wh
 arrives on the wire and what a handler is allowed to see are two separable
 concerns, and this module is the first of them:
 
+* **The event name is in the BODY, not in an `event:` line.** Measured, not inferred:
+  a tap of `GET /event` on 1.18.32 recorded **44 `data:` lines and 0 `event:`
+  lines** (`qa/d11-wire-tap.out`), and every name U4 lists -- including
+  `permission.asked` -- arrives as a top-level `"type"` key of the JSON document.
+  Reading only the SSE `event:` field types all 44 of them `"message"`, which is
+  how the whole permission feature stayed dead behind a permanently healthy
+  connection. `decode_frame` therefore reads the body's `type`, with the `event:`
+  field taking precedence when a spec-compliant server does send one.
 * **It carries EVERY session.** A `permission.asked` for somebody else's session
   arrives on the same socket, so nothing reaches a handler without a
   `properties.sessionID` match -- the one defect here that could do real damage,
@@ -76,8 +84,10 @@ TEXT_DELTA: Final = "message.part.delta"
 #: the pre-agreed degradations, kept typed so they stay reachable.
 EventMode: TypeAlias = Literal["sse", "poll", "deny"]
 EVENT_MODE: Final[EventMode] = "sse"
-#: SSE's own type for a frame that carried no `event:` line; opencode always sends
-#: one, so an unnamed frame is decoded rather than discarded.
+#: SSE's own type for a frame that named itself in neither place. opencode names
+#: every frame in its body and never in the `event:` field (U4, re-measured), so
+#: this is the shape of a frame from a third server, not of opencode's -- decoded
+#: rather than discarded, because an unnamed frame is still a frame.
 SSE_DEFAULT_EVENT: Final = "message"
 #: A logged title is a preview, never a command to run; whoever acts reads
 #: `properties`, and a payload can be kilobytes long.
@@ -198,6 +208,20 @@ async def frames(response: httpx.Response) -> AsyncIterator[OpencodeEvent]:
 def decode_frame(event_type: str, data: Sequence[str]) -> OpencodeEvent | None:
     """One accumulated frame as an event, or `None` when it carries nothing to decode.
 
+    **Where the name comes from, and in what order.** The SSE `event:` field wins
+    whenever it is present, because that field is the only place the SSE
+    specification allows a server to state the name, and a server that states it
+    should not be second-guessed by a reader. opencode 1.18.32 sends none -- 44
+    `data:` lines against 0 `event:` lines in `qa/d11-wire-tap.out`, and 1090 against 0
+    in a 30-minute tap -- and puts the name in the body's own top-level `"type"`, so
+    that is the fallback and the only path a real frame can take on this build. A
+    frame that names itself in neither place decodes as `SSE_DEFAULT_EVENT` rather
+    than being dropped, because an unnamed frame is still a frame. A frame that
+    names itself in BOTH places and disagrees is a WARNING and takes the `event:`
+    field: nothing in this protocol expects a mismatch, and silently preferring one
+    of two names is how a stream that looks perfectly alive stops dispatching
+    anything at all.
+
     Three ways a frame can be unreadable, all of which must leave the stream alive:
     an empty `data` buffer (SSE says dispatch nothing), a body that is not JSON, and
     a body whose `properties` is not an object. The last is the misleading success --
@@ -213,13 +237,36 @@ def decode_frame(event_type: str, data: Sequence[str]) -> OpencodeEvent | None:
         # `str(exc)` is a position ("... line 1 column 3"), never the body itself.
         log.warning("opencode sse: dropping a %s frame: unreadable JSON (%s)", event_type, exc)
         return None
-    properties = payload.get("properties") if isinstance(payload, Mapping) else None
+    mapped: Mapping[str, object] = payload if isinstance(payload, Mapping) else {}
+    properties = mapped.get("properties")
     if not isinstance(properties, Mapping):
         log.warning("opencode sse: dropping a %s frame: 'properties' is not an object", event_type)
         return None
     return OpencodeEvent(
-        type=event_type or SSE_DEFAULT_EVENT, properties=MappingProxyType(dict(properties))
+        type=_name(event_type, mapped.get("type")),
+        properties=MappingProxyType(dict(properties)),
     )
+
+
+def _name(event_type: str, named: object) -> str:
+    """The frame's event name; never raises and never returns an empty string.
+
+    `named` is the body's `"type"` of whatever type JSON handed back, so a non-string
+    there reads as "this frame did not name itself" rather than as a name -- and a
+    name that is only whitespace is the same thing, because no constant and no
+    handler can ever match it.
+    """
+    body_type = _text(named)
+    if body_type is not None and not body_type.strip():
+        body_type = None
+    if not event_type:
+        return body_type or SSE_DEFAULT_EVENT
+    if body_type is not None and body_type != event_type:
+        log.warning(
+            "opencode sse: the event: field says %r and the body says %r; the event: field wins",
+            event_type, body_type,
+        )
+    return event_type
 
 
 def _text(value: object) -> str | None:
