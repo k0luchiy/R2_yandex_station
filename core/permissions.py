@@ -65,6 +65,7 @@ from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeError
 from core.opencode.sse import EVENT_MODE
 from core.policies import confirmation_verdict
+from core.routing import for_human
 from core.tools.telegram_tool import send_message
 
 log = logging.getLogger(__name__)
@@ -385,7 +386,17 @@ class PermissionBroker:
         The text is the user's and can be long and multi-line (a title is
         server-controlled), so it is never logged back -- only its size when Telegram
         refused it.
+
+        The title is interpolated into the question, notice and refusal templates
+        below, and it comes from the SERVER, so a command the user actually typed
+        containing the routing token would otherwise reach their own chat as a raw
+        protocol marker -- the leak D4 was opened for, arriving by a second door.
+        `for_human` is the one outbound guard for the whole project, so this path
+        uses it too. Every template carries prose of its own, so the `or text`
+        fallback is unreachable in practice; it exists so an emptied body degrades
+        to what it was rather than to an empty message.
         """
+        text = for_human(text, sentinel=self._cfg.r2d2_needs_agent_sentinel) or text
         if not await send_message(self._cfg, text):
             log.warning("opencode permissions: Telegram took no message of %d chars", len(text))
 

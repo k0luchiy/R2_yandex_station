@@ -953,6 +953,28 @@ async def test_a_title_with_newlines_cannot_split_the_log_record(broker, telegra
     assert "\n" not in lines[0]
 
 
+async def test_a_title_carrying_the_routing_token_never_reaches_the_chat(
+    broker, server: FakeOpencode, telegram: Telegram, cfg: Config
+):
+    """The routing token is internal protocol between the voice agent and the
+    brain, and the title is SERVER-controlled text built from whatever the user
+    asked for. A user who typed the token into a command would otherwise have it
+    read back to them as a raw protocol marker -- the D4 leak arriving by the
+    broker's door instead of the worker's. The guard removes the token and keeps
+    the sentence, because the question is still the user's to answer."""
+    # Given: an ask whose title carries the token the collectors strip
+    token = cfg.r2d2_needs_agent_sentinel
+    hostile = f"выполни {token} потом ls"
+    await broker.on_permission_requested(APP, SESSION_ID, PERMISSION_ID, hostile, ("*",))
+    # Then: the question reads as prose with the token gone and the rest intact
+    asked = telegram.texts()[0]
+    assert token not in asked
+    assert "потом ls" in asked
+    # And the acceptance notice passes through the same guarded boundary
+    await broker.resolve_from_text(APP, "да")
+    assert all(token not in text for text in telegram.texts())
+
+
 # ---------------------------------------------------------------------------
 # Static guard: the source itself
 # ---------------------------------------------------------------------------
