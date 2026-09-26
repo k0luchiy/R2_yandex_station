@@ -6,6 +6,15 @@ execution of todo 21. The first one is `qa/live-run.md` and
 exactly as measured — nothing below replaces them, and the D-numbering of the
 new findings continues from theirs (D9–D12).
 
+> **Navigation only — nothing below was changed.** The third execution of this
+> todo is [`qa/live-run-v3.md`](live-run-v3.md) and
+> [`qa/live-run-v3-fail.md`](live-run-v3-fail.md). It re-tests every finding
+> here after the D9 and D11 fixes: **4 of 6 scenarios pass**, the permission
+> loop works end to end for the first time (D11 fixed), **D9 is still broken**
+> and its prompt-rule mitigation was measured and found ineffective, D6
+> recurred on the `path=deadline` branch, D10 was not reproduced as a cause, and
+> it adds D13–D15. Every number and verdict in this file stands as measured.
+
 Nothing in the repository, in `config/`, in `~/.r2d2/opencode/` or in `tests/`
 was changed to produce this file. Every number below was measured on this
 machine against `opencode serve` **v1.18.32** on `127.0.0.1:4599` and R2D2 on

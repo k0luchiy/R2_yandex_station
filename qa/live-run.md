@@ -1,5 +1,13 @@
 # T21 — live end-to-end proof against a real `opencode serve`
 
+> **Navigation only — nothing below was changed.** The second and third
+> executions of this todo are [`qa/live-run-postfix.md`](live-run-postfix.md)
+> and [`qa/live-run-v3.md`](live-run-v3.md). The latest re-tests every finding
+> below after the D9 and D11 fixes: **4 of 6 scenarios pass**, the permission
+> loop works end to end for the first time, D9 is still broken, D6 recurred on
+> the `path=deadline` branch, and it adds D13–D15. Every number and verdict in
+> this file stands as measured.
+
 > **This file records the state BEFORE the fixes.** Every number, verdict and
 > finding below is what the run measured, and they are left exactly as measured —
 > that is the value of the document. The eight defects it found (D1–D8) have since
