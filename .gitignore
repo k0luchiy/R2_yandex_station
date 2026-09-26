@@ -1,9 +1,20 @@
+# Secrets. `.env` holds the OpenRouter key, the Telegram bot token and the
+# opencode client credentials; `.env.oc` holds the `opencode serve` password.
+# Both are committed nowhere and their examples are the only `.env*` files that
+# may be tracked -- the negations below exist so a future `.env.local` or
+# `.env.prod` is ignored by default rather than by remembering.
 .env
 .env.oc
+.env.*
+!.env.example
+!.env.oc.example
+
+# Machine state and scratch output.
 db/
-__pycache__/
-*.pyc
 .venv/
 .omo/
-.codegraph
 .r2d2/
+/tmp/
+.codegraph
+__pycache__/
+*.pyc
