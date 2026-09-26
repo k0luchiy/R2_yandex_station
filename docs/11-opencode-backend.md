@@ -65,7 +65,7 @@ opencode недоступен.
 | `GET` | `/agent` | список определений агентов: имена проверяются, а не угадываются | `core/opencode/client.py` → `agents()` |
 | `GET` | `/event` | живой SSE-поток: `permission.asked` и конец хода | `core/opencode/sse.py` → `EventSource.events()` |
 
-### 2.1 Четыре правила, без которых это не работает
+### 2.1 Пять правил, без которых это не работает
 
 **Аутентификация — HTTP basic.** Пароль приходит в `OPENCODE_SERVER_PASSWORD`,
 R2D2 отправляет его как basic-auth. Лаунчер **отказывается стартовать** без
@@ -115,6 +115,57 @@ HEALTH_TIMEOUT_S: Final = 1.5
 #: `OpencodeDeadlineExceeded` rather than a bare `httpx.TimeoutException`.
 DEADLINE_GRACE_S: Final = 0.5
 ```
+
+**Поток событий не читается голосовым дедлайном.** `GET /event` — не запрос: это
+соединение, которое живёт столько, сколько живёт сессия, и opencode отправляет
+в него `server.heartbeat` раз в **10,0 с** (измерено на этой машине, U4).
+Наехав на тот же `timeout: 3.2` — это бюджет Алисы, а не потока — читатель не
+дожидался даже первого сердцебиения: он переподключался по лестнице
+`3,2 с / 5 с` и был слеп большую часть каждого окна. Живой прогон показал это
+буквально: **7 из 7** `permission.asked`, отправленных сервером в провод, читатель
+не увидел, а брокер разрешений, который живёт только на этом событии, не
+работает совсем. Поэтому у потока своя граница — `event_read_timeout` в
+`config/backends.json`, — а `timeout` остаётся дедлайном запроса:
+
+```verbatim core/backends/config_loader.py
+#: The bound on ONE read of the long-lived opencode event stream. It is a different
+#: measurement from `timeout` and needs a different number: opencode heartbeats
+#: every 10.0 s on the build that was measured, so a read bound below that cannot
+#: survive to the next heartbeat and the reader reconnects instead of listening --
+#: blind, and missing `permission.asked`, for a large part of every window. Three
+#: heartbeats of slack keeps a healthy connection through a dropped or delayed one,
+#: and still bounds how long a genuinely dead server goes unnoticed by something
+#: far shorter than the 300 s the permission broker waits before it rejects an
+#: unanswered ask. See `core/opencode/sse.py`.
+DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
+```
+
+```verbatim core/opencode/sse.py
+    def _timeouts(self) -> httpx.Timeout:
+        """The request deadline for everything that is a request, and the stream's own
+        bound for the one read that is supposed to wait.
+
+        Sharing a single number here is what made the reader blind: the read bound
+        has to outlast a 10.0 s heartbeat, and the request deadline must not, because
+        a caller waiting on a turn has 3.2 s of Alice budget. httpx applies the read
+        timeout per socket read, so one long bound is exactly the patience an idle
+        stream needs and never a ceiling on the whole connection.
+        """
+        return httpx.Timeout(
+            connect=self._deadline_s,
+            read=self._read_timeout_s,
+            write=self._deadline_s,
+            pool=self._deadline_s,
+        )
+```
+
+Тридцать секунд — это три сердцебиения запаса: одно потерянное или задержавшееся
+не рвёт живую связь, а сервер, который действительно умер, обнаруживается намного
+быстрее, чем `r2d2_permission_timeout` (300 с), по которому брокер отказывает в
+неотвеченном вопросе. Длинная граница не делает выключение долгим: читатель
+освобождается отменой задачи, а не ожиданием своей границы, и
+`tests/test_sse_stream_timeout.py` проверяет и то, и другое через настоящий сокет —
+`MockTransport` не имеет таймаутов и этот дефект увидеть не мог.
 
 **HTTP 200 — это не ответ.** Отказ модели лежит в поле `info.error` внутри
 успешного 200, поэтому проверка содержимого предшествует чтению `parts`. Ниже —
@@ -285,7 +336,8 @@ DEADLINE_GRACE_S: Final = 0.5
      "username": "${R2D2_OC_USERNAME}", "password": "${R2D2_OC_PASSWORD}",
      "voice_agent": "r2d2-voice", "task_agent": "r2d2-agent",
      "fast_model": "opencode/space-bunny-free", "task_model": "opencode/space-bunny-free",
-     "summarize_model": "opencode/space-bunny-free", "timeout": 3.2},
+     "summarize_model": "opencode/space-bunny-free", "timeout": 3.2,
+     "event_read_timeout": 30.0},
 ```
 
 `${VAR}` подставляется из окружения за один проход. Отсутствующая переменная в
@@ -664,7 +716,7 @@ graceful-ветка. Ни в одном поле нет ничего, что п�
 
 ## 8. `EVENT_MODE`: три режима
 
-```verbatim core/opencode/sse.py
+```verbatim core/opencode/sse_frames.py
 #: The event names U4 recorded, verbatim (C5). `GET /doc` also advertises V2
 #: spellings (`permission.v2.asked`, `session.next.*`) which this build was never
 #: seen sending, so they are not defined here and must not be used.
@@ -703,7 +755,7 @@ SSE_DEFAULT_EVENT: Final = "message"
 разрешения. Поэтому конец хода — это `session.idle` **и** отсутствие
 `permission.asked` без парного `permission.replied`:
 
-```verbatim core/opencode/sse.py
+```verbatim core/opencode/sse_frames.py
 def turn_is_complete(events: Iterable[OpencodeEvent]) -> bool:
     """Whether `events` end a finished turn -- the C5 rule 2 conjunction.
 
@@ -751,7 +803,7 @@ def turn_is_complete(events: Iterable[OpencodeEvent]) -> bool:
 | **C2** | `OPENCODE_CONFIG_DIR` **складывается** с глобальным конфигом, а не изолирует его: 11 чужих агентов и 15 чужих провайдеров остаются видимы. Отсюда адресация по точному имени и явное решение каждого ключа разрешений | `config/opencode/r2d2.opencode.json` |
 | **C3** | `system` действует **на одно сообщение**. Системные промпты лежат в определениях агентов, а не в теле каждого запроса | `config/opencode/r2d2.opencode.json` |
 | **C4** | `tools` — это `Record<string, boolean>`, и он перекрывает `permission` агента на время хода. Но в `GET /agent` поле `tools` читается как `null`, а объявленный `tools` нормализуется в правила `permission` — проверять надо `permission` | `config/opencode/r2d2.opencode.json` |
-| **C5** | Строки событий точные: `server.connected`, `permission.asked`, `permission.replied`, `session.idle`, `message.part.delta`. События «ход завершён» **не существует**. `GET /event` глобальный — фильтровать по `properties.sessionID`. `always` не отправлять никогда | `core/opencode/sse.py`, `core/permissions.py` |
+| **C5** | Строки событий точные: `server.connected`, `permission.asked`, `permission.replied`, `session.idle`, `message.part.delta`. События «ход завершён» **не существует**. `GET /event` глобальный — фильтровать по `properties.sessionID`. `always` не отправлять никогда. `server.heartbeat` идёт раз в **10,0 с**, поэтому граница чтения потока — `event_read_timeout`, а не голосовой `timeout` | `core/opencode/sse.py`, `core/opencode/sse_frames.py`, `core/permissions.py` |
 | **C6** | Каталог сессии — **query-параметр** `?directory=`. Тот же ключ в теле принимается с 200 и молча игнорируется, а сам путь сервер **не проверяет** — проверяет клиент | `core/opencode/client.py`, `core/opencode/session_store.py` |
 | **C7** | `GET /session/{session_id}/message` возвращает `{info, parts}`, а не плоский список: чтение `role` верхнего уровня молча даёт `None`. Неизвестный агент — **500** с бесполезным телом; неизвестный `model id` — **не ошибка** | `core/opencode/wire.py`, `core/opencode/models.py` |
 | **C8** | Измеренная задержка: p50 1.667 с, p95 2.247 с, `r2d2_fast_deadline` = 3.2 с. **Первый ход в новой сессии — 15.5–18.6 с** и не должен стоять на синхронном голосовом пути | `app/config.py`, `core/brain.py` |
@@ -836,7 +888,8 @@ def title_for(application_id: str) -> str:
 | `core/opencode/client.py` | 12 HTTP-маршрутов `opencode serve` |
 | `core/opencode/models.py` | проверка `model id` по `GET /config/providers` (ворота C1) |
 | `core/opencode/session_store.py` | одна сессия на пользователя плюс сборщик зависших |
-| `core/opencode/sse.py` | чтение `GET /event`, три значения `EVENT_MODE` |
+| `core/opencode/sse.py` | чтение `GET /event`: соединение, границы таймаутов, фильтр по сессии |
+| `core/opencode/sse_frames.py` | словарь событий opencode и разбор кадра SSE (`OpencodeEvent`, `turn_is_complete`) |
 | `core/opencode/wire.py` | типы и разбор ответов opencode, иерархия `OpencodeError` |
 | `core/permissions.py` | брокер `permission.asked`: вопрос, ответ, отказ по таймауту |
 | `core/policies.py` | риск команды и разбор ответа «да/нет» |

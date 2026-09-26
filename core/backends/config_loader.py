@@ -41,7 +41,28 @@ log = logging.getLogger(__name__)
 REPO_ROOT: Final = Path(__file__).resolve().parents[2]
 VALID_KINDS: Final[tuple[str, ...]] = ("opencode_session", "openai_compatible")
 CREDENTIAL_FIELDS: Final[frozenset[str]] = frozenset({"api_key", "username", "password"})
+#: The per-request deadline: one bound for a call that must answer inside a budget.
 DEFAULT_TIMEOUT: Final = 3.0
+#: The bound on ONE read of the long-lived opencode event stream. It is a different
+#: measurement from `timeout` and needs a different number: opencode heartbeats
+#: every 10.0 s on the build that was measured, so a read bound below that cannot
+#: survive to the next heartbeat and the reader reconnects instead of listening --
+#: blind, and missing `permission.asked`, for a large part of every window. Three
+#: heartbeats of slack keeps a healthy connection through a dropped or delayed one,
+#: and still bounds how long a genuinely dead server goes unnoticed by something
+#: far shorter than the 300 s the permission broker waits before it rejects an
+#: unanswered ask. See `core/opencode/sse.py`.
+DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
+#: Fields read as JSON numbers rather than strings. A boolean is not a number here:
+#: `true` is a plausible typo for a timeout and would otherwise mean 1 second.
+NUMERIC_FIELDS: Final[frozenset[str]] = frozenset({"timeout", "event_read_timeout"})
+#: A liveness bound that can be switched off by a typo is worse than none. httpx
+#: maps a non-positive timeout onto an already-expired deadline, so a `0` does not
+#: mean "patient", it means every connect raises at once and the reader is dead --
+#: the same blindness this bound exists to remove, silent in the config file.
+#: `timeout` is deliberately not in here: a request deadline of `0` has always
+#: meant "wait as long as it takes" in this project, and that must not change.
+POSITIVE_FIELDS: Final[frozenset[str]] = frozenset({"event_read_timeout"})
 
 _PLACEHOLDER: Final = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -73,6 +94,11 @@ class BackendSpec:
     task_model: str = ""
     summarize_model: str = ""
     timeout: float = DEFAULT_TIMEOUT
+    #: One read of the long-lived event stream. Separate from `timeout` because a
+    #: liveness read and a bounded call are different measurements: sharing one
+    #: number made the reader time out before the next heartbeat and miss every
+    #: `permission.asked` that arrived in between.
+    event_read_timeout: float = DEFAULT_EVENT_READ_TIMEOUT
     auth_style: str = ""
     auth_mode: str = ""
     extra: Mapping[str, str] = field(default_factory=dict)
@@ -153,10 +179,15 @@ def _spec_from_entry(entry: object, *, strict_credentials: bool) -> BackendSpec:
         if f.name in ("name", "kind", "extra") or f.name not in entry:
             continue
         raw = entry[f.name]
-        if f.name == "timeout":
+        if f.name in NUMERIC_FIELDS:
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 raise BackendConfigError(
-                    f"backend {name!r} field 'timeout' must be a number, got {_type_name(raw)}"
+                    f"backend {name!r} field {f.name!r} must be a number, got {_type_name(raw)}"
+                )
+            if f.name in POSITIVE_FIELDS and raw <= 0:
+                raise BackendConfigError(
+                    f"backend {name!r} field {f.name!r} must be greater than 0, got {raw}: a "
+                    "non-positive bound is an expired deadline, not an absent one"
                 )
             values[f.name] = float(raw)
         else:

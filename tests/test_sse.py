@@ -712,6 +712,45 @@ async def test_the_backoff_ladder_grows_to_the_cap_and_stays_there() -> None:
     assert seen == []
 
 
+async def test_a_connection_that_delivered_a_frame_starts_the_ladder_over() -> None:
+    """The ladder is for a server that is not answering, so an answered connection
+    ends it.
+
+    `server.connected` is the first frame of EVERY connection (U4), so any frame at
+    all is proof the server is up. Without this the ladder only ever grows, and one
+    process-lifetime reader sits at the 5 s cap for ever after its third blip --
+    a 5 s blind window on every reconnect, which is a fifth of the 10.0 s heartbeat
+    the read bound now tolerates. A connection that delivered nothing is still a
+    failure, so the cap still holds against a server that is down.
+    """
+    # Given: alternating connections that answer and connections that do not
+    delays: list[float] = []
+    stop = asyncio.Event()
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+        if len(delays) == 4:
+            stop.set()
+
+    failures: list[Exception | None] = [
+        None,
+        httpx.ReadError("reset"),
+        None,
+        httpx.ReadError("reset"),
+        None,
+        None,
+    ]
+    server = EventServer([[connected_frame()], [connected_frame() + idle_frame()]], failures=failures)
+    _seen, handler = _collector()
+    source, _ = _source(server, sleep=sleep)
+    # When
+    await asyncio.wait_for(source.run(handler, stop=stop), 2.0)
+    # Then: 1.0 (answered) -> 1.0 (failed) -> 2.0 (answered) -> 1.0 (failed), and
+    # the growth is gone the moment a frame arrives
+    assert delays == [1.0, 1.0, 2.0, 1.0]
+    assert server.connections == 4
+
+
 async def test_a_transport_error_is_retried_and_the_next_connection_delivers() -> None:
     """`httpx.ReadError` on the first call, a real stream on the second -- the
     reader retries, delivers, and raises nothing."""

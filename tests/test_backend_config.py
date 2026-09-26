@@ -10,6 +10,8 @@ import pytest
 
 from app.config import Config
 from core.backends.config_loader import (
+    DEFAULT_EVENT_READ_TIMEOUT,
+    DEFAULT_TIMEOUT,
     VALID_KINDS,
     BackendChain,
     BackendConfigError,
@@ -48,6 +50,7 @@ SPEC_FIELDS = (
     "task_model",
     "summarize_model",
     "timeout",
+    "event_read_timeout",
     "auth_style",
     "auth_mode",
     "extra",
@@ -238,6 +241,24 @@ def test_backend_chain_and_spec_shapes() -> None:
     assert BackendChain(order=("a",)).unused == ()
 
 
+def test_the_stream_read_bound_has_its_own_default_and_is_read_as_a_number(
+    tmp_path: Path,
+) -> None:
+    # Given a backend that declares the bound, and one that does not
+    cfg = cfg_for(
+        tmp_path,
+        payload(backend(event_read_timeout=12.5), backend(name="spare")),
+    )
+    # When
+    _, specs = load_backend_specs(cfg)
+    # Then a declared value is read, and an absent one is the measured default
+    assert specs["zen"].event_read_timeout == 12.5
+    assert specs["spare"].event_read_timeout == DEFAULT_EVENT_READ_TIMEOUT
+    # and it is a bound for the long-lived stream, so it is not the request deadline
+    assert DEFAULT_EVENT_READ_TIMEOUT > DEFAULT_TIMEOUT
+    assert specs["spare"].timeout == DEFAULT_TIMEOUT
+
+
 # --------------------------------------------------------------------------
 # Config surface (plan todo 2 field list)
 # --------------------------------------------------------------------------
@@ -401,6 +422,13 @@ def test_chain_entry_without_a_matching_backend_raises(tmp_path: Path) -> None:
         ({"timeout": "3.2"}, "timeout", "zen"),
         ({"timeout": True}, "timeout", "zen"),
         ({"timeout": None}, "timeout", "zen"),
+        ({"event_read_timeout": "30"}, "event_read_timeout", "zen"),
+        ({"event_read_timeout": False}, "event_read_timeout", "zen"),
+        # 0 and a negative are not "no bound": httpx maps them onto an
+        # already-expired deadline, so every connect raises at once and the
+        # reader is dead rather than patient.
+        ({"event_read_timeout": 0}, "event_read_timeout", "zen"),
+        ({"event_read_timeout": -1.0}, "event_read_timeout", "zen"),
         ({"retry_policy": {"n": 1}}, "retry_policy", "zen"),
     ],
 )
