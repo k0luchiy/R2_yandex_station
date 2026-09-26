@@ -839,6 +839,55 @@ async def test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal(
     assert len(rig.server.turns) == 1
 
 
+async def test_an_escalated_turn_enqueues_the_collector_that_will_ship_the_answer(
+    rig: Rig,
+) -> None:
+    # Given a warm session and a voice agent that handed the turn to the full agent
+    rig.server.reply = f"Это займёт времени. {SENTINEL} собрать последние статьи про RAG"
+    session_id = await rig.warm()
+    # When
+    text = await rig.say()
+    # Then the ack is spoken, and the agent was given the request ...
+    assert text == ACK
+    assert [turn.agent for turn in rig.server.turns if turn.submitted] == [TASK_AGENT]
+    # ... and EXACTLY ONE collector is armed to bring its answer back. The escalation
+    # is the branch the whole two-path design exists for, and with no collector the
+    # promise `r2d2-agent`'s prompt makes ("твой финальный текст доставляется в
+    # телеграм") is kept by nothing at all.
+    jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert set(job) == JOB_FIELDS
+    assert (job["application_id"], job["session_id"]) == (APP, session_id)
+    # ... anchored on the last message the session held BEFORE this turn's work was
+    # submitted, so the collector returns the agent's answer and never replays the
+    # conversation the user already had
+    held = rig.server.transcript[session_id]
+    assert held, "the session was empty, so there is no marker to check"
+    assert job["since_message_id"] == held[-1]["info"]["id"]
+    assert job["timeout_s"] == COLLECT_TIMEOUT_S
+
+
+async def test_two_turns_that_escalate_arm_one_collector_each_and_never_twice(
+    rig: Rig,
+) -> None:
+    # Given a cold session, and then a warm one -- the two branches that submit
+    # work to the agent without a deadline
+    session_id = await rig.store.resolve(APP)
+    assert await rig.say() == ACK
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    assert await rig.say() == ACK
+    # When / Then: two turns, two collectors, one each
+    jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
+    assert len(jobs) == 2
+    assert all(job["application_id"] == APP for job in jobs)
+    assert all(job["session_id"] == session_id for job in jobs)
+    # ... a second collector for one turn would deliver the same answer twice, which
+    # on a phone reads as two answers and is the failure a duplicate Telegram
+    # message looks like to the user
+    assert all(job["timeout_s"] == COLLECT_TIMEOUT_S for job in jobs)
+
+
 # ---------------------------------------------------------------------------
 # 3. The permission gate: opencode's ask is answered, and only by the user
 # ---------------------------------------------------------------------------
@@ -1033,6 +1082,31 @@ async def test_the_second_turn_of_a_new_user_answers_synchronously(rig: Rig) -> 
     assert rig.server.route_count("POST", "/message") == 1
 
 
+async def test_a_cold_first_turn_enqueues_the_collector_that_will_ship_the_answer(
+    rig: Rig,
+) -> None:
+    # Given a user R2D2 has never asked anything, so the turn takes the C8 branch
+    session_id = await rig.store.resolve(APP)
+    # When
+    text = await rig.say("собери последние статьи про RAG")
+    # Then the ack is spoken, and the work is with the agent ...
+    assert text == ACK
+    assert [turn.agent for turn in rig.server.turns if turn.submitted] == [TASK_AGENT]
+    # ... and EXACTLY ONE collector is armed for it. Without one the agent researches
+    # for as long as it likes and the user receives nothing: the live run did exactly
+    # that, and nothing else in the system would ever read the answer back out.
+    jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
+    assert len(jobs) == 1
+    job = jobs[0]
+    assert set(job) == JOB_FIELDS
+    assert (job["application_id"], job["session_id"]) == (APP, session_id)
+    # ... anchored on an empty session: the marker is `""`, which the collector reads
+    # as "everything the session ever holds is newer than this", the truth for a
+    # session that was created microseconds ago
+    assert job["since_message_id"] == ""
+    assert job["timeout_s"] == COLLECT_TIMEOUT_S
+
+
 # ---------------------------------------------------------------------------
 # 6. A deadline is not an abort
 # ---------------------------------------------------------------------------
@@ -1102,6 +1176,38 @@ async def test_the_collected_turn_ships_the_agents_own_text_to_telegram(
         await worker.stop()
     assert net.telegram == [AGENT_REPLY]
     assert job["session_id"] == session_id
+
+
+async def test_a_turn_that_outran_the_deadline_still_gives_the_agent_the_request(
+    rig: Rig,
+) -> None:
+    # Given a voice turn that outruns the deadline. It is still running server-side
+    # and will answer one way or the other -- an answer, or the escalation marker --
+    # and at the moment the deadline fires R2D2 cannot know which.
+    rig.server.hang_turn = True
+    session_id = await rig.warm()
+    asked = "открой браузер на ноутбуке"
+    # When
+    text = await rig.say(asked)
+    # Then the user is acknowledged rather than left waiting ...
+    assert text == ACK
+    # ... the voice turn was NOT aborted: the work it started is not thrown away ...
+    assert rig.server.aborted == []
+    # ... and the AGENT was given the user's own words anyway. Guessing that the
+    # late turn will answer is what dropped the request on the floor: on the live
+    # run six laptop-control attempts all overran 3.2s and the agent never saw one
+    # of them, so the work existed nowhere at all.
+    submitted = [turn for turn in rig.server.turns if turn.submitted]
+    assert len(submitted) == 1, rig.server.turns
+    assert submitted[0].agent == TASK_AGENT
+    assert submitted[0].session_id == session_id
+    assert submitted[0].text == f"Пользователь попросил голосом: {asked}"
+    # ... with the SAME single collector the branch already armed, so the agent's
+    # answer is still delivered exactly once and the late voice turn's own text is
+    # inside its window rather than in a second, duplicate delivery
+    jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
+    assert len(jobs) == 1
+    assert jobs[0]["session_id"] == session_id
 
 
 # ---------------------------------------------------------------------------

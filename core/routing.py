@@ -1,12 +1,13 @@
 """The one decision that keeps the voice path inside Alice's 4.5 s budget -- and
-the two guards that keep a machine token from ever being spoken (plan todo 13).
+the three guards that keep a machine token from ever reaching a human (plan todo 13).
 
 `r2d2-voice` gets one round, `r2d2_fast_deadline` seconds, to either answer or
 say it cannot. It signals the second case by emitting the sentinel
 (`r2d2_needs_agent_sentinel`, `[[NEEDS_AGENT]]` by default) into its reply, and
 this module turns that string into a `RouteDecision`. Two independent guards
-stand between the sentinel and Alice's `text`/`tts` field, and the third is the
-brain's own assertion (todo 15):
+stand between the sentinel and Alice's `text`/`tts` field, the third is the
+brain's own assertion (todo 15), and a fourth guards the other direction a turn
+can leave by -- Telegram, which Alice cannot send to:
 
 * `parse_voice_reply` is the **structural** guard: it splits at the first
   sentinel and *discards the tail*, so the escalation payload is never a value
@@ -20,8 +21,15 @@ brain's own assertion (todo 15):
   result, a Telegram-only answer, a backend's error string. A guard that is
   total rather than case-by-case is the whole point: enumerating the shapes is
   how a guard leaks.
+* `for_human` is the guard for the **collector**, which reads an assistant
+  message straight out of the session and has no idea whether it is an answer or
+  a routing signal. It lives here rather than in the worker because the sentinel
+  is this module's subject: the worker is handed the token, exactly as
+  `parse_voice_reply` is. Unlike the two above it does NOT drop the whole
+  message -- a 60-paper digest that quotes the token in one sentence must still
+  arrive -- so it removes the token and keeps the rest.
 
-Two decisions this module makes, both tested:
+Three decisions this module makes, all tested:
 
 * **An empty sentinel raises `ValueError`.** `"" in raw` is true for every
   string, so treating an empty sentinel as "absent" would silently disable
@@ -50,6 +58,7 @@ from core.opencode.wire import split_model
 
 __all__ = [
     "RouteDecision",
+    "for_human",
     "parse_voice_reply",
     "sanitize_for_speech",
     "split_model",
@@ -113,3 +122,45 @@ def sanitize_for_speech(raw: str | None, *, sentinel: str) -> str:
     if raw is None or sentinel in raw:
         return ""
     return raw
+
+
+def for_human(raw: str | None, *, sentinel: str) -> str:
+    """The part of `raw` a human may read: the token is out, the answer is in.
+
+    The collector reads assistant text straight out of a session, and a session
+    holds BOTH kinds of assistant message: the agent's answer, and the voice
+    agent's `[[NEEDS_AGENT]]` routing signal. Telling them apart is this
+    module's job, so this is where the Telegram boundary is guarded -- one
+    function every outbound body passes through, rather than a strip in each
+    producer that can be forgotten by the next one.
+
+    Unlike `sanitize_for_speech` it does **not** drop everything it is given.
+    On a speaker there is nothing else in a text carrying the token, but a
+    Telegram body is a 60-paper digest that may *quote* the token in a sentence,
+    and suppressing the whole message to remove one word would throw the answer
+    away with it. So the token is removed and the rest survives:
+
+    * a line that was nothing but the token disappears, because a line of pure
+      protocol is not a message;
+    * a line that merely mentions it keeps every other character, with the double
+      space the removal leaves closed, so an answer is never mangled past
+      recognition;
+    * a line without the token is passed through byte for byte -- the output is a
+      subsequence of the input's lines, and the only thing ever edited is a line
+      the protocol had already touched.
+
+    `""` means nothing was left to show, which is the same fact an empty
+    collection reports and is the caller's to state.
+    """
+    _require_sentinel(sentinel)
+    if not raw:
+        return ""
+    kept: list[str] = []
+    for line in raw.split("\n"):
+        if sentinel not in line:
+            kept.append(line)
+            continue
+        remainder = line.replace(sentinel, "").replace("  ", " ").strip()
+        if remainder:
+            kept.append(remainder)
+    return "\n".join(kept)

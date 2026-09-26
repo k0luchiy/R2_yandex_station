@@ -620,8 +620,7 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
             self._handoff(rec, wiring)
-            await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}")
-            return self.cfg.r2d2_task_ack, False
+            return await self._hand_to_agent(wiring, app_id, session_id, command)
         current_application_id.set(app_id)
 ```
 

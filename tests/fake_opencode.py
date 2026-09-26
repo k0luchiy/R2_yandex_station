@@ -174,7 +174,7 @@ class FakeOpencode:
     )
     _sessions_made: int = field(default=0, init=False, repr=False)
     _polls: dict[str, int] = field(default_factory=dict, init=False, repr=False)
-    _pending: dict[str, str] = field(default_factory=dict, init=False, repr=False)
+    _pending: dict[str, list[str]] = field(default_factory=dict, init=False, repr=False)
 
     # -- what a test reads and writes ----------------------------------------
 
@@ -436,20 +436,26 @@ class FakeOpencode:
         read instead would be a different server -- one that answers before the ask
         -- and it would make the marker `Brain._collect_later` takes equal to the
         answer it is looking for.
+
+        A QUEUE, not one slot: a session that has accepted two turns owes two
+        answers, and holding only the last one would lose a turn the server is
+        still working on -- which is what happens when a voice turn outruns the
+        deadline and the request is handed to the agent as well.
         """
-        self._pending[session_id] = answer
+        self._pending.setdefault(session_id, []).append(answer)
 
     def _answer_for(self, text: str) -> str:
         """What the model says about THIS question; `reply` unless it asks otherwise."""
         return self.escalation if ESCALATE_WORD in text.lower() else self.reply
 
     def _polled(self, session_id: str) -> list[dict[str, Any]]:
-        """The transcript as of this read, releasing a held answer from the second one."""
+        """The transcript as of this read, releasing the held answers from the second one."""
         polls = self._polls[session_id] = self._polls.get(session_id, 0) + 1
-        answer = self._pending.get(session_id)
-        if answer is not None and polls >= 2:
+        held = self._pending.get(session_id)
+        if held and polls >= 2:
             del self._pending[session_id]
-            self._seed(session_id, answer, "assistant")
+            for answer in held:
+                self._seed(session_id, answer, "assistant")
         return self.transcript.get(session_id, [])
 
     def _seed(self, session_id: str, text: str, role: str) -> None:

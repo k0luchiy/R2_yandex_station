@@ -102,6 +102,17 @@ AGENT_REPLY: Final = "Сводка готова: три статьи про RAG.
 #: here as a literal and checked against the module's own constant below, so the
 #: assertion can never pass by comparing the worker to itself.
 NO_REPLY: Final = "Агент не ответил."
+#: `r2d2_needs_agent_sentinel` as the app ships it, read off the dataclass so a
+#: rename in `app/config.py` fails here instead of silently un-guarding the send.
+SENTINEL: Final = Config().r2d2_needs_agent_sentinel
+#: The voice agent's protocol answer, in the exact shape the live run put into the
+#: user's chat eleven times: the marker on its own line, then the one short task
+#: line `docs/11-opencode-backend.md` §4.1 allows after it.
+PROTOCOL_TASK_LINE: Final = "Выполнить в терминале `ls -la /tmp` и пересказать каталог."
+PROTOCOL_REPLY: Final = f"{SENTINEL}\n{PROTOCOL_TASK_LINE}"
+#: What the full agent answers, and the reason the whole collector exists: a
+#: result far too long for Alice's 1024 characters.
+AGENT_DIGEST: Final = "Сводка готова: 60 статей про RAG, три лучшие в приложении."
 #: The pre-existing default for a job type nothing dispatches.
 UNKNOWN_TEXT: Final = "Неизвестная задача."
 #: The password lives in exactly one place -- the spec handed to the real client
@@ -625,7 +636,53 @@ async def test_an_unknown_job_type_is_still_answered_with_the_unknown_text(
 
 
 # ---------------------------------------------------------------------------
-# 7. The dispatch itself: explicit, not a dynamic attribute lookup
+# 7. The escalation marker is machine protocol, not a message for a human
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("collected", "delivered"),
+    (
+        pytest.param(SENTINEL, NO_REPLY, id="a-body-that-was-nothing-but-the-token"),
+        pytest.param(PROTOCOL_REPLY, PROTOCOL_TASK_LINE, id="the-token-line-gone-the-task-line-kept"),
+        pytest.param(
+            f"{PROTOCOL_REPLY}\n{AGENT_DIGEST}",
+            f"{PROTOCOL_TASK_LINE}\n{AGENT_DIGEST}",
+            id="the-digest-arrives-beside-the-token-it-followed",
+        ),
+        pytest.param(
+            f"{AGENT_DIGEST}\nПометка {SENTINEL} — служебная метка.",
+            f"{AGENT_DIGEST}\nПометка — служебная метка.",
+            id="a-mention-loses-the-token-and-nothing-else",
+        ),
+    ),
+)
+async def test_no_outbound_body_ever_carries_the_escalation_marker(
+    net: Net,
+    cfg: Config,
+    memory: Memory,
+    log: logging.Logger,
+    collected: str,
+    delivered: str,
+) -> None:
+    # Given a collector that ends with text carrying the machine token -- the shape
+    # that put eleven `[[NEEDS_AGENT]]` messages in the owner's Telegram chat on the
+    # live run, because nothing between the session and `send_message` looked at it
+    collector = FakeCollector(deque([collected]))
+    worker = Worker(cfg, memory, log, opencode_backend=collector)
+    document = job()
+    # When the job runs. `_run_job` is called directly rather than through the loop
+    # because the assertion is about the body the sender was handed, and a task this
+    # worker spawned would answer "what was sent" only after the test had finished.
+    await worker._run_job(await memory.create_job(document), document)
+    # Then the user reads exactly the human part of the collected text ...
+    assert net.sent == [delivered]
+    # ... and no outbound body anywhere carries the protocol token
+    assert all(SENTINEL not in text for text in net.sent)
+
+
+# ---------------------------------------------------------------------------
+# 8. The dispatch itself: explicit, not a dynamic attribute lookup
 # ---------------------------------------------------------------------------
 
 

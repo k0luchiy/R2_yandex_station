@@ -675,6 +675,42 @@ async def test_the_first_turn_of_a_new_session_is_acknowledged_and_submitted(sta
     assert stack.fake.turns[0].model == MODEL_ID
 
 
+async def test_a_cold_turn_delivers_what_the_agent_answered_to_telegram(stack: Stack) -> None:
+    # Given a user R2D2 has never seen: the C8 branch, which used to submit the work
+    # and return the ack with nobody left to read the answer back out of the session
+    stack.fake.task_reply = AGENT_REPLY
+    # When
+    body = await stack.ask(QUESTION, app_id="cold-app")
+    # Then the user is released with the ack ...
+    assert body["response"]["text"] == ACK
+    # ... and the agent's own text reaches Telegram, which is the only channel that
+    # can push. On the live run the agent fetched sixty arxiv papers into this reply
+    # and the user was told nothing at all, because no collector was armed.
+    assert await stack.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
+    # The anchor of a cold turn's collector is the empty string -- a session created
+    # microseconds earlier has nothing to anchor on, and the collector reads "" as
+    # "everything the session holds is newer". A turn that lands inside that window is
+    # delivered with it, which is why the next test's warm-up collector reports this
+    # turn's answer together with the one that followed it.
+
+
+async def test_an_escalated_turn_delivers_what_the_agent_answered_to_telegram(
+    stack: Stack,
+) -> None:
+    # Given a warm session whose OWN cold turn has been collected and delivered
+    # already -- waiting for it is what keeps the second delivery unambiguous
+    await stack.warm()
+    assert "Сводка готова." in await stack.telegram.wait_for("Сводка готова.")
+    stack.fake.task_reply = AGENT_REPLY
+    # When the voice agent hands the turn to the full agent
+    body = await stack.ask(DIGEST)
+    # Then the user is released with the ack ...
+    assert body["response"]["text"] == ACK
+    # ... and the escalated turn's own answer is delivered, which is the promise the
+    # `r2d2-agent` prompt makes and the branch used to break
+    assert await stack.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
+
+
 async def test_a_warm_session_answers_from_the_voice_agent(stack: Stack) -> None:
     # Given a session that has been used once
     await stack.warm()
@@ -710,18 +746,51 @@ async def test_an_escalated_turn_is_acknowledged_and_handed_to_the_agent(stack: 
 
 async def test_a_turn_that_outran_the_budget_is_collected_into_telegram(stack: Stack) -> None:
     # Given a warm session and a server that accepts the turn and works on it for
-    # longer than the voice budget -- the C8 shape, and the one branch that
-    # enqueues an `opencode_reply` job
+    # longer than the voice budget -- the C8 shape, and the branch that outran it
     await stack.warm()
     stack.fake.hang = True
+    stack.fake.task_reply = AGENT_REPLY
     stack.cfg.r2d2_fast_deadline = 0.05
     # When
     body = await stack.ask(QUESTION)
     # Then the user is released with the ack ...
     assert body["response"]["text"] == ACK
     # ... and the answer the server finishes afterwards is collected by the worker
-    # and pushed to Telegram, which is the only channel that can push
-    assert await stack.telegram.wait_for(ANSWER) == ANSWER
+    # and pushed to Telegram, which is the only channel that can push. Both answers
+    # are in ONE delivery: the turn that outran the budget and the agent turn it was
+    # handed to share a collector, because a turn has exactly one.
+    delivered = await stack.telegram.wait_for(ANSWER)
+    assert ANSWER in delivered
+    assert AGENT_REPLY in delivered
+
+
+async def test_a_turn_that_outran_the_budget_still_gives_the_agent_the_request(
+    stack: Stack,
+) -> None:
+    # Given a warm session and a voice turn that outruns the budget, with nothing in
+    # the app yet to carry the request on: the branch acknowledged and collected, and
+    # the request existed nowhere at all
+    await stack.warm()
+    stack.fake.turns.clear()
+    stack.fake.hang = True
+    stack.fake.task_reply = AGENT_REPLY
+    stack.cfg.r2d2_fast_deadline = 0.05
+    asked = "открой браузер на ноутбуке"
+    # When
+    body = await stack.ask(asked)
+    # Then the user is acknowledged ...
+    assert body["response"]["text"] == ACK
+    # ... the turn that outran the budget was not thrown away ...
+    assert stack.fake.aborted == []
+    # ... and the AGENT was given the user's own words. Whether the late voice turn
+    # will answer or ask for the agent is unknowable at the deadline, and guessing
+    # that it will is what dropped every laptop-control request on the live run.
+    submitted = [turn for turn in stack.fake.turns if turn.submitted]
+    assert len(submitted) == 1, stack.fake.turns
+    assert submitted[0].agent == TASK_AGENT
+    assert asked in submitted[0].text
+    # ... so the work it does reaches the user rather than a session and nowhere else
+    assert await stack.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
 
 
 async def test_two_questions_for_one_application_share_a_single_session(stack: Stack) -> None:

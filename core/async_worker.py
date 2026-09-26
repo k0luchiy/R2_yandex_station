@@ -15,6 +15,15 @@ module -- so every key read here is parsed and checked (`_text_field`,
 `_timeout_field`), and a job that does not match the contract becomes a stated
 job `error` rather than a `KeyError` rendered into the user's Telegram.
 
+Every body this module sends to a human crosses `routing.for_human` on the way
+out (`_deliver`). A session holds two kinds of assistant message -- the agent's
+answer and the voice agent's `[[NEEDS_AGENT]]` routing signal -- and the
+collector reads whichever of them is newest without knowing which it got, so the
+marker used to reach the owner's Telegram verbatim (eleven times on the live
+run). The guard is at the boundary rather than in the collector because the
+boundary is the last place every producer passes, including a future job type
+nobody has written yet.
+
 The dispatch is one explicit branch per job type, never a method name resolved
 from the job's own `type`: that string crosses a module boundary, and a lookup
 built from it turns a typo in `core/brain.py` into an AttributeError at run time,
@@ -27,6 +36,7 @@ from collections.abc import Mapping
 from typing import Final, Protocol
 
 from app.config import Config
+from core import routing
 from core.memory import Memory
 from core.tools import arxiv_tool
 from core.tools.telegram_tool import send_message
@@ -154,11 +164,28 @@ class Worker:
             try:
                 text = await self._dispatch(job)
                 await self.memory.set_job_status(job_id, "done", result=text[:2000])
-                await send_message(self.cfg, text)
+                await self._deliver(text)
             except Exception as exc:
                 self.logger.exception("job %s failed", job_id)
                 await self.memory.set_job_status(job_id, "error", error=str(exc)[:500])
-                await send_message(self.cfg, f"Задача Р2D2 завершилась ошибкой: {exc}")
+                await self._deliver(f"Задача Р2D2 завершилась ошибкой: {exc}")
+
+    async def _deliver(self, text: str) -> None:
+        """The one way this worker puts text into a human's chat.
+
+        Every body -- a collected answer, a digest, a stated failure -- crosses
+        the escalation guard, so the `[[NEEDS_AGENT]]` marker cannot reach a
+        person by any route this pool has. The guard lives in `core.routing`
+        because the token is that module's subject; the live run delivered eleven
+        raw markers into the owner's chat because nothing between the session
+        text and this send looked at them at all.
+
+        A body that was nothing but protocol is stated rather than sent blank: an
+        empty Telegram message renders as nothing on a phone, and "no answer" is
+        exactly what an answer that was only a routing signal means.
+        """
+        body = routing.for_human(text, sentinel=self.cfg.r2d2_needs_agent_sentinel)
+        await send_message(self.cfg, body or NO_REPLY)
 
     async def _dispatch(self, job: dict) -> str:
         kind = job.get("type")

@@ -19,23 +19,29 @@ which of the two a turn gets, and the decision is forced by measurements from
 
 Three more decisions, each load-bearing:
 
-* **A deadline is not an abort.** A voice turn that outruns the budget keeps
-  running server-side; the user is acknowledged and an `opencode_reply` job
-  collects the answer for Telegram. Aborting would destroy work already paid for,
-  and the collector needs a marker -- hence the last message the session held when
-  the deadline fired is recorded in the job.
+* **A deadline is not an abort, and not a loss.** A voice turn that outruns the
+  budget keeps running server-side; the user is acknowledged, the work is
+  submitted to the agent as well, and an `opencode_reply` job collects the answer
+  for Telegram. Aborting would destroy work already paid for; not submitting would
+  lose the request outright, because at the deadline nobody can know whether the
+  late turn will answer or ask for the agent. The collector needs a marker --
+  hence the last message the session held before this turn's work was submitted is
+  recorded in the job.
 * **The fallback chain excludes the session backend.** `config/backends.json`
   lists `opencode` first, but the opencode route has just tried it, and a second
   attempt on the same host would spend budget the turn no longer has. It is also
   the only kind `build_chain` cannot build without the wiring, so leaving it in
   made the whole chain raise `BackendConfigError` and every fallback turn answer
   with `ERROR_TEXT`.
-* **The sentinel never reaches a speaker.** `parse_voice_reply` is the structural
+* **The sentinel never reaches a human.** `parse_voice_reply` is the structural
   guard, `sanitize_for_speech` the total one, and `_speakable` the third: it runs
   on the RAW text of every turn, in `process`, BEFORE `render.clean` strips the
   brackets the sentinel is written with and truncates at 1024 characters. A guard
   after the cleaner would look for a string the cleaner had already dismantled and
-  would miss a sentinel past the cut.
+  would miss a sentinel past the cut. The Telegram direction has its own guard,
+  `routing.for_human` in `core/async_worker.py:_deliver`, because a collected
+  answer is read out of the session rather than out of a model reply and reaches
+  a chat no cleaner ever sees.
 
 `authorized()` is unchanged and is still the only thing between a network-exposed
 webhook and a stranger's laptop.
@@ -283,6 +289,12 @@ class Brain:
         explain. `llm_ms` is measured around `complete()` alone -- `submit_task`
         returns 204 with the work still to come, so timing it would put a worker's
         queue in a field that means "the model answered".
+
+        The three branches that leave for the agent all return through
+        `_hand_to_agent`, which submits the work AND arms the collector that ships
+        the answer. Neither half is optional: submitting without collecting is the
+        agent working for nobody, and collecting without submitting is a collector
+        waiting for a turn that will never come.
         """
         rec = metrics.current()
         rec.agent = wiring.spec.voice_agent
@@ -291,8 +303,7 @@ class Brain:
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
             self._handoff(rec, wiring)
-            await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}")
-            return self.cfg.r2d2_task_ack, False
+            return await self._hand_to_agent(wiring, app_id, session_id, command)
         current_application_id.set(app_id)
         try:
             choice = await rec.measure(
@@ -303,21 +314,70 @@ class Brain:
                 )
             )
         except OpencodeDeadlineExceeded:
-            # NOT aborted: the turn is still running server-side and the collector
-            # below fetches it. The user has already been given the ack.
+            # NOT aborted: the turn is still running server-side, and the collector
+            # fetches it. The work is submitted anyway, because at the deadline
+            # nobody can know whether the late voice turn will answer or ask for the
+            # agent -- and guessing that it will is what dropped every request that
+            # ran long: on the live run six laptop-control attempts all overran
+            # 3.2s and the agent saw none of them. The record stays a `deadline`,
+            # because the turn that outran the budget was the voice turn and
+            # `llm_ms` is its cost.
             rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
             rec.path = metrics.PATH_DEADLINE
-            await self._collect_later(wiring, app_id, session_id)
-            return self.cfg.r2d2_task_ack, False
+            return await self._hand_to_agent(wiring, app_id, session_id, command)
         rec.answered(route=metrics.ROUTE_OPENCODE, model=choice.model, msgs=1, tools=())
         decision = routing.parse_voice_reply(
             choice.content, sentinel=self.cfg.r2d2_needs_agent_sentinel
         )
         if decision.kind == "speak":
             return decision.spoken, False
-        hint = f"\n{decision.task_hint}" if decision.task_hint else ""
         self._handoff(rec, wiring)
-        await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}{hint}")
+        return await self._hand_to_agent(
+            wiring, app_id, session_id, command, hint=decision.task_hint
+        )
+
+    async def _hand_to_agent(
+        self,
+        wiring: HybridWiring,
+        app_id: str,
+        session_id: str,
+        command: str,
+        *,
+        hint: str = "",
+    ) -> tuple[str, bool]:
+        """Give `r2d2-agent` the request, and arm the collector that ships its answer.
+
+        The one place this module submits a task or enqueues an `opencode_reply`
+        job, which is what makes "exactly one collector per turn" a property of the
+        code instead of a convention: the three branches that escalate -- C8, the
+        sentinel and the deadline -- cannot each grow a second, and a branch that
+        escalates cannot forget the collector, because returning the ack at all IS
+        this call.
+
+        The marker is read BEFORE the submit, so it anchors the collector to the
+        last message the session held while the turn was still this turn's own
+        business: the collector then returns the agent's answer and can never
+        replay the conversation the user already had. Reading it afterwards would
+        race opencode's own write of the submitted message and make the anchor
+        depend on which of the two arrived first.
+
+        A refused submit does not turn into a failed turn. The user has already been
+        told a result is coming, the collector is armed either way, and it still
+        ships whatever the session produces -- `NO_REPLY`'s "the agent did not
+        answer" when that is nothing. The reason is in this log line and in the
+        `jobs` row, not in an error spoken to a speaker who cannot act on it.
+        """
+        await self._collect_later(wiring, app_id, session_id)
+        suffix = f"\n{hint}" if hint else ""
+        try:
+            await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}{suffix}")
+        except (OpencodeError, httpx.HTTPError) as exc:
+            self.logger.warning(
+                "opencode %r: session %s of %s took no task from R2D2: %r. The collector is armed "
+                "and the user was acknowledged all the same, so the turn is not lost -- only the "
+                "work behind it is.",
+                wiring.spec.name, session_id, app_id, exc,
+            )
         return self.cfg.r2d2_task_ack, False
 
     @staticmethod
