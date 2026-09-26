@@ -60,7 +60,8 @@ from app.config import Config
 
 __all__ = [
     "ANSWER", "ESCALATION_HINT", "FakeOpencode", "FakeTurn", "HANG_WORD",
-    "PERMISSION_WORD", "SENTINEL", "app", "application_id_of",
+    "PERMISSION_WORD", "REFUSED_TOOL_ERROR", "SENTINEL", "app", "application_id_of",
+    "completed_tool_message", "failed_tool_message", "refused_tool_message",
 ]
 
 #: What the model says to an ordinary question. Distinctive enough that a
@@ -96,6 +97,133 @@ TURN_DELAY_S: Final = 0.01
 STREAM_IDLE_S: Final = 5.0
 #: The prefix of the only session titles R2D2 creates; see `core.opencode.session_store`.
 TITLE_PREFIX: Final = "r2d2:alice:"
+
+
+# ---------------------------------------------------------------------------
+# D9: the three stored tool-call messages a shared session really holds
+# ---------------------------------------------------------------------------
+#
+# Captured BYTE FOR BYTE off a throwaway `opencode serve` v1.18.32 on
+# 127.0.0.1:4610 (throwaway `OPENCODE_CONFIG_DIR`, isolated `XDG_*`, workspace
+# /tmp, three fresh sessions; see `qa/live-run-v4.md`).  The one-session-per-human
+# design means all three land in the SAME transcript, and they are the whole of
+# the discrimination D9 needs:
+#
+# * `refused_tool_message` -- a permission refusal, `state.status == "error"`, no
+#   `text` part, and `state.error` printing the REFUSED agent's rule matrix.  The
+#   error string is byte-identical to the one contract U8 recorded on 4614, which
+#   is the check that the reproduction is the same defect and not a lookalike.
+# * `completed_tool_message` -- a tool call that WORKED, `state.status ==
+#   "completed"`, and equally no `text` part.  Through the text channel these two
+#   are the same message, which is why "empty" cannot mean "refused".
+# * `failed_tool_message` -- a tool call that FAILED for an ordinary reason (the
+#   host does not resolve), also `state.status == "error"`, and NOT opencode's
+#   enforcement state.  This is the counterexample that makes the status alone
+#   insufficient, and it is why the second half of the refusal test exists.
+#
+# `step-finish`'s cost/token counters and `info.time` are elided: they are
+# billing noise and they carry none of the fact under test.  Everything else --
+# every part, every key, the whole `state` object -- is as the server sent it.
+
+#: `state.error` of the captured refusal. The sentence is opencode's own and the
+#: rule list behind it is `r2d2-voice`'s effective matrix, `bash: deny` included.
+REFUSED_TOOL_ERROR: Final = (
+    'The user has specified a rule which prevents you from using this specific tool call. Here are so'
+    'me of the relevant rules [{"permission":"*","action":"allow","pattern":"*"},{"permission":"*","a'
+    'ction":"deny","pattern":"*"},{"permission":"*","action":"deny","pattern":"*"},{"permission":"bas'
+    'h","pattern":"*","action":"deny"},{"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2_do.p'
+    'y *","action":"allow"},{"permission":"bash","pattern":"python3 /home/koluchiy/.r2d2/r2d2_do.py *'
+    '","action":"allow"},{"permission":"bash","pattern":"/home/koluchiy/Documents/R2_yandex_station/.'
+    'venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *","action":"allow"},{"permission":"bash","patte'
+    'rn":"upower *","action":"allow"},{"permission":"bash","pattern":"cat /sys/class/power_supply/*",'
+    '"action":"allow"},{"permission":"bash","pattern":"df *","action":"allow"},{"permission":"bash","'
+    'pattern":"free *","action":"allow"},{"permission":"bash","pattern":"uname *","action":"allow"},{'
+    '"permission":"bash","pattern":"hostname *","action":"allow"},{"permission":"bash","pattern":"ps '
+    '*","action":"allow"},{"permission":"bash","pattern":"uptime","action":"allow"},{"permission":"ba'
+    'sh","pattern":"date","action":"allow"},{"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2'
+    '_do.py shell *","action":"deny"},{"permission":"bash","pattern":"python3 /home/koluchiy/.r2d2/r2'
+    'd2_do.py shell *","action":"deny"},{"permission":"bash","pattern":"/home/koluchiy/Documents/R2_y'
+    'andex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py shell *","action":"deny"}]'
+)
+
+
+def _tool_message(
+    message_id: str,
+    part_id: str,
+    tool: str,
+    state: dict[str, Any],
+    *,
+    agent: str,
+    reasoning: str = "",
+) -> dict[str, Any]:
+    """The captured envelope shape every one of the three messages shares."""
+    parts: list[dict[str, Any]] = [{"id": f"{part_id}_s", "type": "step-start"}]
+    if reasoning:
+        parts.append({"id": f"{part_id}_r", "type": "reasoning", "text": reasoning})
+    parts.append({"id": f"{part_id}_t", "type": "tool", "tool": tool, "state": state})
+    parts.append({"id": f"{part_id}_f", "type": "step-finish", "reason": "tool-calls"})
+    return {"info": {"id": message_id, "role": "assistant", "agent": agent}, "parts": parts}
+
+
+def refused_tool_message(
+    message_id: str = "msg_refused", *, agent: str = "r2d2-voice"
+) -> dict[str, Any]:
+    """The stored refusal: `bash`, `status: "error"`, the matrix printed, no text."""
+    return _tool_message(
+        message_id,
+        f"prt_{message_id}",
+        "bash",
+        {
+            "status": "error",
+            "input": {"command": 'curl -s --max-time 10 https://example.com; echo "EXIT=$?"'},
+            "error": REFUSED_TOOL_ERROR,
+            "time": {"start": 1790410337180, "end": 1790410337483},
+        },
+        agent=agent,
+        reasoning="The user explicitly asks to run a curl command in the terminal. Let me run it.",
+    )
+
+
+def completed_tool_message(
+    message_id: str = "msg_completed", *, agent: str = "r2d2-agent"
+) -> dict[str, Any]:
+    """The stored SUCCESS: `webfetch`, `status: "completed"`, and no text part either."""
+    return _tool_message(
+        message_id,
+        f"prt_{message_id}",
+        "webfetch",
+        {
+            "status": "completed",
+            "input": {"url": "https://example.com", "format": "markdown"},
+            "output": (
+                "Example Domain\n\n# Example Domain\n\nThis domain is for use in documentation "
+                "examples without needing permission. Avoid use in operations.\n\n[Learn more]"
+                "(https://iana.org/domains/example)"
+            ),
+            "title": "https://example.com (text/html)",
+            "metadata": {"truncated": False},
+            "time": {"start": 1790410295948, "end": 1790410296321},
+        },
+        agent=agent,
+    )
+
+
+def failed_tool_message(
+    message_id: str = "msg_failed", *, agent: str = "r2d2-agent"
+) -> dict[str, Any]:
+    """A tool that failed for an ordinary reason -- and is also `status: "error"`."""
+    return _tool_message(
+        message_id,
+        f"prt_{message_id}",
+        "webfetch",
+        {
+            "status": "error",
+            "input": {"url": "https://no-such-host.invalid/page", "format": "text", "timeout": 30},
+            "error": "Transport error (GET https://no-such-host.invalid/page)",
+            "time": {"start": 1790410301266, "end": 1790410301429},
+        },
+        agent=agent,
+    )
 
 
 @dataclass(frozen=True, slots=True)

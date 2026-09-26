@@ -4,30 +4,25 @@ the three guards that keep a machine token from ever reaching a human (plan todo
 `r2d2-voice` gets one round, `r2d2_fast_deadline` seconds, to either answer or
 say it cannot. It signals the second case by emitting the sentinel
 (`r2d2_needs_agent_sentinel`, `[[NEEDS_AGENT]]` by default) into its reply, and
-this module turns that string into a `RouteDecision`. Two independent guards
-stand between the sentinel and Alice's `text`/`tts` field, the third is the
-brain's own assertion (todo 15), and a fourth guards the other direction a turn
-can leave by -- Telegram, which Alice cannot send to:
+this module turns that string into a `RouteDecision`. Two guards stand between
+the sentinel and Alice's `text`/`tts` field, the third is the brain's own
+assertion (todo 15), and a fourth guards the other way out -- Telegram.
 
 * `parse_voice_reply` is the **structural** guard: it splits at the first
   sentinel and *discards the tail*, so the escalation payload is never a value
   anyone can pass on. It cannot be forgotten downstream, because there is
   nothing to forget -- and the discarded `spoken` is `""`, not the hint, because
-  the ack (`r2d2_task_ack`) replaces it. Speaking the hint would mean the user
-  hears half a request instead of an answer.
+  the ack (`r2d2_task_ack`) replaces it.
 * `sanitize_for_speech` is the **total** guard: `""` for *any* input containing
   the sentinel, including `None`. It exists for the caller who reaches a
   `text`/`tts` field without going through `parse_voice_reply` -- a future tool
-  result, a Telegram-only answer, a backend's error string. A guard that is
-  total rather than case-by-case is the whole point: enumerating the shapes is
-  how a guard leaks.
+  result, a Telegram-only answer, a backend's error string. A total guard rather
+  than a case-by-case one is the point: enumerating shapes is how a guard leaks.
 * `for_human` is the guard for the **collector**, which reads an assistant
-  message straight out of the session and has no idea whether it is an answer or
-  a routing signal. It lives here rather than in the worker because the sentinel
-  is this module's subject: the worker is handed the token, exactly as
-  `parse_voice_reply` is. Unlike the two above it does NOT drop the whole
-  message -- a 60-paper digest that quotes the token in one sentence must still
-  arrive -- so it removes the token and keeps the rest.
+  message straight out of the session and cannot tell an answer from a routing
+  signal. It lives here rather than in the worker because the sentinel is this
+  module's subject. Unlike the two above it does NOT drop the whole message -- a
+  60-paper digest that quotes the token in one sentence must still arrive.
 
 Three decisions this module makes, all tested:
 
@@ -36,31 +31,26 @@ Three decisions this module makes, all tested:
   escalation (the model could emit the real sentinel and have it read aloud),
   while treating it as a match would mute the voice path entirely. Neither is
   acceptable, and both are misconfiguration, so it is loud instead.
-* **A stored assistant message that carries the sentinel is a routing signal,
-  not an answer, and does not belong in the transcript.** `transcript_sweep`
-  is the fourth guard, and the only one that looks the other way: the first
-  three stop the token reaching a *human*, and this one stops it reaching the
-  *agent*. One `[[NEEDS_AGENT]]` left in the shared session is read back by
-  `r2d2-agent` on every later turn as part of its own conversation, and a model
-  that sees a token the voice agent was told to emit will emit it too -- after
-  which the session cannot do any work at all. The live run measured exactly
-  that: one escalation permanently disabled the agent path and the recovery
-  (`POST /session/:id/summarize`) returned `true` without compressing
-  anything, so a token that survives summarisation poisons forever. The fix
-  therefore deletes the message rather than relying on the server to summarise
-  it away, and it deletes it on the same turn that observed the escalation,
-  because the agent's turn is submitted immediately afterwards.
+* **A stored assistant message that is opencode's enforcement state does not
+  belong in the transcript.** `transcript_sweep` is the fourth guard and the only
+  one that looks the other way: the first three stop the token reaching a
+  *human*, this one stops it reaching the *agent*. The live run measured both
+  shapes -- one `[[NEEDS_AGENT]]` left in the shared session, and one
+  tool-permission refusal stored with the refused agent's whole rule matrix
+  spelled out in it -- and in both the agent read opencode's state as its own
+  and stopped working. Both are deleted rather than reasoned around, on the turn
+  that observed them, because the agent's turn is submitted straight afterwards.
 * **A model id is never provider-less.** `split_model` is re-exported from
   `core.opencode.wire`, the one implementation the client and this module
   share, so `"/x"` gets the same `("opencode", "x")` the wire body needs rather
   than a `("", "x")` that the server would reject.
 
 The module is pure: no I/O, no config, no logging, no globals beyond the type
-constants. It is handed the sentinel, so changing
-`r2d2_needs_agent_sentinel` changes the routing without touching this file.
-It also does **not** clean or truncate: that is `core/render.py:clean`, and it
-must run *after* the sentinel is gone, so a sentinel past the 1024-char cut is
-still found here (`test_truncation_cannot_hide_the_sentinel`).
+constants. It is handed the sentinel, so changing `r2d2_needs_agent_sentinel`
+changes the routing without touching this file. It also does **not** clean or
+truncate: that is `core/render.py:clean`, and it must run *after* the sentinel is
+gone, so a sentinel past the 1024-char cut is still found here
+(`test_truncation_cannot_hide_the_sentinel`).
 """
 
 from __future__ import annotations
@@ -109,12 +99,17 @@ class RouteDecision:
 class TranscriptSweep:
     """What one pass over a session transcript must delete, and where to anchor.
 
-    `signal_ids` are the stored assistant messages that carry the sentinel: the
-    control signal, not an answer. `since_message_id` is the newest message that
-    SURVIVES the sweep, and the two are decided from the same snapshot on
-    purpose -- anchoring at a message that is about to be deleted is how a
-    collector starts replaying the whole conversation, because a marker the
-    server no longer lists is a marker it cannot position.
+    `signal_ids` are the stored assistant messages that are opencode's own
+    enforcement state rather than conversation: a message carrying the sentinel,
+    and a message holding a tool-permission refusal. Both are read back by the
+    next agent as part of its own history -- the first as a protocol token to
+    copy, the second as a matrix that forbids the reader's own tools.
+
+    `since_message_id` is the newest message that SURVIVES the sweep, and the
+    two are decided from the same snapshot on purpose -- anchoring at a message
+    that is about to be deleted is how a collector starts replaying the whole
+    conversation, because a marker the server no longer lists is a marker it
+    cannot position.
     """
 
     since_message_id: str
@@ -206,7 +201,7 @@ def for_human(raw: str | None, *, sentinel: str) -> str:
 
 
 def transcript_sweep(records: Sequence[MessageRecord], *, sentinel: str) -> TranscriptSweep:
-    """The routing signals stored in one transcript, and the anchor left behind.
+    """The stored enforcement state in one transcript, and the anchor left behind.
 
     `records` is one `GET /session/:id/message` snapshot, which is chronological
     (C7), so "newest that survives" is the last entry that is not being deleted.
@@ -227,21 +222,28 @@ def transcript_sweep(records: Sequence[MessageRecord], *, sentinel: str) -> Tran
     the model never quotes its own instruction -- is the exact dependence this
     fix exists to remove.
 
-    **A tool-permission refusal is NOT swept, and that is measured.** opencode
-    stores a refusal as a `tool` part with `state.status == "error"` whose
-    `state.error` enumerates the effective rules -- the matrix of the agent that
-    was refused, which in a shared session is not the reader's (contract U8).
-    `list_messages` reads TEXT parts only, so that message arrives here with
-    `text == ""` and there is nothing to match: this sweep cannot see a refusal,
-    and the reader that could is `core/opencode`, not this module. What stops a
-    stored refusal from being read as a statement about the reader's own tools is
-    a rule in BOTH agent prompts, which also holds on the turns no sweep runs on.
+    **A tool-permission refusal is swept, on `state.status == "error"`, not on
+    emptiness.** opencode stores a refusal as a `tool` part whose `state.error`
+    enumerates the effective rules -- the matrix of the agent that was refused,
+    which in a shared session is not the reader's (contract U8). It is also how
+    it stores a tool call that SUCCEEDED: `step-start`, `tool`, `step-finish`, no
+    text part either, so `text` is `""` for both and emptiness distinguishes
+    nothing. `MessageRecord.refused` is the discriminator, read from the tool
+    part, and a successful tool turn is provably untouched by it.
+
+    Deleting a refusal does cost the record that opencode refused a command the
+    user asked for, and the trade is deliberate: the harm of keeping it (an
+    agent permanently dead for that user, measured in `qa/live-run-v3.md` §D9) is
+    larger than the harm of losing it. What the user keeps is the request itself
+    -- a `user` message is never swept -- and, measured on both live runs, the
+    refused agent's plain-prose answer in the next assistant message
+    ("Мне запрещено выполня эту команду…"), which is a `text` part and survives.
     """
     _require_sentinel(sentinel)
     signal_ids = tuple(
         record.id
         for record in records
-        if record.role == ASSISTANT_ROLE and sentinel in record.text
+        if record.role == ASSISTANT_ROLE and (sentinel in record.text or record.refused)
     )
     doomed = set(signal_ids)
     anchor = next((record.id for record in reversed(records) if record.id not in doomed), "")

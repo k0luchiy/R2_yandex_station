@@ -39,6 +39,13 @@ from urllib.parse import unquote
 import httpx
 import pytest
 
+from tests.fake_opencode import (
+    REFUSED_TOOL_ERROR,
+    completed_tool_message,
+    failed_tool_message,
+    refused_tool_message,
+)
+
 from core.backends.base import BackendError
 from core.backends.config_loader import BackendSpec
 from core.routing import TranscriptSweep, for_human, transcript_sweep
@@ -930,129 +937,152 @@ async def test_list_messages_raises_when_the_envelope_entry_is_not_an_object() -
 
 
 # ---------------------------------------------------------------------------
-# A stored permission refusal: what the reader can see of it, and what it cannot
+# D9: a stored permission refusal, and the three messages it must be told apart from
 # ---------------------------------------------------------------------------
-
-#: The whole refusal opencode stored, BYTE FOR BYTE off a live `opencode serve`
-#: 1.18.32 (`docs/11-opencode-contract.md`, U8).  It is kept whole and unedited
-#: because the defect is in its shape: the rules it enumerates are the refused
-#: agent's matrix, and in the one-session-per-human design the OTHER agent reads
-#: this exact text as a statement about its own tools.
-DENIED_BASH_ERROR = (
-    'The user has specified a rule which prevents you from using this specific tool call. Here are so'
-    'me of the relevant rules [{"permission":"*","action":"allow","pattern":"*"},{"permission":"*","a'
-    'ction":"deny","pattern":"*"},{"permission":"*","action":"deny","pattern":"*"},{"permission":"bas'
-    'h","pattern":"*","action":"deny"},{"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2_do.p'
-    'y *","action":"allow"},{"permission":"bash","pattern":"python3 /home/koluchiy/.r2d2/r2d2_do.py *'
-    '","action":"allow"},{"permission":"bash","pattern":"/home/koluchiy/Documents/R2_yandex_station/.'
-    'venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *","action":"allow"},{"permission":"bash","patte'
-    'rn":"upower *","action":"allow"},{"permission":"bash","pattern":"cat /sys/class/power_supply/*",'
-    '"action":"allow"},{"permission":"bash","pattern":"df *","action":"allow"},{"permission":"bash","'
-    'pattern":"free *","action":"allow"},{"permission":"bash","pattern":"uname *","action":"allow"},{'
-    '"permission":"bash","pattern":"hostname *","action":"allow"},{"permission":"bash","pattern":"ps '
-    '*","action":"allow"},{"permission":"bash","pattern":"uptime","action":"allow"},{"permission":"ba'
-    'sh","pattern":"date","action":"allow"},{"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2'
-    '_do.py shell *","action":"deny"},{"permission":"bash","pattern":"python3 /home/koluchiy/.r2d2/r2'
-    'd2_do.py shell *","action":"deny"},{"permission":"bash","pattern":"/home/koluchiy/Documents/R2_y'
-    'andex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py shell *","action":"deny"}]'
-)
+#
+# Every fixture below is a live capture, byte for byte; see
+# `tests/fake_opencode.py` for the provenance and the byte-identity check against
+# contract U8.  The point of the three of them is that D9's fix may only be keyed
+# on the one thing that actually separates them: a `tool` part with
+# `state.status == "error"` whose `state.error` is opencode's refusal sentence.
 
 
-def _refused_tool_message(message_id: str, tool: str, error: str) -> dict[str, object]:
-    """The stored assistant message opencode writes when it refuses a tool call.
-
-    Measured: `step-start`, the model's reasoning, the refused tool part, and
-    `step-finish` -- and not one `text` part, because the refusal is the tool
-    part's `state.error` and the refusal itself is never spoken.
-    """
-    return {
-        "info": {"id": message_id, "role": "assistant", "agent": "r2d2-voice", "error": None},
-        "parts": [
-            {"id": f"prt_{message_id}_1", "type": "step-start"},
-            {"id": f"prt_{message_id}_2", "type": "reasoning", "time": {"start": 1, "end": 2}},
-            {
-                "id": f"prt_{message_id}_3",
-                "type": "tool",
-                "tool": tool,
-                "callID": f"call_{message_id}",
-                "state": {
-                    "status": "error",
-                    "input": {"command": "ls -la /tmp/r2d2-workspace"},
-                    "error": error,
-                },
-            },
-            {"id": f"prt_{message_id}_4", "type": "step-finish", "reason": "tool-calls"},
-        ],
-    }
-
-
-async def test_a_stored_permission_refusal_reaches_the_caller_as_empty_text() -> None:
-    """The refusal is a `tool` part, and `list_messages` reads TEXT parts only."""
+async def test_a_stored_refusal_is_reachable_only_through_its_tool_part() -> None:
+    """The rule dump is a `tool` part, and `list_messages` must now say so."""
     # Given: a session holding a refusal opencode stored for the voice agent
-    recorder = canned_body([_refused_tool_message("msg_d1", "bash", DENIED_BASH_ERROR)])
+    recorder = canned_body([refused_tool_message("msg_d1")])
     # When: the transcript is read the one way production reads it
     messages = await _client(recorder).list_messages(SESSION_ID)
-    # Then: the message is there and its rule enumeration is NOT in its text,
-    # which is why no text-keyed sweep can ever see a refusal
-    assert [(m.id, m.role, m.text) for m in messages] == [("msg_d1", "assistant", "")]
+    # Then: the message is there, still with NO text -- the rule enumeration never
+    # enters the text channel -- and the refusal is now a fact of its own, because
+    # through text it is indistinguishable from a tool call that worked
+    assert [(m.id, m.role, m.text, m.refused) for m in messages] == [
+        ("msg_d1", "assistant", "", True)
+    ]
+    assert all(REFUSED_TOOL_ERROR not in m.text for m in messages)
 
 
-async def test_the_transcript_sweep_leaves_a_refusal_alone_and_keeps_its_anchor() -> None:
-    """The sweep's contract on a refusal: not deleted, and the anchor unmoved."""
-    # Given: the refusal as the newest message, after the user asked for the work
+async def test_a_refusal_and_a_successful_tool_turn_are_one_message_through_text() -> None:
+    """The discrimination, on the two captures that are identical but for `state`.
+
+    Measured in the SAME live session: `r2d2-voice` was refused a `bash` it was
+    not allowed, and `r2d2-agent` fetched a page with `webfetch` two messages
+    later.  Both are stored as `step-start` / `tool` / `step-finish` with no `text`
+    part, so the text channel cannot tell them apart and a sweep keyed on emptiness
+    would take the record of everything that worked.
+    """
+    recorder = canned_body(
+        [_message_document("Проверяю сеть.", info={"id": "msg_u1", "role": "user"}),
+         refused_tool_message("msg_d1"),
+         completed_tool_message("msg_ok")]
+    )
+    # When: production's own reader reads the transcript
+    messages = await _client(recorder).list_messages(SESSION_ID)
+    # Then: the two tool messages are byte-identical as far as the reader is
+    # concerned, and the ONLY thing that separates them is the refusal fact
+    assert [m.text for m in messages] == ["Проверяю сеть.", "", ""]
+    assert [m.refused for m in messages] == [False, True, False]
+
+
+async def test_the_sweep_deletes_the_refusal_and_keeps_the_successful_tool_turn() -> None:
+    """D9's regression test: the refusal goes, the work that succeeded stays.
+
+    Before the fix the sweep returned `signal_ids == ()` here, because the refusal
+    has no text to match, and the rule dump stayed in the shared session for ever
+    -- which is what made `r2d2-agent` read the voice agent's matrix as its own
+    and stop calling tools its own matrix allows (`qa/live-run-v3.md`, D9).
+    """
     recorder = canned_body(
         [
-            _message_document("Найди статьи про RAG.", info={"id": "msg_u1", "role": "user"}),
-            _refused_tool_message("msg_d1", "bash", DENIED_BASH_ERROR),
+            _message_document("Проверь, работает ли сеть.", info={"id": "msg_u1", "role": "user"}),
+            refused_tool_message("msg_d1"),
+            completed_tool_message("msg_ok"),
         ]
     )
     records = await _client(recorder).list_messages(SESSION_ID)
     # When: the collector's sweep runs over the very records it will act on
     sweep = transcript_sweep(records, sentinel=SENTINEL)
-    # Then: nothing is deleted -- a refusal is the record that opencode refused a
-    # command the user asked for, and this module may not take that away -- and
-    # the anchor is the newest surviving message, which here IS the refusal
-    assert sweep.signal_ids == ()
-    assert sweep.since_message_id == "msg_d1"
+    # Then: the refusal is deleted and the anchor moves back to a message the
+    # server still lists; the completed `webfetch` and the user's own words are
+    # neither deleted nor used as the anchor
+    assert sweep.signal_ids == ("msg_d1",)
+    assert sweep.since_message_id == "msg_ok"
 
 
-async def test_an_empty_assistant_message_is_not_a_marker_of_a_refusal() -> None:
-    """Why no sweep may key on "empty text": a SUCCESSFUL tool turn looks the same.
+async def test_a_tool_that_failed_for_its_own_reason_is_not_a_refusal() -> None:
+    """`state.status == "error"` ALONE is not enough, and this is the proof.
 
-    Measured in the same live session: four `glob` calls that all completed are
-    stored as an assistant message with no text part either.  Deleting empty-text
-    assistant messages would therefore delete the record of every successful tool
-    call, which costs the user far more than the refusal it was meant to remove.
+    The captured counterexample: a `webfetch` of a host that does not resolve is
+    stored with `status: "error"` and a `Transport error (GET …)` string.  That is
+    the user's own result, not opencode's enforcement state, and deleting it would
+    remove a record of what actually happened to their request.
     """
     recorder = canned_body(
         [
-            _refused_tool_message("msg_d1", "bash", DENIED_BASH_ERROR),
-            {
-                "info": {"id": "msg_ok", "role": "assistant", "agent": "r2d2-agent"},
-                "parts": [
-                    {"id": "prt_ok_1", "type": "step-start"},
-                    {
-                        "id": "prt_ok_2",
-                        "type": "tool",
-                        "tool": "glob",
-                        "callID": "call_ok",
-                        "state": {
-                            "status": "completed",
-                            "input": {"pattern": "*.json", "path": "/tmp"},
-                            "output": "a.json",
-                        },
-                    },
-                    {"id": "prt_ok_3", "type": "step-finish", "reason": "tool-calls"},
-                ],
-            },
+            _message_document("Скачай страницу.", info={"id": "msg_u1", "role": "user"}),
+            failed_tool_message("msg_net"),
+            _message_document("Страница недоступна, вот что вышло.", info={"id": "msg_a2"}),
         ]
     )
     records = await _client(recorder).list_messages(SESSION_ID)
-    # Then: the two messages are indistinguishable through the text channel, so
-    # "empty" cannot mean "refused" -- and the sweep deletes neither
-    assert [m.text for m in records] == ["", ""]
+    # Then: the failed fetch is not a refusal, so nothing is deleted and the
+    # anchor is the newest message, exactly as it was before D9 was fixed
+    assert [m.refused for m in records] == [False, False, False]
     assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
-        since_message_id="msg_ok", signal_ids=()
+        since_message_id="msg_a2", signal_ids=()
+    )
+
+
+async def test_deleting_a_refusal_keeps_the_request_and_the_prose_answer() -> None:
+    """What the user still has afterwards, which is what deleting a refusal costs.
+
+    A refusal message holds no prose of its own, so the two things a user would
+    miss are the message BEFORE it (their own request, a `user` message, never
+    swept) and the message AFTER it -- the refused agent's plain-prose answer,
+    which the live run stores as an ordinary `text` part: "Мне запрещено
+    выполня эту команду в терминале, так что проверить интернет так не получится."
+    Both survive, and only the enforcement state goes.
+    """
+    recorder = canned_body(
+        [
+            _message_document(
+                "Проверь, работает ли интернет: выполни curl.",
+                info={"id": "msg_u1", "role": "user"},
+            ),
+            refused_tool_message("msg_d1"),
+            _message_document(
+                "Мне запрещено выполня эту команду в терминале, так что проверить "
+                "интернет так не получится.",
+                info={"id": "msg_a2"},
+            ),
+        ]
+    )
+    records = await _client(recorder).list_messages(SESSION_ID)
+    # When
+    sweep = transcript_sweep(records, sentinel=SENTINEL)
+    # Then: the request and the prose answer both survive the sweep, and the
+    # anchor is the prose answer -- so the collector is handed the sentence that
+    # tells the user what happened
+    assert sweep.signal_ids == ("msg_d1",)
+    assert sweep.since_message_id == "msg_a2"
+    assert "Мне запрещено выполня эту команду" in records[-1].text
+
+
+async def test_a_user_message_is_never_swept_for_quoting_a_refusal() -> None:
+    """The role decides, not the fact: the owner's own text is the user's."""
+    recorder = canned_body(
+        [
+            _message_document(
+                "почему bash запрещён?",
+                info={"id": "msg_u1", "role": "user"},
+            ),
+            refused_tool_message("msg_d1"),
+        ]
+    )
+    records = await _client(recorder).list_messages(SESSION_ID)
+    # Then: only the assistant's own stored enforcement state goes
+    assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="msg_u1", signal_ids=("msg_d1",)
     )
 
 
@@ -1061,11 +1091,8 @@ async def test_a_refusal_reaches_no_human_through_the_telegram_boundary() -> Non
     # Given: the user's own words next to the stored refusal
     recorder = canned_body(
         [
-            _refused_tool_message("msg_d1", "bash", DENIED_BASH_ERROR),
-            _message_document(
-                "Команда выполнена, вот результат.",
-                info={"id": "msg_a2", "role": "assistant", "agent": "r2d2-agent"},
-            ),
+            refused_tool_message("msg_d1"),
+            _message_document("Команда выполнена, вот результат.", info={"id": "msg_a2"}),
         ]
     )
     records = await _client(recorder).list_messages(SESSION_ID)
@@ -1074,7 +1101,37 @@ async def test_a_refusal_reaches_no_human_through_the_telegram_boundary() -> Non
     # Then: the answer is delivered whole, and no rule enumeration rides along
     # with it -- the refusal was never in the text channel to begin with
     assert shipped == "Команда выполнена, вот результат."
-    assert all(DENIED_BASH_ERROR not in m.text for m in records)
+    assert all(REFUSED_TOOL_ERROR not in m.text for m in records)
+
+
+async def test_the_captured_refusal_is_byte_identical_to_the_contract_u8_record() -> None:
+    """The reproduction is the SAME defect and not a lookalike.
+
+    U8 was recorded on port 4614 against a differently-named throwaway config; this
+    capture came from 4610, a different workspace and a different `application_id`.
+    The rule list opencode prints is the refused agent's RESOLVED matrix, so an
+    identical string is the evidence that the server still behaves the way it did
+    when the defect was first measured -- and that a fixture written from this
+    capture is testing reality rather than a transcription of itself.
+    """
+    # Given: the refusal body as `docs/11-opencode-contract.md` records it in U8,
+    # where it sits inside a JSON block and so carries escaped quotes
+    contract = (
+        Path(__file__).resolve().parents[1] / "docs/11-opencode-contract.md"
+    ).read_text(encoding="utf-8")
+    recorded = next(
+        line for line in contract.splitlines() if REFUSED_TOOL_ERROR[:60] in line
+    )
+    # When: the block's escaping is undone and the JSON string's own quotes dropped
+    body = recorded[recorded.index("The user has specified") :]
+    body = body[: body.rindex('"')].replace('\\"', '"')
+    # Then: the capture and the record are the same string, byte for byte
+    assert body == REFUSED_TOOL_ERROR
+    # and the matrix in it is the VOICE agent's -- `bash *` denied, which is what
+    # `r2d2-agent` asks rather than denies, and which is why reading it as its own
+    # is what killed the agent path
+    assert '"permission":"bash","pattern":"*","action":"deny"' in REFUSED_TOOL_ERROR
+    assert '"permission":"bash","pattern":"upower *","action":"allow"' in REFUSED_TOOL_ERROR
 
 
 @pytest.mark.parametrize(

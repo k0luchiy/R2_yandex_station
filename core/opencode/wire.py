@@ -22,6 +22,9 @@ Three things are load-bearing and were all measured in todo 1
 * **`{info, parts}` is the message shape (C7).** `role`, `model`, `agent` and
   `error` live inside `info`; reading them at the top level silently yields
   `None`, which is exactly how the first version of the spike probe broke.
+* **A tool permission refusal is a `tool` part, invisible to text.** opencode
+  stores it with `state.status == "error"` and no `text` part, so the text reads
+  `""` -- as it does for a call that succeeded. `parts_facts` reads the fact.
 """
 
 from __future__ import annotations
@@ -46,11 +49,14 @@ __all__ = [
     "OpencodeProtocolError",
     "OpencodeReply",
     "OpencodeStatusError",
+    "REFUSAL_SENTENCE",
     "SessionInfo",
     "decode",
     "envelope_detail",
     "excerpt",
+    "parts_facts",
     "records",
+    "refusal_in_parts",
     "reply_of",
     "required_text",
     "split_model",
@@ -60,6 +66,12 @@ __all__ = [
 #: opencode's own provider id, used when a configured model string carries none.
 DEFAULT_PROVIDER_ID: Final = "opencode"
 BODY_EXCERPT_CHARS: Final = 240
+#: opencode's sentence for "the user's permission matrix forbids this call",
+#: byte-for-byte off a live v1.18.32 (`docs/11-opencode-contract.md`, U8).  It is
+#: the second half of the refusal test, and the half that is easy to get wrong.
+REFUSAL_SENTENCE: Final = (
+    "The user has specified a rule which prevents you from using this specific tool call"
+)
 _T = TypeVar("_T")
 
 
@@ -126,9 +138,16 @@ class SessionInfo:
 
 @dataclass(frozen=True, slots=True)
 class MessageRecord:
+    """One `{info, parts}` entry as the rest of R2D2 reads a session.
+
+    `text` is the TEXT parts only -- `""` for a message that is only a tool call,
+    and a successful tool call is exactly that. So `refused` is its own fact.
+    """
+
     id: str
     role: str
     text: str
+    refused: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,23 +195,59 @@ def required_text(entry: object, key: str, context: str) -> str:
     return value
 
 
-def text_of_parts(parts: list[object]) -> str:
-    """The `text` parts concatenated in order; `reasoning` and `tool` are not answers."""
+def parts_facts(parts: list[object]) -> tuple[str, bool]:
+    """One message's parts as (answer text, whether a tool call was REFUSED).
+
+    One walk: both facts come out of the same list, and only one of them is
+    visible to the other. A refused call is a `tool` part with
+    `state.status == "error"`, `state.error` opening with `REFUSAL_SENTENCE`
+    (contract U8) and NO `text` part -- so the text alone reads `""`, exactly as
+    it does for a tool call that SUCCEEDED, and the refusal is the whole of the
+    difference between those two messages.
+
+    Both halves of that test matter and the second is easy to get wrong:
+    measured in the same live session, a `webfetch` of a host that does not
+    resolve is stored as `state.status == "error"` too, under a
+    `Transport error (GET …)` string, and a failed fetch is the user's own
+    result rather than opencode's enforcement state. If a future opencode
+    rewords the sentence this stops matching and the refusals stay: the failure
+    direction is D9 again, never a lost record.
+    """
     chunks: list[str] = []
+    refused = False
     for part in parts:
         if not isinstance(part, Mapping):
             raise OpencodeProtocolError(
                 f"opencode: a message part must be a JSON object, got {type(part).__name__}"
             )
-        if part.get("type") != "text":
-            continue
-        text = part.get("text")
-        if not isinstance(text, str):
-            raise OpencodeProtocolError(
-                f"opencode: a text part must carry a string 'text', got {type(text).__name__}"
+        kind = part.get("type")
+        state = part.get("state")
+        if kind == "text":
+            text = part.get("text")
+            if not isinstance(text, str):
+                raise OpencodeProtocolError(
+                    f"opencode: a text part must carry a string 'text', got {type(text).__name__}"
+                )
+            chunks.append(text)
+        elif kind == "tool" and not refused:
+            error = state.get("error") if isinstance(state, Mapping) else None
+            refused = (
+                isinstance(state, Mapping)
+                and state.get("status") == "error"
+                and isinstance(error, str)
+                and error.startswith(REFUSAL_SENTENCE)
             )
-        chunks.append(text)
-    return "".join(chunks)
+    return "".join(chunks), refused
+
+
+def text_of_parts(parts: list[object]) -> str:
+    """The `text` parts concatenated in order; `reasoning` and `tool` are not answers."""
+    return parts_facts(parts)[0]
+
+
+def refusal_in_parts(parts: list[object]) -> bool:
+    """Whether a tool call in these parts was REFUSED by opencode; see `parts_facts`."""
+    return parts_facts(parts)[1]
 
 
 def envelope_detail(error: object) -> tuple[str, int | None]:

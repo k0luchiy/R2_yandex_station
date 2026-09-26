@@ -74,6 +74,11 @@ from core.opencode.client import OpencodeClient
 from core.opencode.session_store import OcSessionStore, title_for
 from core.permissions import PermissionBroker
 from core.render import MAX_TEXT
+from tests.fake_opencode import (
+    completed_tool_message,
+    failed_tool_message,
+    refused_tool_message,
+)
 
 # ---------------------------------------------------------------------------
 # Doubles
@@ -1047,6 +1052,85 @@ async def test_a_refused_delete_leaves_the_turn_successful_and_says_why(
     assert text == ACK
     assert rig.server.turns[1].agent == TASK_AGENT
     assert any("routing signal" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_stored_permission_refusal_is_deleted_on_the_escalating_turn(
+    rig: Rig,
+) -> None:
+    # Given a session that already holds a permission refusal opencode stored for
+    # the VOICE agent -- a `tool` part with `state.status == "error"`, the voice
+    # matrix spelled out in its `state.error`, and no text part at all. Left in
+    # place the other agent reads that matrix as its own and stops calling tools
+    # its own matrix allows (D9, measured in qa/live-run-v3.md).
+    rig.server.reply = f"Понял. {SENTINEL} скачай страницу"
+    session_id = await rig.warm()
+    rig.server.seed(
+        session_id,
+        said("Проверь, работает ли интернет.", "msg_u0", role="user"),
+        refused_tool_message("msg_refused"),
+        said("Мне запрещено выполня эту команду в терминале.", "msg_prose"),
+    )
+    # When the user asks for something that escalates
+    assert await rig.say() == ACK
+    # Then the refusal is deleted BY ID on this very turn, in the same sweep and
+    # from the same snapshot that chose the anchor -- and the anchor is a message
+    # that survives, so the collector cannot be handed a marker the server has
+    # just dropped
+    assert [mid for _sid, mid in rig.server.deleted] == ["msg_refused", "msg_a1"]
+    job = rig.brain.worker.jobs[0]
+    live = {str(entry["info"]["id"]) for entry in rig.server.transcript[session_id]}
+    assert job["since_message_id"] == "msg_u1"
+    assert job["since_message_id"] in live
+    assert job["since_message_id"] not in {mid for _sid, mid in rig.server.deleted}
+    # And what the user keeps: the request that was refused and the plain-prose
+    # answer the refused agent gave about it. Only the rule dump is gone.
+    assert stored_texts(rig, session_id) == [
+        "Проверь, работает ли интернет.",
+        "Мне запрещено выполня эту команду в терминале.",
+        QUESTION,
+    ]
+
+
+async def test_a_successful_tool_turn_in_the_session_is_never_deleted(rig: Rig) -> None:
+    # Given a session holding a tool call that COMPLETED -- also stored with no
+    # text part, which is what made "no text" unusable as a refusal marker and
+    # would take the record of everything that worked if it were used
+    rig.server.reply = f"Понял. {SENTINEL} скачай страницу"
+    session_id = await rig.warm()
+    rig.server.seed(
+        session_id,
+        said("Скачай страницу.", "msg_u0", role="user"),
+        completed_tool_message("msg_worked"),
+    )
+    # When
+    assert await rig.say() == ACK
+    # Then only the escalation signal goes; the completed tool call stays, and it
+    # is not mistaken for a refusal on the strength of its missing text part
+    assert [mid for _sid, mid in rig.server.deleted] == ["msg_a1"]
+    assert "msg_worked" in {
+        str(entry["info"]["id"]) for entry in rig.server.transcript[session_id]
+    }
+
+
+async def test_a_tool_that_failed_for_its_own_reason_is_never_deleted(rig: Rig) -> None:
+    # Given a session holding a `webfetch` that could not resolve: also
+    # `state.status == "error"`, and NOT opencode's enforcement state. It is the
+    # user's own result, so the status alone cannot be the discriminator.
+    rig.server.reply = f"Понял. {SENTINEL} скачай страницу"
+    session_id = await rig.warm()
+    rig.server.seed(
+        session_id,
+        said("Скачай страницу.", "msg_u0", role="user"),
+        failed_tool_message("msg_netfail"),
+    )
+    # When
+    assert await rig.say() == ACK
+    # Then it survives, and the anchor is the user's own message for this turn
+    assert [mid for _sid, mid in rig.server.deleted] == ["msg_a1"]
+    assert "msg_netfail" in {
+        str(entry["info"]["id"]) for entry in rig.server.transcript[session_id]
+    }
+    assert rig.brain.worker.jobs[0]["since_message_id"] == "msg_u1"
 
 
 async def test_the_collected_answer_is_the_agents_and_not_a_replay(

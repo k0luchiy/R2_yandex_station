@@ -56,6 +56,7 @@ from core.opencode.wire import (
     OpencodeStatusError,
     SessionInfo,
     decode,
+    parts_facts,
     records,
     reply_of,
     required_text,
@@ -180,13 +181,16 @@ class OpencodeClient(OpencodeTransport):
     async def delete_message(self, session_id: str, message_id: str) -> bool:
         """`DELETE /session/:id/message/:messageID` -> whether it was removed.
 
-        The route exists for one caller and one reason: the escalation sentinel
-        is a control signal, and a control signal stored in the session is read
-        back by the next agent as part of its own conversation (see
-        `core.routing.transcript_sweep`). Summarising the session away is not a
-        substitute -- the server answers `true` and leaves the transcript
-        untouched -- so the message is deleted, by id, on the turn that observed
-        it. The id is quoted because a message id is server-controlled text.
+        The route has two callers and one reason each, and the reason is the
+        same in both: a stored message that is opencode's enforcement state, not
+        conversation. The escalation sentinel is a control signal the next agent
+        reads back as its own history, and a tool-permission refusal carries the
+        REFUSED agent's whole rule matrix, which the other agent then reads as a
+        ban on its own tools (see `core.routing.transcript_sweep`). Summarising
+        the session away is not a substitute for either -- the server answers
+        `true` and leaves the transcript untouched -- so the message is deleted,
+        by id, on the turn that observed it. The id is quoted because a message
+        id is server-controlled text.
         """
         removed = await self._request(
             "DELETE",
@@ -237,7 +241,13 @@ class OpencodeClient(OpencodeTransport):
         ]
 
     async def list_messages(self, session_id: str) -> list[MessageRecord]:
-        """`GET /session/:id/message` -> `[{info, parts}]` read as records (C7)."""
+        """`GET /session/:id/message` -> `[{info, parts}]` read as records (C7).
+
+        Both facts come from one pass over the parts: the text, and whether
+        opencode REFUSED a tool call in this message. A refusal has no text part
+        at all and a successful tool call has none either, so the second fact
+        cannot be recovered from the first -- see `core.opencode.wire`.
+        """
         response = await self._request("GET", f"/session/{session_id}/message", params=self._scoped_params())
         out: list[MessageRecord] = []
         for entry in records(response, "the message list"):
@@ -248,11 +258,13 @@ class OpencodeClient(OpencodeTransport):
                     f"opencode {self._name}: a message envelope must hold an 'info' object and a "
                     f"'parts' list, got {type(info).__name__} and {type(parts).__name__}"
                 )
+            text, refused = parts_facts(parts)
             out.append(
                 MessageRecord(
                     id=required_text(info, "id", "a message"),
                     role=str(info.get("role", "")),
-                    text=text_of_parts(parts),
+                    text=text,
+                    refused=refused,
                 )
             )
         return out

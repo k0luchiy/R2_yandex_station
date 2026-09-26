@@ -299,6 +299,17 @@ def stored(message_id: str, role: str, text: str) -> MessageRecord:
     return MessageRecord(id=message_id, role=role, text=text)
 
 
+def refused(message_id: str, role: str = "assistant") -> MessageRecord:
+    """A stored permission refusal as `list_messages` now reports it.
+
+    The fact is not in `text` -- a refusal message has no text part -- so it can
+    only be constructed here, and only because `MessageRecord` grew a field for
+    it.  The wire shape behind it is a `tool` part with `state.status == "error"`
+    and no `text` part at all, and that is asserted where the wire is read.
+    """
+    return MessageRecord(id=message_id, role=role, text="", refused=True)
+
+
 #: The transcript the live run left behind: the user asked for real work, the
 #: voice agent answered with the routing signal, and the agent read it back.
 POISONED: Final[tuple[MessageRecord, ...]] = (
@@ -370,6 +381,75 @@ def test_a_whole_session_of_signals_still_yields_an_anchor() -> None:
     # newer", which is the documented meaning of an empty marker
     assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
         since_message_id="", signal_ids=("msg_a1", "msg_a2")
+    )
+
+
+def test_a_stored_refusal_is_swept_and_the_anchor_moves_past_it() -> None:
+    # Given: the transcript the live run left after a permission denial -- the
+    # user's request, the refusal opencode stored, and the agent's own answer.
+    # The refusal has NO text, so the string match cannot see it (D9).
+    records = (
+        stored("msg_u1", "user", "Проверь, работает ли интернет."),
+        refused("msg_d1"),
+        stored("msg_a2", "assistant", "Проверю через webfetch."),
+    )
+    # When
+    sweep = transcript_sweep(records, sentinel=SENTINEL)
+    # Then: the refusal is deleted -- it is the refused agent's whole rule matrix
+    # in a form the other agent reads as its own -- and the anchor is the newest
+    # SURVIVOR, never the message being deleted
+    assert sweep == TranscriptSweep(since_message_id="msg_a2", signal_ids=("msg_d1",))
+
+
+def test_a_refusal_is_the_newest_message_and_still_is_not_the_anchor() -> None:
+    # Given: a refusal as the NEWEST message the server holds
+    records = (
+        stored("msg_u1", "user", "Проверь, работает ли интернет."),
+        refused("msg_d1"),
+    )
+    # When / Then: the anchor degrades to the newest message that survives, and
+    # never to the one this same pass is about to delete
+    assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="msg_u1", signal_ids=("msg_d1",)
+    )
+
+
+def test_a_user_message_carrying_a_refusal_fact_is_never_swept() -> None:
+    # Given: `refused` on a USER record, which cannot happen on the wire and is
+    # pinned here so the role check is not an accident of the predicate's order
+    records = (
+        MessageRecord(id="msg_u1", role="user", text="", refused=True),
+        stored("msg_a1", "assistant", "Понял."),
+    )
+    # When / Then: the role decides. A user's content is never this module's to
+    # take, whatever fact the record carries
+    assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="msg_a1", signal_ids=()
+    )
+
+
+def test_a_successful_tool_turn_is_untouched_by_the_refusal_rule() -> None:
+    # Given: the same empty text, WITHOUT the refusal fact -- a tool call that
+    # completed. Deleting on emptiness would take this with it, which is why the
+    # discriminator is a fact read off the tool part and not the missing text
+    records = (stored("msg_u1", "user", "Скачай страницу."), stored("msg_ok", "assistant", ""))
+    # When / Then: nothing is deleted and the anchor is the newest message
+    assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="msg_ok", signal_ids=()
+    )
+
+
+def test_a_refusal_and_a_sentinel_in_one_transcript_are_both_swept() -> None:
+    # Given: the two kinds of stored enforcement state in the same session, which
+    # is what a voice turn that was refused and then escalated leaves behind
+    records = (
+        stored("msg_u1", "user", "Сделай сводку статей с arxiv."),
+        refused("msg_d1"),
+        stored("msg_a2", "assistant", f"{SENTINEL} собрать сводку"),
+    )
+    # When / Then: both go, in transcript order, and one snapshot decided both
+    assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="msg_u1", signal_ids=("msg_d1", "msg_a2")
     )
 
 
