@@ -32,8 +32,8 @@ Three decisions this module makes, all tested:
   while treating it as a match would mute the voice path entirely. Neither is
   acceptable, and both are misconfiguration, so it is loud instead.
 * **A stored assistant message that is opencode's enforcement state does not
-  belong in the transcript.** `transcript_sweep` is the fourth guard and the only
-  one that looks the other way: the first three stop the token reaching a
+  belong in the transcript.** `transcript_sweep` is the fifth guard and the only
+  one that looks the other way: the first four stop the token reaching a
   *human*, this one stops it reaching the *agent*. The live run measured both
   shapes -- one `[[NEEDS_AGENT]]` left in the shared session, and one
   tool-permission refusal stored with the refused agent's whole rule matrix
