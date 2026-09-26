@@ -7,15 +7,19 @@ is `[[NEEDS_AGENT]]` is an agent that answers with `[[NEEDS_AGENT]]`. Two more m
 the same read and cannot have it there, and both are defects the live run measured
 (`qa/live-run-v3.md`):
 
-* **D6-residue -- the marker a DEADLINE turn leaves behind.** That branch hands the work to
-  the agent while the voice turn is still running, so at sweep time the signal does not exist
-  yet. It arrives afterwards, the agent reads it as its own history and writes one itself; the
-  collector then ships that echo, and the user receives a stripped copy of their own question
-  instead of the result. The fix is ordering, not speed: the signal is deleted at the entry
-  of the NEXT turn for that session, which is the last moment before any agent reads the
-  history again. `note_dead_turn` marks the session and `sweep_residue` does the work; the
-  mark is in-process only, because a restart loses it and the next escalating turn's own
-  sweep still finds the signal.
+* **D6-residue -- the residue a DEADLINE turn leaves behind.** That branch used to hand the
+  work to the agent while the voice turn was still running, so at sweep time the signal did
+  not exist yet. It arrived afterwards, the agent read it as its own history and wrote one
+  itself; the collector then shipped that echo, and the user received a stripped copy of
+  their own question instead of the result. `note_dead_turn` marks the session and
+  `sweep_residue` does the work; the mark is in-process only, because a restart loses it
+  and the next escalating turn's own sweep still finds the signal.
+  **That is now the backstop, not the mechanism.** `core/session_settle.py` holds the
+  deadline branch's hand-off until the voice turn has been seen to end, so the turn's own
+  marker and its own tool refusal are in the snapshot the sweep takes and go out before
+  the agent's turn is submitted; this sweep is what remains for the two cases that wait
+  cannot cover -- a wait that hit its bound, and a deployment with no event reader to
+  learn the end from. It is the reason such a turn costs a delay rather than an answer.
 * **D15 -- the read that timed out before anything was armed.** That read is bounded by half
   a second on a path that has already spent the whole voice budget, and when it timed out the
   hand-off simply returned: the user was acknowledged and nobody was left to fetch the answer.
@@ -113,6 +117,16 @@ class SessionSweeper:
     def note_dead_turn(self, session_id: str) -> None:
         """Record that this session's last turn may still be writing a routing signal."""
         self._dead_turns.add(session_id)
+
+    def note_swept(self, session_id: str) -> None:
+        """Write the debt off: the hand-off's own snapshot came after that turn ended.
+
+        The debt exists for a residue the deadline branch's sweep could not see, and once
+        the branch waits for the turn to end its own read sees all of it. Only a wait that
+        was a guess may not say this, and only it therefore leaves the debt standing for
+        the next turn -- which is the whole difference between the two.
+        """
+        self._dead_turns.discard(session_id)
 
     async def sweep_residue(self, client: OpencodeClient, app_id: str, session_id: str) -> bool:
         """Delete an unwritten-at-the-time signal before this turn's agent reads history.

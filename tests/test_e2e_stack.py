@@ -74,6 +74,7 @@ from fastapi import FastAPI
 import core.brain
 import core.permissions
 import core.async_worker
+import core.session_settle as settle_module
 from app import main as main_module
 from app.config import Config
 from app.main import build_app
@@ -82,7 +83,13 @@ from core.brain import ERROR_TEXT, GREETING
 from core.memory import Memory
 from core.opencode.client import OpencodeClient
 from core.render import MAX_TEXT
-from tests.fake_opencode import ANSWER, SENTINEL, FakeOpencode, FakeTurn
+from tests.fake_opencode import (
+    ANSWER,
+    SENTINEL,
+    FakeOpencode,
+    FakeTurn,
+    refused_tool_message,
+)
 
 # ---------------------------------------------------------------------------
 # Vocabulary
@@ -520,6 +527,11 @@ async def stack(
     """
     fake = serve_in_process
     install(tmp_path, monkeypatch)
+    # This stack has no SSE reader either: `httpx.ASGITransport` collects a response body
+    # before the client sees it, so the per-session `GET /event` reader can never complete
+    # a frame here and the settled wait degrades to its fixed grace. The shipped grace is
+    # 5s and no test may pay that, so it is set here -- and nowhere else.
+    monkeypatch.setattr(settle_module, "SETTLE_GRACE_S", 0.2)
     app = build_app()
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(
@@ -759,6 +771,10 @@ async def test_a_turn_that_outran_the_budget_is_collected_into_telegram(stack: S
     # Given a warm session and a server that accepts the turn and works on it for
     # longer than the voice budget -- the C8 shape, and the branch that outran it
     await stack.warm()
+    # The warm-up's own collector is armed on an empty anchor -- that is C8 -- and it
+    # delivers everything the session holds, including the warm turn's answers. It is
+    # consumed here so the delivery this test is about is unambiguously its own.
+    await stack.telegram.wait_for("Сводка готова.")
     stack.fake.hang = True
     stack.fake.task_reply = AGENT_REPLY
     stack.cfg.r2d2_fast_deadline = 0.05
@@ -766,13 +782,13 @@ async def test_a_turn_that_outran_the_budget_is_collected_into_telegram(stack: S
     body = await stack.ask(QUESTION)
     # Then the user is released with the ack ...
     assert body["response"]["text"] == ACK
-    # ... and the answer the server finishes afterwards is collected by the worker
-    # and pushed to Telegram, which is the only channel that can push. Both answers
-    # are in ONE delivery: the turn that outran the budget and the agent turn it was
-    # handed to share a collector, because a turn has exactly one.
-    delivered = await stack.telegram.wait_for(ANSWER)
-    assert ANSWER in delivered
-    assert AGENT_REPLY in delivered
+    # ... and the answer is collected by the worker and pushed to Telegram, which is the
+    # only channel that can push. It is the AGENT's answer, alone: this branch's hand-off
+    # waits for the still-running voice turn to stop writing, so the collector's anchor is
+    # read after that turn's own output and its window begins there. The voice turn's late
+    # answer stays in the transcript as context for the agent instead of being spliced into
+    # the same message, and the user is not left without an answer either way.
+    assert await stack.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
 
 
 async def test_a_turn_that_outran_the_budget_still_gives_the_agent_the_request(
@@ -793,6 +809,11 @@ async def test_a_turn_that_outran_the_budget_still_gives_the_agent_the_request(
     assert body["response"]["text"] == ACK
     # ... the turn that outran the budget was not thrown away ...
     assert stack.fake.aborted == []
+    # ... and the work it does reaches the user rather than a session and nowhere else.
+    # The delivery is also the proof that the request was handed over: on this branch the
+    # submit waits for the still-running voice turn to stop writing, so it happens after
+    # the acknowledgement and nothing synchronous in this test may assert on it.
+    assert await stack.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
     # ... and the AGENT was given the user's own words. Whether the late voice turn
     # will answer or ask for the agent is unknowable at the deadline, and guessing
     # that it will is what dropped every laptop-control request on the live run.
@@ -800,12 +821,59 @@ async def test_a_turn_that_outran_the_budget_still_gives_the_agent_the_request(
     assert len(submitted) == 1, stack.fake.turns
     assert submitted[0].agent == TASK_AGENT
     assert asked in submitted[0].text
-    # ... so the work it does reaches the user rather than a session and nowhere else
-    assert await stack.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
 
 
-async def test_two_questions_for_one_application_share_a_single_session(stack: Stack) -> None:
-    # Given a user with a warm session
+async def test_a_deadline_turn_is_handed_over_only_after_its_voice_turn_is_seen_to_end(
+    served: Stack,
+) -> None:
+    """**The race, over the whole stack and a real socket.** Nothing is left to guess.
+
+    The in-process stack cannot deliver an SSE frame, so this is the one place the settled
+    wait is observed doing its real job: the per-session reader is attached to a served
+    fake, the voice turn outruns the budget and then closes ITSELF with the real
+    `session.idle`, and only then is the agent's turn submitted. Before the fix the submit
+    happened inside the request, so the agent's turn began while the voice turn was still
+    writing and read whatever that turn stored as its own history -- measured live as five
+    consecutive turns spent refusing commands its own matrix permits (`qa/live-run-v6.md`
+    §D9).
+    """
+    # Given a warm session whose reader is really attached
+    await served.warm()
+    session_id = next(iter(served.fake.sessions))
+    await served.fake.wait_for_stream()
+    # ... and a voice turn that outruns the budget, then finishes on its own, leaving
+    # behind the stored tool refusal that used to arrive behind the sweep
+    served.fake.hang = True
+    served.fake.hang_answer_s = 0.2
+    served.fake.task_reply = AGENT_REPLY
+    served.cfg.r2d2_fast_deadline = 0.05
+    served.fake.routes.clear()
+    # When the user is released
+    body = await served.ask(QUESTION)
+    # Then the ack is inside Alice's budget and NO agent turn was submitted
+    assert body["response"]["text"] == ACK
+    assert not [route for route in served.fake.routes if route.endswith("/prompt_async")]
+    # ... the still-running voice turn's own refusal, stored while R2D2 is already answering
+    served.fake.transcript.setdefault(session_id, []).append(
+        refused_tool_message("msg_voice_refusal")
+    )
+    # Then: the server closes that turn, the request is handed over, and the agent's
+    # answer is what reaches the user
+    assert await served.telegram.wait_for(AGENT_REPLY) == AGENT_REPLY
+    routes = served.fake.routes
+    assert [route for route in routes if route.endswith("/prompt_async")]
+    # ... and the refusal went BEFORE the submit, so the agent never read it as its own
+    deleted = next(i for i, r in enumerate(routes) if "msg_voice_refusal" in r)
+    submitted = next(i for i, r in enumerate(routes) if r.endswith("/prompt_async"))
+    assert deleted < submitted, routes
+    assert not [
+        envelope
+        for envelope in served.fake.transcript[session_id]
+        if envelope["info"].get("id") == "msg_voice_refusal"
+    ]
+
+
+async def test_two_questions_for_one_application_share_a_single_session(stack: Stack) -> None:    # Given a user with a warm session
     await stack.warm()
     # When two more questions arrive for the same application
     await stack.ask(QUESTION)

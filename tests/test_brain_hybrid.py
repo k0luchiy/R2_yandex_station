@@ -51,7 +51,7 @@ import asyncio
 import json
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
 
@@ -60,6 +60,7 @@ import pytest
 import respx
 
 import core.brain
+import core.session_settle as settle_module
 from app.config import Config
 from core.async_worker import Worker
 from core.backends.config_loader import BackendSpec, load_backend_specs
@@ -72,6 +73,8 @@ from core.brain import ERROR_TEXT, GREETING, HELP_TEXT, Brain
 from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded
 from core.opencode.session_store import OcSessionStore, title_for
+from core.opencode.sse_frames import TURN_COMPLETE, OpencodeEvent
+from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker
 from core.render import MAX_TEXT
 from tests.fake_opencode import (
@@ -689,6 +692,11 @@ async def rig(
     wiring = core.brain.HybridWiring(
         spec=oc_spec, client=client, store=store, backend=backend, broker=broker
     )
+    # This rig wires NO `TurnWatch`, which is the deployment the settled wait degrades in
+    # (`EVENT_MODE = "poll"`, or no opencode route): with no reader there is no way to learn
+    # that a still-running voice turn ended, so it waits a fixed grace instead. The shipped
+    # grace is 5s -- longer than any test may pay -- and this is the only place it is set.
+    monkeypatch.setattr(settle_module, "SETTLE_GRACE_S", POLL_S)
     brain = Brain(cfg, memory, worker, logging.getLogger("r2d2.test.brain"), opencode=wiring)
     try:
         yield Rig(brain, server, net, memory, cfg, oc_spec, store, backend)
@@ -1042,16 +1050,20 @@ async def test_a_turn_that_never_overran_the_budget_pays_no_residue_read(
 
 
 async def _armed_job(rig: Rig, timeout_s: float = 5.0) -> dict:
-    """The one `opencode_reply` job the worker holds, once a background arm has landed.
+    """The one `opencode_reply` job the worker holds, once the hand-off has fully run.
 
-    The arm that answers a failed read runs off Alice's clock by design, so the test waits
-    for the job rather than for a duration -- and a job that never appears fails here
-    instead of in an assertion three lines later.
+    The hand-off is off Alice's clock on the deadline branch -- it waits for the voice turn
+    that outran the budget to stop writing -- so the test waits for the hand-off rather than
+    for a duration; a job that never appears fails here instead of in an assertion three
+    lines later. BOTH halves are required, and the order between them is what makes this
+    safe rather than merely eventual: `_collect_later` writes the `jobs` row before
+    `_hand_over` submits, so observing the submit proves the row exists and the fixture's
+    teardown cannot close the database under a write still in flight.
     """
     async def appeared() -> dict:
         while True:
             jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
-            if jobs:
+            if jobs and [turn for turn in rig.server.turns if turn.submitted]:
                 return jobs[0]
             await asyncio.sleep(0.01)
 
@@ -1600,10 +1612,11 @@ async def test_a_deadline_turn_is_handed_to_the_worker_as_an_opencode_reply_job(
     session_id = await rig.warm()
     rig.server.seed(session_id, said("предыдущий вопрос", "msg_old", role="user"))
     await rig.say()
+    # The job exists on the OTHER side of the settled wait now -- off Alice's clock, which
+    # is the whole of the fix -- so the test waits for the job rather than for a duration.
+    job = await _armed_job(rig)
     # Then exactly one job was enqueued, of the type todo 16 dispatches ...
-    jobs = rig.brain.worker.jobs
-    assert len(jobs) == 1
-    job = jobs[0]
+    assert rig.brain.worker.jobs == [job]
     assert job["type"] == JOB_TYPE
     assert set(job) == JOB_FIELDS
     # ... carrying everything the collector needs and nothing it does not
@@ -1626,7 +1639,7 @@ async def test_the_collected_turn_ships_the_agents_own_text_to_telegram(
     session_id = await rig.warm()
     rig.server.seed(session_id, said("предыдущий вопрос", "msg_old", role="user"))
     await rig.say()
-    job = rig.brain.worker.jobs[0]
+    job = await _armed_job(rig)
     worker = CollectorWorker(rig.cfg, rig.memory, rig.backend)
     await worker.start()
     try:
@@ -1708,9 +1721,9 @@ async def test_a_re_verification_that_stays_slow_leaves_the_answer_a_deadline_no
     # Then: acknowledged, not the graceful error, and a collector is armed for the answer
     assert spoken == ACK
     assert spoken != ERROR_TEXT
-    jobs = rig.brain.worker.jobs
-    assert [job["type"] for job in jobs] == [JOB_TYPE]
-    assert jobs[0]["application_id"] == APP
+    job = await _armed_job(rig)
+    assert [job["type"] for job in [job]] == [JOB_TYPE]
+    assert job["application_id"] == APP
 
 
 async def test_a_re_verification_deadline_with_no_binding_still_falls_back(
@@ -1751,18 +1764,244 @@ async def test_a_turn_that_outran_the_deadline_still_gives_the_agent_the_request
     # ... and the AGENT was given the user's own words anyway. Guessing that the
     # late turn will answer is what dropped the request on the floor: on the live
     # run six laptop-control attempts all overran 3.2s and the agent never saw one
-    # of them, so the work existed nowhere at all.
+    # of them, so the work existed nowhere at all. The submit is off Alice's clock
+    # now -- it waits for that voice turn to stop writing -- so the test waits for
+    # the collector that proves it happened.
+    await _armed_job(rig)
     submitted = [turn for turn in rig.server.turns if turn.submitted]
     assert len(submitted) == 1, rig.server.turns
     assert submitted[0].agent == TASK_AGENT
     assert submitted[0].session_id == session_id
     assert submitted[0].text == f"Пользователь попросил голосом: {asked}"
     # ... with the SAME single collector the branch already armed, so the agent's
-    # answer is still delivered exactly once and the late voice turn's own text is
-    # inside its window rather than in a second, duplicate delivery
+    # answer is still delivered exactly once -- and its window now begins where that
+    # voice turn stopped writing, so the voice turn's own late answer is context for
+    # the agent rather than a second half of the same delivery
     jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
     assert len(jobs) == 1
     assert jobs[0]["session_id"] == session_id
+
+
+# ---------------------------------------------------------------------------
+# 6b. No agent turn may begin while a voice turn for that session is still in flight
+# ---------------------------------------------------------------------------
+
+
+def _watched(rig: Rig) -> TurnWatch:
+    """The rig's wiring with a real event reader attached, and fed by hand.
+
+    The fixture builds the wiring with no `TurnWatch`, which is the shape the settled
+    wait degrades into. "Wait for the voice turn to end" is only measurable from the
+    stream, so these tests wire one and note real frames into it -- which is exactly
+    what `app/opencode_route.py`'s per-session reader does with what the server sends.
+    """
+    turns = TurnWatch()
+    rig.brain.opencode = replace(rig.brain.opencode, turns=turns)
+    return turns
+
+
+def _idle(turns: TurnWatch, session_id: str) -> None:
+    """One `session.idle` for `session_id`, verbatim off the wire (C5, U4)."""
+    turns.note(OpencodeEvent(type=TURN_COMPLETE, properties={"sessionID": session_id}))
+
+
+def _order(rig: Rig) -> dict[str, int]:
+    """Where each opencode write landed, so "before" and "after" can be asserted."""
+    seen: dict[str, int] = {}
+    for index, request in enumerate(rig.server.requests):
+        method, path = request.method, request.url.path
+        if method == "POST" and path.endswith("/prompt_async"):
+            seen.setdefault("submit", index)
+        elif method == "DELETE" and "/message/" in path:
+            seen.setdefault("delete", index)
+    return seen
+
+
+def _live_ids(rig: Rig, session_id: str) -> set[str]:
+    """The ids the server still lists: what a collector's anchor has to be one of."""
+    return {str(entry["info"]["id"]) for entry in rig.server.transcript[session_id]}
+
+
+def _deleted_ids(rig: Rig) -> set[str]:
+    """Every id R2D2 asked the server to delete, in any session."""
+    return {message_id for _session, message_id in rig.server.deleted}
+
+
+async def test_no_agent_turn_starts_while_the_voice_turn_that_outran_the_budget_is_running(
+    rig: Rig,
+) -> None:
+    """**The race.** Two turns in one session at once is what killed the agent for a user.
+
+    The deadline branch used to submit the agent's task inside the request, so `r2d2-agent`
+    began while the still-running voice turn was writing -- and whatever that turn stored
+    landed behind the sweep, which the agent then read as its own history. Measured on the
+    live run (`qa/live-run-v6.md` §D9): the residue was a stored tool refusal whose
+    `state.error` enumerates the refused agent's whole permission matrix, and the agent
+    spent five consecutive turns refusing `echo`, `ls`, `r2d2_do shell` and `read` -- four
+    commands its own matrix permits. Deleting that record did not undo it, because the prose
+    the refusing agent wrote in its place is conversation and is never swept.
+    """
+    # Given a session with a reader attached, and a voice turn that outruns the budget
+    turns = _watched(rig)
+    session_id = await rig.warm()
+    _idle(turns, session_id)  # the reader is attached before the wait begins
+    rig.server.hang_turn = True
+    rig.cfg.r2d2_fast_deadline = DEADLINE_S
+    # When the user is released
+    assert await rig.say() == ACK
+    # Then: no task, and no collector, while that voice turn is still running
+    assert [turn for turn in rig.server.turns if turn.submitted] == [], rig.server.turns
+    assert rig.brain.worker.jobs == []
+    # ... and the still-running turn lands: a tool refusal carrying the matrix of the
+    # agent that was refused, which is exactly what the sweep used to miss
+    rig.server.hang_turn = False
+    rig.server.seed(session_id, refused_tool_message("msg_voice_refusal"))
+    # ... and the server reports that the turn is over
+    _idle(turns, session_id)
+    job = await _armed_job(rig)
+    # Then the request reached the agent, the residue is gone, and it went BEFORE the
+    # submit -- an agent asked to work in a session that still holds the refusal reads
+    # the refused agent's matrix as its own, and that is the whole defect
+    order = _order(rig)
+    assert "msg_voice_refusal" in [message_id for _session, message_id in rig.server.deleted]
+    assert order["delete"] < order["submit"], order
+    assert job["since_message_id"] not in _deleted_ids(rig)
+    assert job["since_message_id"] in _live_ids(rig, session_id)
+
+
+async def test_the_marker_a_deadline_turn_leaves_is_swept_before_that_turns_collector_anchors(
+    rig: Rig, net: Net
+) -> None:
+    """**D6-residue, in its new shape.** The echo can no longer be shipped as an answer.
+
+    On the deadline branch the voice turn wrote `[[NEEDS_AGENT]]` after R2D2 had stopped
+    looking, the agent read it as its own history and wrote one itself, and that echo was
+    the first message after the anchor -- so the collector shipped the user a stripped copy
+    of their own question instead of the result (`qa/live-run-v3.md` §3). The hand-off now
+    reads its snapshot after that turn has ended, so the marker is in it, goes out, and the
+    anchor is a message the server still lists.
+    """
+    # Given a voice turn that outran the budget and then wrote the marker anyway
+    turns = _watched(rig)
+    session_id = await rig.warm()
+    _idle(turns, session_id)
+    rig.server.hang_turn = True
+    rig.cfg.r2d2_fast_deadline = DEADLINE_S
+    assert await rig.say() == ACK
+    rig.server.hang_turn = False
+    rig.server.seed(session_id, said(f"Понял. {SENTINEL} собрать сводку", "msg_late_signal"))
+    _idle(turns, session_id)
+    # When the collector is armed
+    job = await _armed_job(rig)
+    # Then the marker is gone, and the anchor is not it and is not anything deleted
+    assert "msg_late_signal" in [message_id for _session, message_id in rig.server.deleted]
+    assert job["since_message_id"] != "msg_late_signal"
+    assert job["since_message_id"] in _live_ids(rig, session_id)
+    # ... and what the user reads in Telegram is the agent's answer, never the echo
+    worker = CollectorWorker(rig.cfg, rig.memory, rig.backend)
+    await worker.start()
+    try:
+        net.delivered.clear()
+        await worker.enqueue(job)
+        assert await asyncio.wait_for(net.delivered.wait(), timeout=5.0)
+    finally:
+        await worker.stop()
+    assert net.telegram == [AGENT_REPLY]
+
+
+async def test_a_deadline_turn_that_outlives_its_wait_is_still_handed_over_and_swept_next_turn(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound is a bound and not a promise, so the backstop is what covers the rest.
+
+    A voice turn that is still running after `SETTLE_TIMEOUT_S` gets the old ordering: the
+    request is submitted and the collector is armed, but the hand-off's snapshot cannot be
+    known to hold everything that turn will write. What distinguishes that turn is the
+    **debt** -- it is left standing, so the entry of the next turn still sweeps, which is
+    what turns a missing ordering guarantee into a delay rather than a loss. The wait is
+    shortened to what a test can pay; the branch is the one that matters.
+    """
+    # Given a wait that cannot be satisfied
+    monkeypatch.setattr(settle_module, "SETTLE_TIMEOUT_S", 0.1)
+    turns = _watched(rig)
+    session_id = await rig.warm()
+    _idle(turns, session_id)
+    rig.server.hang_turn = True
+    rig.cfg.r2d2_fast_deadline = DEADLINE_S
+    assert await rig.say() == ACK
+    # ... the voice turn still writing a residue
+    rig.server.hang_turn = False
+    rig.server.seed(session_id, refused_tool_message("msg_after_the_bound"))
+    # When the bound elapses
+    job = await _armed_job(rig)
+    # Then the work still reached the agent, exactly once
+    assert [turn.agent for turn in rig.server.turns if turn.submitted] == [TASK_AGPLY if False else TASK_AGENT]
+    assert job["session_id"] == session_id
+    # ... and the next turn still pays the residue read, because nothing observed the end
+    rig.cfg.r2d2_fast_deadline = 5.0
+    rig.server.reply = ANSWER
+    reads = rig.server.route_count("GET", "/message")
+    assert await rig.say() == ANSWER
+    assert rig.server.route_count("GET", "/message") == reads + 1
+    assert "msg_after_the_bound" in _deleted_ids(rig)
+    assert session_id
+
+
+async def test_a_deadline_turn_whose_end_was_observed_leaves_no_residue_debt_behind(
+    rig: Rig,
+) -> None:
+    """The converse, and the reason the wait is worth anything: the next turn pays nothing.
+
+    Once the hand-off's own read has run after the voice turn was SEEN to end, the residue
+    that turn owed is gone and the debt is written off, so `sweep_residue` costs the next
+    turn one set lookup and no request -- which is the whole trade the deadline branch makes:
+    a bounded wait off Alice's clock, paid for by the turn after it, never by the speaker.
+    """
+    # Given a deadline turn whose end the reader reports
+    turns = _watched(rig)
+    session_id = await rig.warm()
+    _idle(turns, session_id)
+    rig.server.hang_turn = True
+    rig.cfg.r2d2_fast_deadline = DEADLINE_S
+    assert await rig.say() == ACK
+    rig.server.hang_turn = False
+    rig.server.seed(session_id, refused_tool_message("msg_swept_by_the_handover"))
+    _idle(turns, session_id)
+    await _armed_job(rig)
+    assert "msg_swept_by_the_handover" in _deleted_ids(rig)
+    # When the NEXT turn for that user runs, on the fast path
+    rig.cfg.r2d2_fast_deadline = 5.0
+    rig.server.reply = ANSWER
+    reads = rig.server.route_count("GET", "/message")
+    # Then it is answered in place and reads nothing: there is no debt left
+    assert await rig.say() == ANSWER
+    assert rig.server.route_count("GET", "/message") == reads
+    assert session_id
+
+
+async def test_a_deadline_branch_without_an_event_reader_still_hands_the_request_over(
+    rig: Rig,
+) -> None:
+    """The degradation is honest, not silent -- and the request is still not lost.
+
+    `EVENT_MODE = "poll"`, or a deployment with no opencode route, attaches no reader, so
+    there is no way to learn that the still-running voice turn ended. The wait falls back to
+    a fixed grace, says in a WARNING that the ordering guarantee is not there, and hands
+    over anyway: D5 is not conditional on how the server was watched.
+    """
+    # Given the fixture's wiring, which has no TurnWatch at all
+    assert rig.brain.opencode.turns is None
+    rig.server.hang_turn = True
+    session_id = await rig.warm()
+    rig.cfg.r2d2_fast_deadline = DEADLINE_S
+    # When
+    assert await rig.say() == ACK
+    job = await _armed_job(rig)
+    # Then the agent has the request, exactly once, in the right session
+    submitted = [turn for turn in rig.server.turns if turn.submitted]
+    assert [turn.session_id for turn in submitted] == [session_id]
+    assert job["session_id"] == session_id
+    assert [entry["type"] for entry in rig.brain.worker.jobs] == [JOB_TYPE]
 
 
 # ---------------------------------------------------------------------------

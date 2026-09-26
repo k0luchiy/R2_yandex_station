@@ -15,16 +15,17 @@ itself -- the submit, the transcript sweep and the `opencode_reply` job -- is
   answers directly.
 * **A deadline is not an abort, and not a loss.** A voice turn that outruns the
   budget keeps running server-side; the user is acknowledged, the work is
-  submitted to the agent as well, and an `opencode_reply` job collects the answer
-  for Telegram. Aborting would destroy work already paid for; not submitting would
-  lose the request outright, because at the deadline nobody can know whether the
-  late turn will answer or ask for the agent.
-* **The residue sweep runs at the entry of a turn, and only where it is owed.** A turn
-  that overran the budget hands its work to the agent while the voice turn is still
-  writing, so the marker that turn leaves cannot be deleted before the agent reads it --
-  the live run measured the whole chain, the echo and the stripped copy of the user's own
-  question that came of it. `SessionCollector` remembers which sessions that happened to and
-  sweeps them here, before this turn's agent is asked anything.
+  submitted to the agent as well -- after that turn has stopped writing, off
+  Alice's clock -- and an `opencode_reply` job collects the answer for Telegram.
+  Aborting would destroy work already paid for; not submitting would lose the
+  request outright, because at the deadline nobody can know whether the late turn
+  will answer or ask for the agent. The ordering is the other half: two turns in
+  one session at once is what let a tool refusal the sweep could not see become
+  the agent's own history (`qa/live-run-v6.md` §D9).
+* **The residue sweep still runs, now as a backstop.** `SessionCollector` remembers
+  which sessions crossed the deadline, and `SessionRoute` sweeps them at the entry
+  of this turn -- which is what catches a residue a hand-off could not see, because
+  its wait is bounded and a bound is not a promise.
 * **C1 is the caller's to handle.** An `info.error` carrying a 403
   `FreeTierError`, or a 402 inside an HTTP 200, is a refusal that raises out of
   here; `Brain._handle` then answers from the provider chain. A refusal text that
@@ -35,6 +36,7 @@ itself -- the submit, the transcript sweep and the `opencode_reply` job -- is
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Final
 
@@ -116,10 +118,13 @@ class SessionRoute:
         queue in a field that means "the model answered".
 
         The three branches that leave for the agent all return through
-        `self.collector.hand_to_agent`, which submits the work AND arms the
-        collector that ships the answer. Neither half is optional: submitting
-        without collecting is the agent working for nobody, and collecting without
-        submitting is a collector waiting for a turn that will never come.
+        `self.collector`, which submits the work AND arms the collector that ships
+        the answer. Neither half is optional: submitting without collecting is the
+        agent working for nobody, and collecting without submitting is a collector
+        waiting for a turn that will never come. Two of the three branches hand
+        over inside the request; the deadline branch cannot, because its voice turn
+        is still running, and gets the same acknowledgement from a call that hands
+        over in a background continuation instead.
         """
         rec = metrics.current()
         rec.agent = wiring.spec.voice_agent
@@ -150,11 +155,16 @@ class SessionRoute:
             # `llm_ms` is its cost.
             rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
             rec.path = metrics.PATH_DEADLINE
-            # The voice turn is still running, so the sweep before the agent's turn cannot
-            # see the `[[NEEDS_AGENT]]` it is about to write. Marked, and swept at the entry
-            # of this user's NEXT turn -- the last moment before any agent reads it again.
+            # The voice turn is still running, so this branch hands the work over in a
+            # background continuation instead of inside the request: two turns in one
+            # session at once is what put a tool refusal the sweep could not see into
+            # the agent's own history and killed it for the user (`qa/live-run-v6.md`
+            # §D9). The session is marked as owing a residue sweep either way, because
+            # the wait is bounded and a bound is not a promise.
             self.collector.note_may_leave_signal(session_id)
-            return await self.collector.hand_to_agent(wiring, app_id, session_id, command)
+            return self.collector.hand_to_agent_after_the_voice_turn(
+                wiring, app_id, session_id, command, time.monotonic()
+            )
         rec.answered(route=metrics.ROUTE_OPENCODE, model=choice.model, msgs=1, tools=())
         decision = routing.parse_voice_reply(
             choice.content, sentinel=self.cfg.r2d2_needs_agent_sentinel

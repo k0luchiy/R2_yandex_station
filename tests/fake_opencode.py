@@ -269,6 +269,13 @@ class FakeOpencode:
     #: A turn is accepted and never answered -- what a cold cache looks like from
     #: the client, and the only way to reach the deadline branch.
     hang: bool = False
+    #: When set, a hanging turn CLOSES ITSELF after this many seconds instead of
+    #: waiting to be read: the answer is stored and the turn ends with the real
+    #: `session.idle`, without anybody polling the transcript. That is the shape
+    #: the live server has, and it is the only one `core/session_settle.py` can
+    #: measure -- holding the answer for a later poll would make the wait for the
+    #: voice turn to end depend on the collector, which is the collector.
+    hang_answer_s: float = 0.0
     #: Every route answers this instead of its own. `503` is the in-process
     #: stand-in for "the server is not running"; the real refusal is proved by the
     #: loopback QA, which stops the process.
@@ -441,7 +448,12 @@ class FakeOpencode:
                 # session, the answer is still being worked on, and it will land as
                 # an assistant message later. That is what makes a deadline a
                 # hand-off rather than a loss -- the collector is what waits for it.
-                server._deliver_later(session_id, answer)
+                if server.hang_answer_s:
+                    asyncio.get_running_loop().call_later(
+                        server.hang_answer_s, server._seed, session_id, answer, ASSISTANT_ROLE
+                    )
+                else:
+                    server._deliver_later(session_id, answer)
                 return _forever()
             if server.turn_error is not None:
                 return _json({"info": {"id": "msg_e", "error": server.turn_error}, "parts": []})
