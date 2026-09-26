@@ -216,8 +216,9 @@ class PermissionBroker:
         recognise its own configuration must not answer permissions."""
         source = ASK_SOURCE.get(EVENT_MODE)
         if source is None:
-            log.info("opencode permissions: broker is inert; the agent config already denies bash, "
-                     "edit and external_directory, so no ask can arrive")
+            log.info("opencode permissions: broker is inert; event mode %r has no ask source, "
+                     "so a bash ask cannot be attributed to this broker and must not be "
+                     "answered here", EVENT_MODE)
             return
         log.info("opencode permissions: asks arrive %s; one left unanswered for %.0fs is refused",
                  source, self._window_s)

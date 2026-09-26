@@ -30,9 +30,11 @@ not to touch it. So the fix is the **order**, not the sweep, and this module own
   moment R2D2 gave up on the turn, **and** no ask of ours unanswered. The second half is
   what makes it safe on a session with two agents in it -- opencode sends `session.idle`
   even while a tool is blocked on a human answer (C5), so idle alone would release the
-  wait on a turn that is parked rather than finished. `r2d2-voice` has no `ask` rule at
-  all, so in practice its turn cannot park; the conjunction is kept because that is a
-  property of the deployed matrix and not of this module.
+  wait on a turn that is parked rather than finished. `r2d2-voice` has an `ask` rule --
+  its `bash` catch-all asks rather than denies, so a raw terminal attempt from the voice
+  agent parks its turn on a human answer. The conjunction is therefore load-bearing
+  rather than theoretical, and hitting the bound below is an ordinary outcome of that
+  policy choice, not a pathological server.
 * **The wait is bounded, and the bound is stated.** `SETTLE_TIMEOUT_S` is three times
   the worst measured voice turn (18.6 s for a cold first turn, `docs/11-opencode-contract.md`
   U6) and a twentieth of the collector's own 600 s ceiling, so a turn that outruns it is
