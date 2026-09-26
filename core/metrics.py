@@ -30,11 +30,12 @@ Three properties are load-bearing:
 * `deadline` -- the voice turn outran `r2d2_fast_deadline` and was handed to the
   collector, and `route=opencode` for the branch that answers from a session.
 
-`deadline` and `route=opencode` belong to `Brain._opencode_turn`, which does not
-report to a recorder yet: a turn that route took is a turn with no record, and
-that is the gap todo 18's wiring closes. Until then the chain turn is the one
-instrumented, and `docs/11-opencode-contract.md`'s measured p50 of 1.667 s against
-the 2.5 s budget is the number the record exists to keep watching.
+Both of those belong to `Brain._opencode_turn`, which reports them itself since
+todo 18: it is the only branch that knows which agent spoke and whether the voice
+turn ran out of budget, so a recorder that could not be told would be a recorder
+nobody fills in. `docs/11-opencode-contract.md`'s measured p50 of 1.667 s against
+the 2.5 s budget is the number the record exists to keep watching, and it lands
+on that branch.
 """
 
 from __future__ import annotations
@@ -59,6 +60,7 @@ ROUTE_FALLBACK: Final = "fallback"
 PATH_VOICE: Final = "voice"
 PATH_ESCALATE: Final = "escalate"
 PATH_ERROR: Final = "error"
+PATH_DEADLINE: Final = "deadline"
 
 #: The one record per turn. The first seven fields are the format the plan pins;
 #: `msgs` and `tools` are what the line it replaced carried, kept because they are

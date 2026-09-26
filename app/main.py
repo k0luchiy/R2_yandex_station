@@ -1,23 +1,53 @@
-import asyncio
-import logging
-from contextlib import asynccontextmanager
-from typing import Final
+"""The composition root: build the stack, start it, stop it (plan todo 18).
 
-import httpx
+Everything R2D2 is made of is created here, in the order the objects depend on
+each other, and every task started here is stopped here in the reverse order --
+an un-stopped task is a "Task was destroyed but it is pending" warning at every
+reload, and a warning nobody reads is how a leak survives.
+
+The order, and why it is this order:
+
+1. `Memory` -- everything else needs the database, and it is the only thing that
+   must exist before the registry can be read meaningfully.
+2. the startup gate (`probe_opencode_server`) -- it answers "is the brain there?",
+   and the wiring below is built differently depending on the answer.
+3. the opencode route (`app.opencode_route.wire_opencode`): client, session store,
+   session backend, broker, event readers, and the C1 model gate.
+4. the `Worker`, **with** the session backend when there is one -- todo 16's
+   `opencode_reply` job collects the answer of a turn that outran the voice
+   budget, and a worker without the collector answers "Неизвестная задача.".
+5. the `Brain`, with the route as `HybridWiring` or with nothing, which is the
+   supported "answer from the chain only" deployment.
+6. start: the worker, the broker's 30 s sweep, the 60 s reaper, and the session
+   readers that are already attached.
+
+**The server is never started, never killed and never waited for.** A systemd user
+unit (`scripts/r2d2-opencode.service`) owns `opencode serve`; this process is its
+client. No process-control API is named anywhere in `app/` -- not even in a
+docstring -- and `tests/test_serve_unit.py` asserts their absence by reading this
+file's text.
+
+**A missing opencode server does not stop R2D2 from starting.** The fallback chain
+carries every turn, `/health` reports the degradation in a field, and the startup
+line says `opencode=unwired` rather than a bare "started" -- a misleading success
+is the failure mode here, not a crash.
+"""
+
+import logging
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+from app import diagnostics
 from app.config import Config
+from app.opencode_route import wire_opencode
 from core.async_worker import Worker
-from core.backends.config_loader import BackendConfigError, BackendSpec, load_backend_specs
-from core.brain import SESSION_KIND, Brain
+from core.backends.config_loader import BackendConfigError, load_backend_specs
+from core.brain import Brain
 from core.memory import Memory
-from core.opencode.client import (
-    OpencodeClient,
-    OpencodeError,
-    OpencodeHealth,
-    OpencodeProtocolError,
-)
+from core.opencode.client import OpencodeClient, OpencodeHealth
 from core.tools.telegram_tool import send_message
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -25,23 +55,15 @@ logger = logging.getLogger("r2d2")
 
 #: What the owner runs when the gate below reports the server unreachable.
 LAUNCHER = "scripts/opencode_serve.sh"
-#: The bound on the `/health` liveness probe, and it is the ROUTE's bound rather
-#: than the client's: a server that stops reading the socket does not end the
-#: client's own timeout any sooner, and a probe that hangs is the one thing an
-#: operator cannot diagnose with.
-HEALTH_PROBE_TIMEOUT_S: Final = 2.0
-#: The only body the diagnostics route answers 503 with, and the only error a
-#: caller has to parse.
-UNREACHABLE: Final = "opencode unreachable"
 
 
 async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
     """One liveness probe of the opencode server, logged. Never raises.
 
     `None` means "no opencode backend to probe" -- either the registry could not
-    be read or it declares no such backend -- which is a different situation
-    from "the server is down", and R2D2 must boot either way: the fallback
-    backend chain carries the request until todo 18 wires the client in.
+    be read or it declares no such backend -- which is a different situation from
+    "the server is down", and R2D2 must boot either way: the fallback backend
+    chain carries the request until `wire_opencode` has its say.
     """
     try:
         _chain, specs = load_backend_specs(cfg)
@@ -66,81 +88,46 @@ async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
     return health
 
 
-async def probe_opencode(spec: BackendSpec | None, cfg: Config) -> OpencodeHealth:
-    """One bounded liveness probe of a configured opencode server. Never raises.
-
-    A registry with no `opencode` backend reads exactly like a server that is
-    down -- R2D2 has no opencode route and the chain carries every turn -- so it
-    answers with the same `reachable=False` and no address.
-
-    It does not log: `probe_opencode_server` already reported the cause at
-    startup with the command that fixes it, and a route a monitor polls every few
-    seconds would repeat that line forever. The answer belongs in the body.
-    """
-    if spec is None:
-        return OpencodeHealth(reachable=False)
-    client = OpencodeClient(spec, cfg.r2d2_workspace)
-    try:
-        return await asyncio.wait_for(client.health(), HEALTH_PROBE_TIMEOUT_S)
-    except TimeoutError:
-        return OpencodeHealth(reachable=False)
-    finally:
-        # The client opens its own connection pool on first use, so a client left
-        # unclosed here leaks one pool per probe -- i.e. per health check.
-        await client.aclose()
-
-
-async def health_view(cfg: Config) -> tuple[dict[str, object], list[str]]:
-    """`(the opencode key of the health body, the fallback chain)`. Never raises.
-
-    The chain is the *effective* one: `config/backends.json` lists the session
-    backend first because it is the primary route, and `core/brain.py` drops it
-    from the walk (a second attempt on the host that just failed spends budget the
-    turn no longer has), so reporting it here would advertise a backend that can
-    never answer a turn.
-
-    A registry that cannot be read is the loud case, not a quiet one: the body
-    then carries `chain: []`, which says out loud that R2D2 has no brain at all
-    rather than a brain with a missing part.
-    """
-    try:
-        chain, specs = load_backend_specs(cfg)
-    except BackendConfigError:
-        return {"reachable": False, "version": None, "base_url": ""}, []
-    spec = specs.get("opencode")
-    liveness = await probe_opencode(spec, cfg)
-    return (
-        {
-            "reachable": liveness.reachable,
-            "version": liveness.version,
-            "base_url": spec.base_url if spec is not None else "",
-        },
-        [name for name in chain.order if specs[name].kind != SESSION_KIND],
-    )
-
-
-def unreachable() -> JSONResponse:
-    return JSONResponse({"error": UNREACHABLE}, status_code=503)
-
-
 def build_app() -> FastAPI:
     cfg = Config.load()
 
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         memory = await Memory(cfg.resolved_db_path()).connect()
-        worker = Worker(cfg, memory, logger)
-        await worker.start()
-        brain = Brain(cfg, memory, worker, logger)
+        health = await probe_opencode_server(cfg)
+        route = await wire_opencode(cfg, memory, health, OpencodeClient)
+        worker = Worker(cfg, memory, logger, route.wiring.backend if route else None)
+        brain = Brain(cfg, memory, worker, logger, opencode=route.wiring if route else None)
         app.state.cfg = cfg
         app.state.memory = memory
         app.state.worker = worker
         app.state.brain = brain
-        await probe_opencode_server(cfg)
-        logger.info("R2D2 started, db=%s, provider=%s", cfg.resolved_db_path(), cfg.llm_provider)
-        yield
-        await worker.stop()
-        await memory.close()
+        app.state.route = route
+        await worker.start()
+        if route is not None:
+            await route.start()
+        fallback = await diagnostics.fallback_backends(cfg, load_backend_specs)
+        # `opencode=wired`/`unwired` is the field that keeps this line from reading
+        # as a guarantee: a startup that says only "started" is what an operator
+        # with a dead opencode server (or a refused model) would take for a brain.
+        # The last field is `fallback` and NOT `chain` on purpose: these are the
+        # backends `build_chain` could actually build, while `/health`'s `chain` is
+        # the declared order minus the session backend. Two different numbers under
+        # one name is how an operator concludes the health probe is lying.
+        logger.info(
+            "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s",
+            cfg.resolved_db_path(),
+            "wired" if route is not None else "unwired",
+            route.models_label if route is not None else "none",
+            fallback,
+        )
+        try:
+            yield
+        finally:
+            if route is not None:
+                await route.stop()
+            await worker.stop()
+            await memory.close()
 
     app = FastAPI(title="R2D2", lifespan=lifespan)
 
@@ -156,7 +143,7 @@ def build_app() -> FastAPI:
         """
         cfg: Config = request.app.state.cfg
         memory: Memory = request.app.state.memory
-        liveness, chain = await health_view(cfg)
+        liveness, chain = await diagnostics.health_view(cfg, load_backend_specs, OpencodeClient)
         return {
             "status": "ok",
             "opencode": liveness,
@@ -166,35 +153,9 @@ def build_app() -> FastAPI:
 
     @app.get("/diagnostics/providers")
     async def diagnostics_providers(request: Request):
-        """The live `GET /config/providers` and `GET /agent` payloads, unedited.
-
-        Which models the server can reach and which agents it exposes is the pair
-        of facts that decides whether a turn is answered or refused -- C1 measured
-        a 403 `FreeTierError` inside an HTTP 200 -- and neither is visible in a log
-        line. The route is unauthenticated, so it returns what the server said and
-        nothing else: an upstream body that will not parse is never echoed back.
-        """
+        """The live provider and agent catalogs; `app/diagnostics.py` has the why."""
         cfg: Config = request.app.state.cfg
-        try:
-            _chain, specs = load_backend_specs(cfg)
-        except BackendConfigError:
-            return unreachable()
-        spec = specs.get("opencode")
-        if spec is None:
-            return unreachable()
-        client = OpencodeClient(spec, cfg.r2d2_workspace)
-        try:
-            providers = await client.providers()
-            agents = await client.agents()
-        except OpencodeProtocolError:
-            # A 2xx the client cannot read: the server spoke, and it spoke
-            # nonsense. 502, and never the body -- see the docstring.
-            return JSONResponse({"error": "opencode answered with a malformed body"}, status_code=502)
-        except (httpx.HTTPError, OpencodeError):
-            return unreachable()
-        finally:
-            await client.aclose()
-        return {"providers": providers, "agents": agents}
+        return await diagnostics.providers_view(cfg, load_backend_specs, OpencodeClient)
 
     @app.get("/")
     async def root():

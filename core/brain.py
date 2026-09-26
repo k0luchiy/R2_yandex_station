@@ -276,33 +276,63 @@ class Brain:
         `complete()` resolves the session itself through the `ContextVar`, so the
         store is consulted here for the two things it alone knows: which session
         the agent turn belongs to, and whether this session has ever been used.
+
+        Every return below reports itself to the turn recorder, because this is the
+        PRIMARY route and the one whose latency decides whether we fit Alice's
+        4.5 s: a turn that reached opencode and said nothing is a turn nobody can
+        explain. `llm_ms` is measured around `complete()` alone -- `submit_task`
+        returns 204 with the work still to come, so timing it would put a worker's
+        queue in a field that means "the model answered".
         """
+        rec = metrics.current()
+        rec.agent = wiring.spec.voice_agent
         session_id = await wiring.store.resolve(app_id)
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
+            self._handoff(rec, wiring)
             await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}")
             return self.cfg.r2d2_task_ack, False
         current_application_id.set(app_id)
         try:
-            choice = await wiring.backend.complete(
-                [{"role": "user", "content": command}],
-                timeout=self.cfg.r2d2_fast_deadline,
-                model=wiring.spec.fast_model,
+            choice = await rec.measure(
+                wiring.backend.complete(
+                    [{"role": "user", "content": command}],
+                    timeout=self.cfg.r2d2_fast_deadline,
+                    model=wiring.spec.fast_model,
+                )
             )
         except OpencodeDeadlineExceeded:
             # NOT aborted: the turn is still running server-side and the collector
             # below fetches it. The user has already been given the ack.
+            rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
+            rec.path = metrics.PATH_DEADLINE
             await self._collect_later(wiring, app_id, session_id)
             return self.cfg.r2d2_task_ack, False
+        rec.answered(route=metrics.ROUTE_OPENCODE, model=choice.model, msgs=1, tools=())
         decision = routing.parse_voice_reply(
             choice.content, sentinel=self.cfg.r2d2_needs_agent_sentinel
         )
         if decision.kind == "speak":
             return decision.spoken, False
         hint = f"\n{decision.task_hint}" if decision.task_hint else ""
+        self._handoff(rec, wiring)
         await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}{hint}")
         return self.cfg.r2d2_task_ack, False
+
+    @staticmethod
+    def _handoff(rec: metrics.Turn, wiring: HybridWiring) -> None:
+        """Record a turn that moves to the AGENT: the ack's own facts, not the voice's.
+
+        `msgs=1` and no tools are what the session route really sent (C3/U2: the
+        session already holds the conversation, and the voice protocol carries no
+        tool calls), and `escalated` is what makes the record read `path=escalate`
+        rather than `path=voice` -- the user was acknowledged, not answered, and
+        those are different facts about a 4.5 s turn.
+        """
+        rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.task_model, msgs=1, tools=())
+        rec.agent = wiring.spec.task_agent
+        rec.escalated = True
 
     async def _prepare(self, wiring: HybridWiring, app_id: str, session_id: str) -> bool:
         """Count the turn, summarise a long session once, and report whether it is warm.
