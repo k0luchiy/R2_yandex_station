@@ -24,6 +24,14 @@ run). The guard is at the boundary rather than in the collector because the
 boundary is the last place every producer passes, including a future job type
 nobody has written yet.
 
+**What counts as an answer is not decided here.** This pool bounds a job; whether the
+body a collector produced may be shown to a person as the agent's answer is
+`core/answer_gate.py`, which knows the escalation protocol and the turn state the
+opencode event stream reports. The split is by question: this module answers "may this
+worker keep a slot for another ten minutes", the gate answers "is this the answer".
+The pool's only part of that answer is the bound -- the gate is asked for a verdict and
+`asyncio.wait_for` is what stops it running for ever.
+
 The dispatch is one explicit branch per job type, never a method name resolved
 from the job's own `type`: that string crosses a module boundary, and a lookup
 built from it turns a typo in `core/brain.py` into an AttributeError at run time,
@@ -37,7 +45,10 @@ from typing import Final, Protocol
 
 from app.config import Config
 from core import routing
+from core.answer_gate import NO_REPLY as ANSWER_GATE_NO_REPLY
+from core.answer_gate import AnswerGate
 from core.memory import Memory
+from core.opencode.turn_watch import TurnWatch
 from core.tools import arxiv_tool
 from core.tools.telegram_tool import send_message
 
@@ -47,10 +58,10 @@ JOB_OPENCODE_REPLY: Final = "opencode_reply"
 #: The collector's ceiling for a job that states none. The same value
 #: `core.brain.COLLECT_TIMEOUT_S` puts in a job it writes.
 COLLECT_TIMEOUT_S: Final = 600.0
-#: What the user is told when the collector ended without any assistant text. An
-#: empty body would be a misleading success: the phone shows nothing at all and
-#: the operator sees a delivered job with no reason in it.
-NO_REPLY: Final = "Агент не ответил."
+#: What the user is told when the collector ended without any assistant text. Defined by
+#: `core/answer_gate.py`, which decides that, and re-exported here so the job pool keeps
+#: one name for the sentence its own jobs produce.
+NO_REPLY: Final = ANSWER_GATE_NO_REPLY
 
 
 class WorkerJobError(Exception):
@@ -125,10 +136,23 @@ class Worker:
         self.memory = memory
         self.logger = logger or logging.getLogger("r2d2.worker")
         self._backend = opencode_backend
+        self._turns: TurnWatch | None = None
         self._queue: asyncio.Queue[tuple[str, dict]] = asyncio.Queue()
         self._tasks: list[asyncio.Task] = []
         self._jobs: set[asyncio.Task] = set()
         self._sem = asyncio.Semaphore(2)
+
+    def arm_watch(self, turns: TurnWatch | None) -> None:
+        """Give this pool the turn state its collector needs, once it exists.
+
+        The watch is built where the opencode route is wired (`app/opencode_route`,
+        beside the event readers that feed it) and reaches the pool through
+        `SessionCollector.hand_to_agent` -- the one call in the whole server that arms
+        a collector, and the only place that holds both the route and the worker. A
+        pool with no watch keeps the silence heuristic alone, which is the pre-agreed
+        degradation rather than a different behaviour.
+        """
+        self._turns = turns
 
     async def start(self) -> None:
         self._tasks.append(asyncio.create_task(self._loop()))
@@ -198,11 +222,12 @@ class Worker:
     async def _opencode_reply(self, job: dict) -> str:
         """The text the opencode agent produced after the marker, or `NO_REPLY`.
 
-        The keys are checked before the backend is touched, so a malformed job
-        cannot half-run. The ceiling is applied here rather than left to
-        `collect_reply`, which ends on its own idle condition but is one
-        implementation away from being the thing that holds a slot for ten
-        minutes.
+        The keys are checked before the backend is touched, so a malformed job cannot
+        half-run. The ceiling is applied HERE, around the whole gate, rather than left to
+        `collect_reply`, which ends on its own idle condition but is one implementation
+        away from being the thing that holds a slot for ten minutes -- and rather than
+        left to `core/answer_gate.py`, which is about what an answer IS and not about how
+        long this pool may be held.
         """
         backend = self._backend
         if backend is None:
@@ -214,9 +239,10 @@ class Worker:
         session_id = _text_field(job, "session_id")
         since_message_id = _text_field(job, "since_message_id", allow_empty=True)
         timeout_s = _timeout_field(job)
+        gate = AnswerGate(self.cfg, self.logger, backend.collect_reply, self._turns)
         try:
-            text = await asyncio.wait_for(
-                backend.collect_reply(session_id, since_message_id, timeout_s), timeout_s
+            return await asyncio.wait_for(
+                gate.answer(session_id, since_message_id, timeout_s), timeout_s
             )
         except TimeoutError as exc:
             # Indistinguishable from a TimeoutError the collector raised itself, and
@@ -227,7 +253,6 @@ class Worker:
                 f"{session_id!r} within {timeout_s:g}s. The turn is still running server-side "
                 "and nothing aborts it, so its answer is still there to be asked for."
             ) from exc
-        return text or NO_REPLY
 
     async def _arxiv(self, job: dict) -> str:
         query = job.get("query", "")

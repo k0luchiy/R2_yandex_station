@@ -16,11 +16,15 @@ own tests instead of a line in a docstring:
   operator can see what a single durable grant would have bought, and it is never
   posted anywhere.
 * **Every ambiguous path fails toward `reject`.** A timeout, an unreachable
-  server, a 200 that carries `false`, a second ask that orphans the first, a
-  record whose shape cannot be read: each one refuses. The only route to an
-  execution is an explicit "да" inside the window, and
-  `test_a_failed_answer_is_never_reported_as_approved` pins that the returned
-  verdict reflects what the server was actually told.
+  server, a 200 that carries `false`, a record whose shape cannot be read: each
+  one refuses. The only route to an execution is an explicit "да" inside the
+  window, and `test_a_failed_answer_is_never_reported_as_approved` pins that the
+  returned verdict reflects what the server was actually told.
+* **A turn that needs two confirmations can complete.** D14 measured a second ask
+  refusing the first 0.55 s after it was raised, because the row under
+  `application_id` held one ask. The row holds a queue now; the invariant is
+  "one QUESTION at a time, each ask answered at most once, never `always`", and
+  `test_a_second_ask_queues_behind_the_first_and_both_can_be_answered` is it.
 
 **Alice cannot push**, so the confirmation question goes out through Telegram
 (`core.tools.telegram_tool.send_message`) and the answer comes back as text from
@@ -92,7 +96,9 @@ SHELL_PENDING: Final = {
     "session_id": SESSION_ID,
     "permission_id": PERMISSION_ID,
 }
-#: The field set the broker writes, so a shape change is a test failure.
+#: The field set the broker writes, so a shape change is a test failure. `queued` is the
+#: tail of the queue (D14): the head's own fields are spread at the top level, so a row
+#: holding one ask reads exactly as it always did and only the queue adds a key.
 RECORD_FIELDS: Final = {
     "kind",
     "session_id",
@@ -100,11 +106,13 @@ RECORD_FIELDS: Final = {
     "title",
     "always",
     "requested_at",
+    "queued",
 }
 
 QUESTION: Final = "Нужно подтверждение: {title}. Ответь в телеграм «да» или «нет»."
 ACCEPTED: Final = "Принято, выполняю: {title}."
 UNANSWERABLE: Final = "Сервер не принял ответ, действие отклонено: {title}."
+OVERLOADED: Final = "Запросов подтверждения слишком много, действие отклонено: {title}."
 TIMEOUT_NOTICE: Final = "Подтверждение не получено, действие отклонено."
 
 
@@ -352,28 +360,81 @@ async def test_the_ask_never_builds_an_alice_payload(broker, server: FakeOpencod
     assert server.requests == []
 
 
-async def test_a_second_ask_refuses_the_orphaned_one_it_evicts(
-    broker, memory: Memory, server: FakeOpencode, telegram: Telegram, caplog
+async def test_a_second_ask_queues_behind_the_first_and_both_can_be_answered(
+    broker, memory: Memory, server: FakeOpencode, telegram: Telegram
 ):
-    """`pending_actions` holds one row per user, so a second ask has to evict the
-    first. Leaving the evicted ask unanswered would wedge the turn blocked on it --
-    with no record, the sweep could never refuse it."""
-    # Given: an unanswered ask from a crashed run
-    await broker.on_permission_requested(APP, "ses_old", "per_old", "rm -rf /", ("rm *",))
-    # When: a new ask arrives for the same user
-    with caplog.at_level(logging.WARNING, logger="core.permissions"):
-        await broker.on_permission_requested(APP, SESSION_ID, PERMISSION_ID, TITLE, MASKS)
-    # Then: the orphan is refused on the wire, and the new ask owns the row
-    assert server.answers() == [{"response": "reject"}]
-    assert server.answer_posts()[0].url.path == "/session/ses_old/permissions/per_old"
+    """**D14, and the reason this file no longer has an eviction test.**
+
+    The live run measured it: a turn that needed two confirmations raised two asks 0.55 s
+    apart, and the broker refused the FIRST one 0.15 s after raising it, because the row
+    under `application_id` held one ask and the new one evicted it. The user was looking
+    at the question for a command that had already been rejected, and the turn could never
+    complete. The row was never the constraint -- treating it as a single slot was -- so
+    the row now holds a queue and this test is the queue's contract:
+
+    * the first ask stays pending and the second joins behind it;
+    * exactly ONE question is on screen at a time, so a `да` in Telegram is never
+      ambiguous;
+    * each ask is answered at most once, and the answers go out in the order they were
+      raised, so the turn's commands run in the order the agent asked for them.
+    """
+    # Given: one turn that raises two asks, the second a moment after the first
+    await broker.on_permission_requested(APP, SESSION_ID, "per_1", "ls -la /tmp", ("ls *",))
+    await broker.on_permission_requested(APP, SESSION_ID, "per_2", "curl -s x", ("curl *",))
+    # Then: nothing was refused -- the first ask is still answerable
+    assert server.answers() == []
     record = await memory.get_pending(APP)
-    assert record is not None and record["permission_id"] == PERMISSION_ID
-    # And the user is asked about both, in order -- the eviction is not secret
-    assert telegram.texts() == [
-        QUESTION.format(title="rm -rf /"),
-        QUESTION.format(title=TITLE),
+    assert record is not None
+    assert record["permission_id"] == "per_1"
+    assert [queued["permission_id"] for queued in record["queued"]] == ["per_2"]
+    # And the user has ONE question: the one they can actually answer right now
+    assert telegram.texts() == [QUESTION.format(title="ls -la /tmp")]
+    # When: the first question is answered
+    assert await broker.resolve_from_text(APP, "да") == "approved"
+    # Then: it landed as `once`, and the SECOND ask is now the question
+    assert server.answers() == [{"response": "once"}]
+    assert server.answer_posts()[0].url.path.endswith("/permissions/per_1")
+    assert telegram.texts()[-1] == QUESTION.format(title="curl -s x")
+    assert (await memory.get_pending(APP))["permission_id"] == "per_2"
+    # When: the second is answered too -- the turn needing two confirmations completes
+    assert await broker.resolve_from_text(APP, "да") == "approved"
+    # Then: both were approved once, in order, and nothing is left to answer
+    assert [body["response"] for body in server.answers()] == ["once", "once"]
+    assert server.answer_posts()[1].url.path.endswith("/permissions/per_2")
+    assert await memory.get_pending(APP) is None
+    # And a third `да` is an ordinary message again: every ask is answered at most once
+    assert await broker.resolve_from_text(APP, "да") == "unrelated"
+    assert len(server.answer_posts()) == 2
+
+
+async def test_a_queue_the_user_cannot_reach_refuses_the_newcomer_and_not_the_head(
+    broker, memory: Memory, server: FakeOpencode, telegram: Telegram
+):
+    """The bound on the queue, and which side of it the refusal falls on.
+
+    `MAX_QUEUED` exists so a turn that raises asks in a loop cannot grow the row without
+    end. The ask that does not fit is the one refused, because every ask already stored
+    is still reachable by exactly one `да` or `нет`; refusing the head instead -- which is
+    what the pre-queue broker did to the older ask -- is the failure D14 was.
+    """
+    # Given: the queue filled to its bound, one ask at a time
+    from core.pending_permission import MAX_QUEUED
+
+    for index in range(MAX_QUEUED + 1):
+        await broker.on_permission_requested(APP, SESSION_ID, f"per_{index}", f"cmd {index}", ())
+    # Then: the newcomer is refused on the wire, and the head is still the first ask
+    assert server.answers() == [{"response": "reject"}]
+    assert OVERLOADED.format(title=f"cmd {MAX_QUEUED}") in telegram.texts()
+    record = await memory.get_pending(APP)
+    assert record is not None
+    assert record["permission_id"] == "per_0"
+    assert [queued["permission_id"] for queued in record["queued"]] == [
+        f"per_{index}" for index in range(1, MAX_QUEUED)
     ]
-    assert "per_old" in caplog.text
+    # And the refused ask is the ONLY one refused -- the queued ones are still answerable
+    assert server.answer_posts()[0].url.path.endswith(f"/permissions/per_{MAX_QUEUED}")
+    assert await broker.resolve_from_text(APP, "да") == "approved"
+    assert server.answer_posts()[-1].url.path.endswith("/permissions/per_0")
 
 
 # ---------------------------------------------------------------------------

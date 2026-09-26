@@ -59,6 +59,7 @@ from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeError, OpencodeHealth
 from core.opencode.session_store import OcSessionStore
 from core.opencode.sse import PERMISSION_ASKED, EventSource, OpencodeEvent
+from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker
 
 __all__ = ["OpencodeRoute", "SessionReaders", "SessionWatchingStore", "wire_opencode"]
@@ -89,10 +90,12 @@ class SessionReaders:
     the flag and returns without sleeping out the ladder.
     """
 
-    def __init__(self, spec: BackendSpec, directory: str, broker: PermissionBroker) -> None:
+    def __init__(self, spec: BackendSpec, directory: str, broker: PermissionBroker,
+                 turns: TurnWatch | None = None) -> None:
         self._spec = spec
         self._directory = directory
         self._broker = broker
+        self._turns = turns
         self._stop = asyncio.Event()
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
@@ -146,6 +149,10 @@ class SessionReaders:
         self, app_id: str, session_id: str
     ) -> Callable[[OpencodeEvent], Awaitable[None]]:
         async def handle(event: OpencodeEvent) -> None:
+            if self._turns is not None:
+                # Before the broker's branch, and for EVERY frame: a collector has to learn
+                # that the turn ended as well as that nothing of ours waits on a human.
+                self._turns.note(event)
             if event.type != PERMISSION_ASKED:
                 return
             permission_id, session = event.permission_id, event.session_id
@@ -287,18 +294,17 @@ async def wire_opencode(
         return _refused(f"the workspace {cfg.r2d2_workspace!r} does not exist")
     client = factory(spec, cfg.r2d2_workspace)
     broker = PermissionBroker(memory, client, cfg)
-    readers = SessionReaders(spec, cfg.r2d2_workspace, broker)
+    turns = TurnWatch()
+    readers = SessionReaders(spec, cfg.r2d2_workspace, broker, turns)
     store = SessionWatchingStore(memory, client, cfg, readers)
     backend = OpencodeSessionBackend(spec, OpencodeWiring(client=client, store=store, cfg=cfg))
     await _reattach(readers, memory)
     models = await _validated(backend, spec, reachable=bool(health and health.reachable))
     if models is None:
         return _refused(f"{spec.name!r} does not offer every model this deployment sends")
-    return OpencodeRoute(
-        wiring=HybridWiring(spec=spec, client=client, store=store, backend=backend, broker=broker),
-        readers=readers,
-        models=models,
-    )
+    wiring = HybridWiring(spec=spec, client=client, store=store, backend=backend,
+                          broker=broker, turns=turns)
+    return OpencodeRoute(wiring=wiring, readers=readers, models=models)
 
 
 # ---------------------------------------------------------------------------

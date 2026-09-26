@@ -199,3 +199,18 @@ def test_the_client_is_still_constructed_the_way_every_caller_constructs_it():
     assert subject._owns_client is False
     assert repr(subject) == f"OpencodeClient(base_url='http://127.0.0.1:4599', directory={WORKSPACE!r})"
     assert "R2D2_OC_PASSWORD_VALUE" not in repr(subject)
+
+
+def test_a_transport_names_itself_and_not_its_subclass():
+    # Given: the BASE class, which is the object that actually holds the socket
+    base = transport.OpencodeTransport(_spec(), WORKSPACE)
+    # When
+    text = repr(base)
+    # Then: it says what it is. A hardcoded "OpencodeClient" here named an object that
+    # does not exist -- the base has no routes of its own, and a subclass a later change
+    # adds would be reported as its parent, which is the one thing a traceback cannot do.
+    assert text == f"OpencodeTransport(base_url='http://127.0.0.1:4599', directory={WORKSPACE!r})"
+    # And the real client is still named exactly as the assertion above pins it, because
+    # its name comes from its own class rather than from this base's
+    assert repr(client.OpencodeClient(_spec(), WORKSPACE)).startswith("OpencodeClient(")
+    assert "R2D2_OC_PASSWORD_VALUE" not in text

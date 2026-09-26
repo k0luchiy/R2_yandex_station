@@ -36,12 +36,27 @@ The properties this module exists to hold:
   deadline nobody can know whether the late turn will answer or ask for the
   agent, and the collector needs a marker -- hence the last message the session
   held before this turn's work was submitted is recorded in the job.
-* **A permission refusal in the transcript is not this module's business.** A
-  refusal is a `tool` part, `list_messages` reads text parts only, and the reader
-  that could see it belongs to `core/opencode`. What keeps one agent's refusal
-  from reading as a ban on the other's tools is a rule in both agent prompts.
-  This sweep stays the one artefact it was built for, and `_collect_later` says
-  why deleting a refusal would cost the user more than it saves.
+* **A stored permission refusal IS this module's business, and is deleted.** A refusal is a
+  `tool` part whose `state.error` enumerates the refused agent's whole effective matrix
+  (contract U8), which in the shared one-session-per-human model is not the reader's. It is
+  read as `MessageRecord.refused`, and `routing.transcript_sweep` counts it as enforcement
+  state rather than conversation, so it goes out in the same pass and from the same snapshot
+  that fixes the anchor (`signal_ids` means "messages that must not survive", whatever made
+  them a signal). What the user keeps is the request itself and the refused agent's plain-prose
+  answer in the next assistant message; what goes is the record that the command was refused.
+  The trade is measured in `qa/live-run-v3.md` §D9 and `qa/live-run-v4.md`: keeping it left an
+  agent permanently dead for that user, and deleting it did not.
+* **A lost anchor race never loses an answer silently (D15).** The transcript read
+  that decides the anchor is bounded by half a second, and when it times out the
+  turn used to return before arming anything: the user was told a result was
+  coming and nobody was left to fetch it. The collector is now armed either way,
+  on an anchor resolved off Alice's clock, and if even that cannot be read the
+  loss is stated in the user's chat rather than logged and forgotten.
+* **A deadline turn's own marker is swept on the NEXT turn (D6-residue).** On that
+  branch the voice turn is still running when the sweep runs, so its
+  `[[NEEDS_AGENT]]` does not exist yet -- the agent then reads it and writes one
+  itself. `sweep_residue` deletes it at the entry of the following turn, which is
+  the last moment before any agent reads the history again.
 """
 
 from __future__ import annotations
@@ -56,6 +71,8 @@ from app.config import Config
 from core import routing
 from core.async_worker import Worker
 from core.opencode.client import OpencodeError
+from core.session_sweeps import MARKER_TIMEOUT_S, SessionSweeper
+from core.tools.telegram_tool import send_message
 
 if TYPE_CHECKING:  # the route composes this module, so the edge cannot be a runtime one
     from core.session_route import HybridWiring
@@ -67,11 +84,6 @@ JOB_OPENCODE_REPLY: Final = "opencode_reply"
 #: The collector's ceiling, stated in the job rather than left to the reader. It
 #: is a ceiling and not a wait: `collect_reply` ends on the idle condition first.
 COLLECT_TIMEOUT_S: Final = 600.0
-#: What an escalating turn may spend on the transcript: reading it once, and per
-#: routing signal deleting the message the sweep found. It has already spent the
-#: whole voice budget, so this is small and absolute -- a server that will not
-#: answer here costs the answer, never the acknowledgement.
-MARKER_TIMEOUT_S: Final = 0.5
 #: The agent task carries the request in the user's own words, so the agent has
 #: it even when the voice model offered no hint.
 TASK_PREFIX: Final = "Пользователь попросил голосом: "
@@ -91,6 +103,7 @@ class SessionCollector:
         self.cfg = cfg
         self.worker = worker
         self.logger = logger
+        self.sweeper = SessionSweeper(cfg, logger, self._enqueue, self._say)
 
     async def hand_to_agent(
         self,
@@ -103,33 +116,32 @@ class SessionCollector:
     ) -> tuple[str, bool]:
         """Give `r2d2-agent` the request, and arm the collector that ships its answer.
 
-        The one place this module submits a task or enqueues an `opencode_reply`
-        job, which is what makes "exactly one collector per turn" a property of the
-        code instead of a convention: the three branches that escalate -- C8, the
-        sentinel and the deadline -- cannot each grow a second, and a branch that
-        escalates cannot forget the collector, because returning the ack at all IS
-        this call.
+        The one place this module submits a task or enqueues an `opencode_reply` job,
+        which is what makes "exactly one collector per turn" a property of the code instead
+        of a convention: the three branches that escalate -- C8, the sentinel and the
+        deadline -- cannot each grow a second, and a branch that escalates cannot forget
+        the collector, because returning the ack at all IS this call.
 
-        `_collect_later` runs first and reads the transcript BEFORE the submit, so
-        the marker is the last message the session held while this turn was still
-        its own business: the collector then returns the agent's answer and can
-        never replay the conversation the user already had. It is also what deletes
-        the voice agent's routing signal, and that has to happen before the agent's
-        turn is queued -- an agent asked to work in a session whose newest message is
-        `[[NEEDS_AGENT]]` is an agent that answers with `[[NEEDS_AGENT]]`. Reading it
-        after the submit would race opencode's own write of the task message and
-        make the marker depend on which of the two arrived first.
+        `_collect_later` runs first and reads the transcript BEFORE the submit, so the
+        marker is the last message the session held while this turn was still its own
+        business: the collector then returns the agent's answer and can never replay the
+        conversation the user already had. It is also what deletes the voice agent's
+        routing signal, and that has to happen before the agent's turn is queued -- an agent
+        asked to work in a session whose newest message is `[[NEEDS_AGENT]]` is an agent
+        that answers with `[[NEEDS_AGENT]]`. Reading it after the submit would race
+        opencode's own write of the task message.
 
-        A refused submit does not turn into a failed turn. The user has already been
-        told a result is coming, the collector is armed either way, and it still
-        ships whatever the session produces -- `NO_REPLY`'s "the agent did not
-        answer" when that is nothing. The reason is in this log line and in the
-        `jobs` row, not in an error spoken to a speaker who cannot act on it.
+        A refused submit does not turn into a failed turn. The user has already been told
+        a result is coming, the collector is armed either way, and it still ships whatever
+        the session produces -- `NO_REPLY`'s "the agent did not answer" when that is
+        nothing. The reason is in this log line and in the `jobs` row, not in an error
+        spoken to a speaker who cannot act on it.
         """
-        await self._collect_later(wiring, app_id, session_id)
-        suffix = f"\n{hint}" if hint else ""
+        self.worker.arm_watch(wiring.turns)
+        task = f"{TASK_PREFIX}{command}\n{hint}" if hint else f"{TASK_PREFIX}{command}"
+        await self._collect_later(wiring, app_id, session_id, task)
         try:
-            await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}{suffix}")
+            await wiring.backend.submit_task(session_id, task)
         except (OpencodeError, httpx.HTTPError) as exc:
             self.logger.warning(
                 "opencode %r: session %s of %s took no task from R2D2: %r. The collector is armed "
@@ -139,7 +151,52 @@ class SessionCollector:
             )
         return self.cfg.r2d2_task_ack, False
 
-    async def _collect_later(self, wiring: HybridWiring, app_id: str, session_id: str) -> None:
+    def note_may_leave_signal(self, session_id: str) -> None:
+        """Record that this session's last turn may still be writing a routing signal.
+
+        Called from the deadline branch, where the voice turn is handed to the agent while it
+        is still running: the sweep that runs before the agent's turn therefore cannot see
+        the `[[NEEDS_AGENT]]` that turn is about to write, and the agent, reading it as its
+        own history, writes one itself. The signal is removed at the entry of the NEXT turn
+        for this session -- see `sweep_residue` -- because at this point there is nothing to
+        remove.
+        """
+        self.sweeper.note_dead_turn(session_id)
+
+    async def sweep_residue(
+        self, wiring: HybridWiring, app_id: str, session_id: str
+    ) -> bool:
+        """Delete a dead turn's routing signal before this turn's agent reads history.
+
+        Only sessions the deadline branch touched are swept, so the common turn pays nothing,
+        and the sweep is `core/session_sweeps.py`'s: one read that decides deletions alone and
+        never an anchor, which is what keeps the one-snapshot rule below intact.
+        """
+        return await self.sweeper.sweep_residue(wiring.client, app_id, session_id)
+
+    async def _say(self, text: str) -> None:
+        """One message in the user's own chat, through the tool the whole project uses.
+
+        Only used to STATE a loss: a bounded loss of an answer is the plan's rule, a silent
+        one is not, and the only honest way to report it is in the channel the user is in.
+        """
+        await send_message(self.cfg, text)
+
+    async def _enqueue(self, app_id: str, session_id: str, anchor: str) -> None:
+        """Write the one `opencode_reply` job this escalating turn gets."""
+        await self.worker.enqueue(
+            {
+                "type": JOB_OPENCODE_REPLY,
+                "application_id": app_id,
+                "session_id": session_id,
+                "since_message_id": anchor,
+                "timeout_s": COLLECT_TIMEOUT_S,
+            }
+        )
+
+    async def _collect_later(
+        self, wiring: HybridWiring, app_id: str, session_id: str, task: str
+    ) -> None:
         """Take the routing signal out of the transcript, and hand the still-running
         turn to the worker that ships the answer to Telegram.
 
@@ -151,34 +208,36 @@ class SessionCollector:
         server no longer lists, and a marker it cannot position means "everything
         in the session is newer" -- the entire conversation replayed into Telegram.
 
-        Deleting is not a repair of the user's transcript. Only ASSISTANT messages
-        carrying the sentinel are removed, so every utterance the user made and
-        every real answer survives; what goes is a control signal that the protocol
-        never meant to be conversation, and leaving it is what let one escalation
-        disable the agent path for good (the live run's `POST .../summarize`
-        answered `true` and compressed nothing, so no summariser could have saved
-        it). The escalation hint is not lost with the message: it is already part
-        of the task text submitted above.
+        Deleting is not a repair of the user's transcript. Only ASSISTANT messages are
+        removed, and only when they are opencode's own enforcement state -- carrying the
+        sentinel, or holding a tool-permission refusal -- so every utterance the user made
+        and every real answer survives. What goes is a control signal the protocol never
+        meant to be conversation, and leaving the sentinel is what let one escalation disable
+        the agent path for good. The escalation hint is not lost with the message: it is
+        already part of the task text submitted above.
 
-        The same paragraph is why this sweep does NOT delete a tool-permission
-        refusal, which opencode stores in the shared session with the refused
-        agent's whole effective matrix spelled out in it (contract U8). Two
-        reasons, and the first is not a choice: `list_messages` reads a message's
-        text parts, and a refusal is a `tool` part, so it arrives as `text == ""`
-        -- this sweep cannot see one however it is written. The second is a
-        choice: a refusal is the record that opencode refused a command the user
-        asked for, and deleting a whole message to remove a list of rules would
-        take that record with it, which is the one thing this module is not
-        allowed to do to a user's history. The reading is prevented where the
-        reading happens instead -- a rule in both agent prompts, which also holds
-        on the turns this sweep never runs on, such as a voice turn that was
-        refused and then answered without escalating.
+        A stored refusal is swept on the same pass and is NOT protected, which is the change
+        from the version of this paragraph that argued the opposite. It arrived as
+        `MessageRecord.refused` rather than as text, so this sweep can see one; what it
+        carries is the refused agent's whole effective matrix spelled out (contract U8), and
+        in the shared session that matrix is not the reader's. The prompt rule that used to
+        stand in for the deletion is measured and ineffective -- the agent read the refusal as
+        a ban on its own tools, reached for `bash` where `webfetch` was allowed and needed no
+        human, and stopped working for that user for good (`qa/live-run-v3.md` §D9). The
+        price is that the record of the refusal goes with it; the user still learns the
+        command did not run, from the request that is never swept and from the prose answer
+        the refused agent wrote next, and both live runs measured that surviving
+        (`qa/live-run-v4.md`).
 
-        Finding the marker costs one GET on a path that has already spent the
-        whole voice budget, and it is bounded: a server that will not answer here
-        loses the answer, never the acknowledgement. The deletes carry the same
-        bound, because they happen between the model's reply and the words Alice
-        is waiting for.
+        Finding the marker costs one GET on a path that has already spent the whole voice
+        budget, and it is bounded: a server that will not answer here must not cost the
+        user the acknowledgement. It used to cost the ANSWER as well -- the read timed out,
+        the method returned, and no collector was ever armed, so a plain question produced
+        an answer nobody was ever going to receive (`qa/live-run-v3.md` §D15: "Париж."
+        written to the session at 13:36:59 and never delivered). So the read failing is no
+        longer the end of the hand-off: the collector is armed anyway, on an anchor resolved
+        off Alice's clock by `_arm_when_readable`, and only a server that cannot answer THAT
+        either costs the answer -- and then the user is told, in their own chat.
         """
         try:
             records = await asyncio.wait_for(
@@ -186,51 +245,25 @@ class SessionCollector:
             )
         except (TimeoutError, httpx.HTTPError, OpencodeError) as exc:
             self.logger.warning(
-                "opencode %r: the turn in session %s of %s keeps running but cannot be "
-                "collected: %s", wiring.spec.name, session_id, app_id, exc,
+                "opencode %r: the turn in session %s of %s kept running but the transcript did "
+                "not answer inside %.1fs (%s: %s); the collector is armed anyway on an anchor "
+                "resolved in the background, and the user is told if even that fails",
+                wiring.spec.name, session_id, app_id, MARKER_TIMEOUT_S, type(exc).__name__, exc,
             )
+            self.sweeper.arm_later(wiring.client, app_id, session_id, task)
             return
-        sweep = routing.transcript_sweep(
-            records, sentinel=self.cfg.r2d2_needs_agent_sentinel
-        )
+        sweep = routing.transcript_sweep(records, sentinel=self.cfg.r2d2_needs_agent_sentinel)
         for message_id in sweep.signal_ids:
-            await self._erase_signal(wiring, app_id, session_id, message_id)
-        await self.worker.enqueue(
-            {
-                "type": JOB_OPENCODE_REPLY,
-                "application_id": app_id,
-                "session_id": session_id,
-                "since_message_id": sweep.since_message_id,
-                "timeout_s": COLLECT_TIMEOUT_S,
-            }
-        )
-
-    async def _erase_signal(
-        self, wiring: HybridWiring, app_id: str, session_id: str, message_id: str
-    ) -> None:
-        """Delete one stored routing signal, and say so loudly if it survived.
-
-        A failure here is not a failed turn: the user has already been
-        acknowledged, the collector is armed either way, and the agent's own
-        prompt tells it the token is the gateway's. What a failure does cost is
-        the guarantee, so it is logged with the reason rather than swallowed --
-        a session that keeps a signal is a session whose agent may start copying
-        it, and the operator is the one who can see that happening.
-        """
-        try:
-            removed = await asyncio.wait_for(
-                wiring.client.delete_message(session_id, message_id), MARKER_TIMEOUT_S
-            )
-        except (TimeoutError, httpx.HTTPError, OpencodeError) as exc:
-            self.logger.warning(
-                "opencode %r: the routing signal %s is still stored in session %s of %s and "
-                "the agent reads it as its own history: %s",
-                wiring.spec.name, message_id, session_id, app_id, exc,
-            )
+            await self.sweeper.erase(wiring.client, app_id, session_id, message_id)
+        if not sweep.since_message_id and records:
+            # The session held messages and the sweep removed every one, so `""` would name
+            # the whole deleted history as newer -- in a collector that lives for its whole
+            # 600 s ceiling, so the next turn's answer arrives as this turn's. The only
+            # boundary left is the task message, which the submit has not written yet.
+            self.sweeper.arm_later(wiring.client, app_id, session_id, task)
             return
-        if not removed:
-            self.logger.warning(
-                "opencode %r: asked to delete the routing signal %s from session %s of %s; the "
-                "server did not remove it, and the agent reads it as its own history",
-                wiring.spec.name, message_id, session_id, app_id,
-            )
+        # An EMPTY snapshot is the C8 case, and `""` is the truth rather than a default: this
+        # session has held nothing, so "everything it ever holds is newer" is exact. There is
+        # no boundary to wait for, and waiting would hand the answer to a collector that does
+        # not exist yet -- the D15 shape again.
+        await self._enqueue(app_id, session_id, sweep.since_message_id)

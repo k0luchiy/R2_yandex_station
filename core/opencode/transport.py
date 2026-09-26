@@ -23,6 +23,11 @@ of how the server is ADDRESSED (`docs/11-opencode-contract.md`):
 * **C6** -- the directory is the query parameter `?directory=<abs path>`; the same
   key in the body is accepted with a 200 and silently ignored, and the server does
   not validate the path at all, so `_scoped_params` refuses locally.
+* **A read timeout is a deadline; a refused connection is not.** The server took
+  the request and did not finish it, which is the one fact a caller can act on, so
+  it arrives as the typed `OpencodeDeadlineExceeded` rather than as an
+  `httpx.ReadTimeout` with an empty message. `_request` owns that rule because it
+  is the only place that can tell a read from a connect.
 * **The configured password never leaves this module**: scrubbed from every error
   excerpt, absent from every log line, absent from `repr`, and the `Authorization`
   header is never logged.
@@ -41,7 +46,13 @@ from collections.abc import Mapping
 import httpx
 
 from core.backends.config_loader import BackendSpec
-from core.opencode.wire import OpencodeError, OpencodeStatusError, excerpt, split_model
+from core.opencode.wire import (
+    OpencodeDeadlineExceeded,
+    OpencodeError,
+    OpencodeStatusError,
+    excerpt,
+    split_model,
+)
 
 __all__ = ["OpencodeTransport"]
 
@@ -81,7 +92,7 @@ class OpencodeTransport:
         )
 
     def __repr__(self) -> str:
-        return f"OpencodeClient(base_url={self._base_url!r}, directory={self._directory!r})"
+        return f"{type(self).__name__}(base_url={self._base_url!r}, directory={self._directory!r})"
 
     async def aclose(self) -> None:
         """Close the client only if this object created it.
@@ -133,15 +144,43 @@ class OpencodeTransport:
         params: Mapping[str, str] | None = None,
         json_body: object = None,
     ) -> httpx.Response:
-        """One request: absolute URL, basic auth, explicit timeout, non-2xx raised."""
-        response = await self._http().request(
-            method,
-            f"{self._base_url}{path}",
-            params=params,
-            json=json_body,
-            auth=self._auth,
-            timeout=self._timeout if timeout is None else timeout,
-        )
+        """One request: absolute URL, basic auth, explicit timeout, non-2xx raised.
+
+        **A read that times out is a DEADLINE, not a broken socket.** The distinction
+        is whether the request got out: `httpx.ReadTimeout`/`WriteTimeout` mean the
+        server accepted it and did not finish inside the bound, which is exactly what
+        `OpencodeDeadlineExceeded` means everywhere else in this project ("the turn
+        is still running server-side and was not aborted"). A `ConnectTimeout` and a
+        `PoolTimeout` mean the request never left, and they stay transport errors so
+        a server that is down still falls to the chain.
+
+        The live run measured why this is not cosmetic. Right after an
+        `opencode serve` restart the first `GET /session` -- the re-verification of
+        the user's binding, which lists every session the server holds -- read-timed
+        out against a server that was healthy: the health probe in the same turn
+        answered 200. The turn then fell through to the fallback chain, whose members
+        were unusable that day, and the user heard `ERROR_TEXT` from a working brain.
+        The typed deadline is what lets the caller recognise that case as "the server
+        is slow", and the reason is spelled out here because `str(httpx.ReadTimeout())`
+        is empty -- the same defect the worker's `NO_REPLY` and this file's own 500s
+        already had to answer.
+        """
+        bound = self._timeout if timeout is None else timeout
+        try:
+            response = await self._http().request(
+                method,
+                f"{self._base_url}{path}",
+                params=params,
+                json=json_body,
+                auth=self._auth,
+                timeout=bound,
+            )
+        except (httpx.ReadTimeout, httpx.WriteTimeout) as exc:
+            raise OpencodeDeadlineExceeded(
+                f"opencode {self._name}: {method} {path} was accepted and did not answer within "
+                f"{bound:g}s, so the server is answering slowly rather than not at all; whatever "
+                f"it is working on is still running there and nothing was aborted"
+            ) from exc
         if not response.is_success:
             raise OpencodeStatusError(
                 f"opencode {self._name}: {method} {path} -> HTTP {response.status_code} ({excerpt(response, self._password)})",

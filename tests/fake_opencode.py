@@ -42,7 +42,9 @@ filtered for it would hide exactly the defect the filter exists to prevent. A
 subscriber gets `server.connected` first, then whatever is pushed; the stream ends
 when the test says so (`close_streams`) or after `stream_idle_s`, so a forgotten
 reader cannot hold a test open for ever. Every frame it pushes is shaped like the
-live one: the name in the body's `"type"`, and no `event:` line (D11).
+live one: the name in the body's `"type"`, and no `event:` line (D11) -- and writing an
+assistant message brings the `session.idle` that closes the turn, because a fake that
+never sent it would hide the collector's own end condition.
 """
 
 from __future__ import annotations
@@ -80,6 +82,9 @@ ESCALATE_WORD: Final = "digest"
 PERMISSION_WORD: Final = "permission"
 
 VERSION: Final = "1.18.32"
+#: The one role whose message ends a turn, and therefore the one that brings the idle
+#: frame with it (C7: `info.role` is where the role is read from).
+ASSISTANT_ROLE: Final = "assistant"
 #: The catalogue `core.opencode.models` validates the configuration against (C1):
 #: the ids listed here are the ids the deployment may send.
 MODEL_ID: Final = "space-bunny-free"
@@ -608,6 +613,13 @@ class FakeOpencode:
         self.transcript.setdefault(session_id, []).append(
             {"info": {"id": _next_message_id(), "role": role}, "parts": [{"type": "text", "text": text}]}
         )
+        if role == ASSISTANT_ROLE:
+            # The live server closes a turn with `session.idle` (C5), and it carries
+            # `properties.sessionID`. A fake that never sends it would leave every collector
+            # that waits for the turn to end waiting for ever -- which is exactly what the
+            # real server stops it from doing. Only an ASSISTANT message ends a turn: the
+            # user's own message is the beginning of one.
+            self._push("session.idle", {"sessionID": session_id})
 
 
 def application_id_of(title: str) -> str:

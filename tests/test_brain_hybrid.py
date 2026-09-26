@@ -70,7 +70,7 @@ from core.backends.opencode_session import (
 )
 from core.brain import ERROR_TEXT, GREETING, HELP_TEXT, Brain
 from core.memory import Memory
-from core.opencode.client import OpencodeClient
+from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded
 from core.opencode.session_store import OcSessionStore, title_for
 from core.permissions import PermissionBroker
 from core.render import MAX_TEXT
@@ -256,6 +256,11 @@ class FakeOpencode:
         #: asked for, and the status the server answered with. The routing signal
         #: must leave the session on the very turn that observed it.
         self.deleted: list[tuple[str, str]] = []
+        #: How many transcript reads answer with nothing at all, and the reason they give.
+        #: D15's precondition: the sweep's half-second read does not get an answer while
+        #: the server is perfectly healthy, and the turn is acknowledged all the same.
+        self.stall_polls: int = 0
+        self.stall_reason: object = httpx.ReadTimeout("")
         self.delete_status: int = 200
         self._hung: dict[str, tuple[str, str]] = {}
         self._answered: set[str] = set()
@@ -277,9 +282,16 @@ class FakeOpencode:
         if method == "POST" and path.endswith("/message"):
             return self._turn(session_id, request)
         if method == "POST" and path.endswith("/prompt_async"):
-            self._record(session_id, request, submitted=True)
+            turn = self._record(session_id, request, submitted=True)
+            # The real server STORES the submitted task as a user message, and the
+            # transcript read that follows is how a collector anchored late tells what the
+            # session held before the hand-off from what it held after it.
+            self.seed(session_id, said(turn.text, f"msg_task{len(self.turns)}", role="user"))
             return httpx.Response(204)
         if method == "GET" and path.endswith("/message"):
+            if self.stall_polls:
+                self.stall_polls -= 1
+                raise self.stall_reason
             return self._poll(session_id)
         if method == "DELETE" and "/message/" in path:
             return self._delete(session_id, parts[4])
@@ -894,10 +906,168 @@ async def test_an_escalated_turn_enqueues_the_collector_that_will_ship_the_answe
     # ... anchored on the last message the session held BEFORE this turn's work was
     # submitted, so the collector returns the agent's answer and never replays the
     # conversation the user already had
-    held = rig.server.transcript[session_id]
+    # the newest message that is not R2D2's own submitted task, which the sweep read
+    # before the submit and which the real server also stores
+    held = [
+        entry
+        for entry in rig.server.transcript[session_id]
+        if not str(entry["parts"][0]["text"]).startswith(TASK_TEXT_PREFIX)
+    ]
     assert held, "the session was empty, so there is no marker to check"
     assert job["since_message_id"] == held[-1]["info"]["id"]
     assert job["timeout_s"] == COLLECT_TIMEOUT_S
+
+
+async def test_a_transcript_read_that_failed_still_leaves_a_collector_armed(
+    rig: Rig, net: Net
+) -> None:
+    """**D15.** The ack is spoken, so a collector must be armed whatever the read did.
+
+    Measured: the sweep's `GET /session/:id/message` is bounded by half a second on a path
+    that has already spent the whole voice budget, and when it timed out the hand-off simply
+    returned. The user was told "Проверяю, пришлю в телеграм.", the voice agent went on to
+    write "Париж.", and no `opencode_reply` row existed for that turn at all -- the answer was
+    written to the session and delivered to nobody (`qa/live-run-v3.md` §D15, 12:36:49).
+
+    The collector is therefore armed on an anchor resolved off Alice's clock, and the anchor
+    is the part that has to be right: `since_message_id=""` is what `collect_reply` reads as
+    "everything in the session is newer", which is the whole conversation replayed into
+    Telegram. The task message is the one thing known to be written after the hand-off, so
+    the late read is cut there.
+    """
+    # Given: a warm session whose transcript does not answer the sweep inside its half second
+    session_id = await rig.warm()
+    rig.server.seed(session_id, said("предыдущий вопрос", "msg_old", role="user"))
+    rig.server.reply = f"Это займёт времени. {SENTINEL} собрать последние статьи про RAG"
+    rig.server.stall_polls = 1
+    # When
+    assert await rig.say() == ACK
+    # Then a collector IS armed -- the turn is not the D15 turn any more ...
+    job = await _armed_job(rig)
+    assert job["session_id"] == session_id
+    # ... anchored BEFORE the task R2D2 submitted, so the answer is collected and the
+    # conversation the user already had is not
+    assert job["since_message_id"] != "", "an empty anchor replays the whole session"
+    assert job["since_message_id"] == "msg_u1"
+    # ... and the answer it fetches is the agent's own, with nothing of the session around it
+    rig.server.seed(session_id, said(AGENT_REPLY, "msg_agent"))
+    worker = CollectorWorker(rig.cfg, rig.memory, rig.backend)
+    await worker.start()
+    try:
+        net.telegram.clear()
+        await worker.enqueue(job)
+        await asyncio.wait_for(_delivered(net, AGENT_REPLY), timeout=5.0)
+    finally:
+        await worker.stop()
+    assert net.telegram == [AGENT_REPLY]
+
+
+async def test_a_transcript_that_never_answers_states_the_loss_in_the_users_chat(
+    rig: Rig, net: Net, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other end of D15's trade-off: bounded, but never silent.
+
+    A bounded loss of an answer is acceptable -- the plan's own rule. A SILENT one is not,
+    because the user has already been acknowledged and is waiting for a message that will
+    not arrive. The deadline is shortened to what a test can pay; the branch is the one that
+    matters.
+    """
+    # Given: a server that answers NOTHING on the transcript, ever
+    import core.session_sweeps as sweeps_module
+
+    monkeypatch.setattr(sweeps_module, "ANCHOR_TIMEOUT_S", 0.1)
+    session_id = await rig.warm()
+    rig.server.reply = f"Это займёт времени. {SENTINEL} собрать последние статьи про RAG"
+    rig.server.stall_polls = 1000
+    # When
+    assert await rig.say() == ACK
+    await asyncio.wait_for(_delivered(net, sweeps_module.ANCHOR_LOST), timeout=5.0)
+    # Then: no collector was armed, and the user was told
+    assert [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE] == []
+    assert net.telegram == [sweeps_module.ANCHOR_LOST]
+    assert session_id
+
+
+async def test_a_deadline_turns_marker_is_swept_before_the_next_turn_reads_history(
+    rig: Rig
+) -> None:
+    """**D6-residue.** The signal a deadline turn leaves is deleted before anything reads it.
+
+    The deadline branch hands the work to the agent while the voice turn is still running, so
+    the sweep that runs before the agent's turn cannot see the `[[NEEDS_AGENT]]` that turn is
+    about to write. It arrives afterwards, the agent reads it as its own history and writes
+    one itself, and the collector ships that echo: measured live, the user received a stripped
+    copy of their own question instead of the requested essay (`qa/live-run-v3.md` §3). A later
+    voice-path turn swept nothing at all and the token was still in the session afterwards.
+
+    Deleting it on that turn is impossible -- the message does not exist yet -- so it is
+    deleted at the entry of the NEXT turn for that session, which is the last moment before
+    any agent reads the history again. And only a session the deadline branch touched is
+    swept, so the common turn pays nothing.
+    """
+    # Given: a turn that overran the budget, so its marker is written too late to be swept
+    session_id = await rig.warm()
+    rig.server.reply = f"Это займёт времени. {SENTINEL} собрать последние статьи про RAG"
+    rig.server.hang_turn = True
+    rig.cfg.r2d2_fast_deadline = 0.05
+    assert await rig.say() == ACK
+    # ... and the voice turn then lands, marker and all
+    rig.server.hang_turn = False
+    rig.server.seed(session_id, said(rig.server.reply, "msg_late_signal"))
+    # When: the NEXT turn for that user runs
+    rig.cfg.r2d2_fast_deadline = 5.0
+    rig.server.reply = ANSWER
+    assert await rig.say() == ANSWER
+    # Then the late signal is gone from the session, and only it
+    assert ("msg_late_signal") in [message_id for _session, message_id in rig.server.deleted]
+    assert SENTINEL not in "\n".join(stored_texts(rig, session_id))
+
+
+async def test_a_turn_that_never_overran_the_budget_pays_no_residue_read(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cost side of the residue sweep: a session with no debt is not read at all.
+
+    A read on the fast path would be one more request inside Alice's 4.5 s for every
+    question ever asked, so the debt is a set lookup and nothing else.
+    """
+    # Given: a warm session that has never overrun the budget
+    session_id = await rig.warm()
+    before = rig.server.route_count("GET", "/message")
+    # When
+    assert await rig.say() == ANSWER
+    # Then
+    assert rig.server.route_count("GET", "/message") == before
+    assert rig.server.transcript[session_id]
+
+
+async def _armed_job(rig: Rig, timeout_s: float = 5.0) -> dict:
+    """The one `opencode_reply` job the worker holds, once a background arm has landed.
+
+    The arm that answers a failed read runs off Alice's clock by design, so the test waits
+    for the job rather than for a duration -- and a job that never appears fails here
+    instead of in an assertion three lines later.
+    """
+    async def appeared() -> dict:
+        while True:
+            jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
+            if jobs:
+                return jobs[0]
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(appeared(), timeout=timeout_s)
+
+
+async def _delivered(net: Net, text: str, timeout_s: float = 5.0) -> None:
+    """Wait for Telegram to carry `text`, and fail on anything else."""
+
+    async def arrived() -> None:
+        while True:
+            if text in net.telegram:
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(arrived(), timeout=timeout_s)
 
 
 async def test_two_turns_that_escalate_arm_one_collector_each_and_never_twice(
@@ -925,9 +1095,26 @@ async def test_two_turns_that_escalate_arm_one_collector_each_and_never_twice(
 # ---------------------------------------------------------------------------
 
 
+#: The prefix `SessionCollector` puts on the task it submits, quoted here rather than
+#: imported so a rename in the product cannot silently change what these tests filter.
+TASK_TEXT_PREFIX: Final = "Пользователь попросил голосом: "
+
+
 def stored_texts(rig: Rig, session_id: str) -> list[str]:
-    """Every message text the server still holds for this session."""
-    return [str(entry["parts"][0]["text"]) for entry in rig.server.transcript[session_id]]
+    """Every message text the server still holds for this session, EXCEPT R2D2's own tasks.
+
+    The task is stored as a user message because the real server stores it that way -- and
+    because a collector anchored late has to tell what the session held before the hand-off
+    from what it held after it, which it can only do if the task is in the transcript. These
+    assertions are about the USER's conversation surviving a sweep, and the task is R2D2's
+    own text rather than something the user said, so it is filtered here instead of in six
+    assertions.
+    """
+    return [
+        str(entry["parts"][0]["text"])
+        for entry in rig.server.transcript[session_id]
+        if not str(entry["parts"][0]["text"]).startswith(TASK_TEXT_PREFIX)
+    ]
 
 
 async def test_an_escalation_removes_the_routing_signal_from_the_session(rig: Rig) -> None:
@@ -1452,6 +1639,98 @@ async def test_the_collected_turn_ships_the_agents_own_text_to_telegram(
         await worker.stop()
     assert net.telegram == [AGENT_REPLY]
     assert job["session_id"] == session_id
+
+
+async def test_a_re_verification_that_timed_out_does_not_lose_the_answer(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """**D12, second half.** The turn the deadline classification was for.
+
+    `OcSessionStore.resolve` re-checks the binding against `GET /session` on every turn,
+    because a binding the server has never heard of is a wedge. Right after an `opencode
+    serve` restart that read timed out against a server that was healthy -- the health probe
+    in the same turn answered 200, and the list of every session the server holds is a big
+    answer -- and the turn fell through to the fallback chain, which was empty of working
+    members that day, so the user heard the graceful error text with a working brain behind
+    it.
+
+    The transport now types that read as `OpencodeDeadlineExceeded`
+    (`tests/test_opencode_client.py`), and this is where the type earns its keep: a deadline
+    on the re-verification is a statement about the server's SPEED, not about the binding, so
+    the turn continues on the bound session. A session the server really had dropped answers
+    the voice turn 404, which the brain already falls back from -- the direction of this
+    tolerance is the safe one.
+    """
+    # Given: a warm, bound session whose FIRST re-verification cannot complete in time
+    session_id = await rig.warm()
+    asked_once = False
+
+    async def slow_first_time(app_id: str) -> str:
+        nonlocal asked_once
+        if not asked_once:
+            asked_once = True
+            raise OpencodeDeadlineExceeded("opencode: GET /session did not answer within 3.2s")
+        return await real_resolve(app_id)
+
+    real_resolve = rig.store.resolve
+    monkeypatch.setattr(rig.store, "resolve", slow_first_time)
+    # When
+    with caplog.at_level(logging.WARNING, logger="r2d2"):
+        spoken = await rig.say()
+    # Then: the user is answered, from the very session the database claims ...
+    assert spoken == ANSWER, "a slow re-verification cost the user the answer"
+    assert [turn.session_id for turn in rig.server.turns] == [session_id]
+    # ... and the reason it fell back to the claim is on record, with the reason it timed out
+    assert "did not re-verify it in time" in caplog.text
+    assert "did not answer within" in caplog.text
+
+
+async def test_a_re_verification_that_stays_slow_leaves_the_answer_a_deadline_not_an_error(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same read failing again inside the voice turn: a deadline, not a lost turn.
+
+    `complete()` resolves the session itself, so a server that is slow twice hands the
+    deadline branch a turn that cannot be answered in place. That branch is the right one:
+    the user is acknowledged, the work is submitted to the agent, and the collector ships the
+    answer to Telegram. What D12 removed is the *other* outcome, the graceful error text
+    from an empty chain against a brain that was working the whole time.
+    """
+    # Given: a warm, bound session whose re-verification never completes in time
+    await rig.warm()
+
+    async def always_slow(_app_id: str) -> str:
+        raise OpencodeDeadlineExceeded("opencode: GET /session did not answer within 3.2s")
+
+    monkeypatch.setattr(rig.store, "resolve", always_slow)
+    # When
+    spoken = await rig.say()
+    # Then: acknowledged, not the graceful error, and a collector is armed for the answer
+    assert spoken == ACK
+    assert spoken != ERROR_TEXT
+    jobs = rig.brain.worker.jobs
+    assert [job["type"] for job in jobs] == [JOB_TYPE]
+    assert jobs[0]["application_id"] == APP
+
+
+async def test_a_re_verification_deadline_with_no_binding_still_falls_back(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other side of the same tolerance: with nothing to fall back ON, the chain answers.
+
+    A brand-new user has no binding, so "trust the claim" would mean inventing a session.
+    The turn then does what it always did on a transport failure -- the chain answers --
+    which is the supported degradation rather than a new one.
+    """
+    # Given: a user R2D2 has never bound, and a re-verification that cannot complete
+    async def always_slow(_app_id: str) -> str:
+        raise OpencodeDeadlineExceeded("opencode: GET /session did not answer within 3.2s")
+
+    monkeypatch.setattr(rig.store, "resolve", always_slow)
+    # When
+    spoken = await rig.say(app_id="never-seen")
+    # Then
+    assert spoken == FALLBACK_ANSWER
 
 
 async def test_a_turn_that_outran_the_deadline_still_gives_the_agent_the_request(

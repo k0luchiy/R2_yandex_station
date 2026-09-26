@@ -19,6 +19,12 @@ itself -- the submit, the transcript sweep and the `opencode_reply` job -- is
   for Telegram. Aborting would destroy work already paid for; not submitting would
   lose the request outright, because at the deadline nobody can know whether the
   late turn will answer or ask for the agent.
+* **The residue sweep runs at the entry of a turn, and only where it is owed.** A turn
+  that overran the budget hands its work to the agent while the voice turn is still
+  writing, so the marker that turn leaves cannot be deleted before the agent reads it --
+  the live run measured the whole chain, the echo and the stripped copy of the user's own
+  question that came of it. `SessionCollector` remembers which sessions that happened to and
+  sweeps them here, before this turn's agent is asked anything.
 * **C1 is the caller's to handle.** An `info.error` carrying a 403
   `FreeTierError`, or a 402 inside an HTTP 200, is a refusal that raises out of
   here; `Brain._handle` then answers from the provider chain. A refusal text that
@@ -40,6 +46,7 @@ from core.backends.opencode_session import OpencodeSessionBackend, current_appli
 from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded
 from core.opencode.session_store import OcSessionStore
+from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker, PermissionVerdict
 from core.session_collector import SessionCollector
 
@@ -63,7 +70,10 @@ class HybridWiring:
     carried because the brain needs `fast_model` and `summarize_model` from the
     one place they are configured -- changing a model must stay a one-line edit in
     `config/backends.json`. `broker` is optional so a deployment without todo 14
-    still routes; without it a pending ask is simply not answered here.
+    still routes; without it a pending ask is simply not answered here. `turns` is
+    the per-session memory the opencode event readers fill, and it travels with the
+    wiring because the collector that must know whether the agent is parked on a human
+    is armed from here rather than from the composition root.
     """
 
     spec: BackendSpec
@@ -71,6 +81,7 @@ class HybridWiring:
     store: OcSessionStore
     backend: OpencodeSessionBackend
     broker: PermissionBroker | None = None
+    turns: TurnWatch | None = None
 
 
 class SessionRoute:
@@ -112,7 +123,8 @@ class SessionRoute:
         """
         rec = metrics.current()
         rec.agent = wiring.spec.voice_agent
-        session_id = await wiring.store.resolve(app_id)
+        session_id = await self._session_of(wiring, app_id)
+        await self.collector.sweep_residue(wiring, app_id, session_id)
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
@@ -138,6 +150,10 @@ class SessionRoute:
             # `llm_ms` is its cost.
             rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
             rec.path = metrics.PATH_DEADLINE
+            # The voice turn is still running, so the sweep before the agent's turn cannot
+            # see the `[[NEEDS_AGENT]]` it is about to write. Marked, and swept at the entry
+            # of this user's NEXT turn -- the last moment before any agent reads it again.
+            self.collector.note_may_leave_signal(session_id)
             return await self.collector.hand_to_agent(wiring, app_id, session_id, command)
         rec.answered(route=metrics.ROUTE_OPENCODE, model=choice.model, msgs=1, tools=())
         decision = routing.parse_voice_reply(
@@ -171,6 +187,38 @@ class SessionRoute:
             case _:
                 return None
 
+    # -- internals ---------------------------------------------------------
+
+    async def _session_of(self, wiring: HybridWiring, app_id: str) -> str:
+        """The user's opencode session, or the one the database already claims.
+
+        `OcSessionStore.resolve` re-checks the binding against `GET /session` on every
+        turn, because a binding the server has never heard of is a wedge. That check is
+        also the one request on this path with no deadline of its own, and right after an
+        `opencode serve` restart it read-timed out on a server that was perfectly healthy
+        -- the health probe in the same turn answered 200, the list of every session the
+        server holds is a big answer, and the turn then fell through to the fallback chain
+        and spoke `ERROR_TEXT` with a working brain behind it. `core/opencode/transport.py`
+        classifies that read timeout as the typed `OpencodeDeadlineExceeded`, and this is
+        where the type earns its keep: the binding is a claim the store has already
+        verified, so the honest reading of "the server is slow to answer right now" is
+        "use the claim", and a session the server really has dropped answers the voice
+        turn 404s, which the brain already handles by falling back. With no binding there
+        is nothing to fall back on, so the deadline is raised unchanged.
+        """
+        try:
+            return await wiring.store.resolve(app_id)
+        except OpencodeDeadlineExceeded as exc:
+            bound = await self.memory.get_oc_session(app_id)
+            if bound is None:
+                raise
+            self.logger.warning(
+                "opencode: %s is bound to session %s and the server did not re-verify it in time "
+                "(%s); the turn continues on the bound session rather than losing the answer",
+                app_id, bound.session_id, exc,
+            )
+            return bound.session_id
+
     @staticmethod
     def _handoff(rec: metrics.Turn, wiring: HybridWiring) -> None:
         """Record a turn that moves to the AGENT: the ack's own facts, not the voice's.
@@ -196,7 +244,8 @@ class SessionRoute:
             provider, model = routing.split_model(wiring.spec.summarize_model)
             await wiring.client.summarize(session_id, provider=provider, model=model)
             self.logger.info(
-                "opencode %r: summarised the session of %s after %d messages", session_id, app_id, count
+                "opencode %r: summarised the session of %s after %d messages",
+                wiring.spec.name, session_id, count,
             )
         await self.memory.touch_oc_session(app_id, message_delta=1)
         return count > 0

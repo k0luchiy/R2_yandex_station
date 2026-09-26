@@ -301,9 +301,15 @@ def _harness(
 
 
 def _client(
-    recorder: Recorder, *, directory: str = WORKSPACE, spec: BackendSpec | None = None
+    recorder: Recorder,
+    *,
+    directory: str = WORKSPACE,
+    spec: BackendSpec | None = None,
+    timeout: float | None = None,
 ) -> OpencodeClient:
-    return _harness(recorder, directory=directory, spec=spec)[0]
+    return _harness(
+        recorder, directory=directory, spec=spec or (None if timeout is None else _spec(timeout=timeout))
+    )[0]
 
 
 async def _turn(
@@ -624,6 +630,47 @@ async def test_a_deadline_exceeded_is_a_backend_error_so_the_brain_falls_back() 
     # Then
     assert issubclass(OpencodeDeadlineExceeded, OpencodeError)
     assert issubclass(OpencodeError, BackendError)
+
+
+async def test_a_read_that_times_out_is_a_typed_deadline_and_not_a_broken_socket() -> None:
+    """**D12.** The server took the request and did not finish it: that is a deadline.
+
+    Measured on the third live run: right after an `opencode serve` restart the first
+    `GET /session` -- the re-verification of the user's binding, which lists every session
+    the server holds -- read-timed out against a server that was healthy, the health probe
+    in the same turn having answered 200. The turn then fell through to the fallback chain,
+    whose members were unusable that day, and the user heard the graceful error text from a
+    working brain. The bare `httpx.ReadTimeout` also carries no reason at all:
+    `str(httpx.ReadTimeout())` is empty, so the log line named a lost answer and not why.
+
+    The fix is a classification, and it is in the transport because that is the only place
+    that can tell a read from a connect. `OpencodeDeadlineExceeded` is what every other
+    caller already means by "the server is answering slowly, and whatever it is working on
+    is still running there".
+    """
+    # Given: a server that accepts the connection and never finishes reading
+    def stall(_request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("")
+
+    # When
+    with pytest.raises(OpencodeDeadlineExceeded) as raised:
+        await _client(Recorder(stall), timeout=0.05).list_messages(SESSION_ID)
+    # Then: the typed deadline, with a reason a log line can print
+    assert not isinstance(raised.value, httpx.HTTPError)
+    assert "did not answer within" in str(raised.value)
+    assert str(raised.value).strip(), "a deadline with an empty message is D12's other half"
+
+
+async def test_a_connection_nobody_answers_stays_a_transport_error() -> None:
+    """The other half of D12's rule, and the direction that must not change.
+
+    A refused connection means the server is not there. Reclassifying that as a deadline
+    would take the "server down" case -- the one the whole fallback chain exists for -- and
+    turn it into a session-level deadline, which no caller can fall back from.
+    """
+    # Given / When
+    with pytest.raises(httpx.ConnectError):
+        await _client(Recorder(_refuse)).list_messages(SESSION_ID)
 
 
 # ---------------------------------------------------------------------------

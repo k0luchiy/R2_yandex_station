@@ -642,44 +642,89 @@ async def test_an_unknown_job_type_is_still_answered_with_the_unknown_text(
 
 
 @pytest.mark.parametrize(
-    ("collected", "delivered"),
+    "collected",
     (
-        pytest.param(SENTINEL, NO_REPLY, id="a-body-that-was-nothing-but-the-token"),
-        pytest.param(PROTOCOL_REPLY, PROTOCOL_TASK_LINE, id="the-token-line-gone-the-task-line-kept"),
+        pytest.param(SENTINEL, id="a-body-that-was-nothing-but-the-token"),
+        pytest.param(PROTOCOL_REPLY, id="the-token-line-and-the-task-line"),
         pytest.param(
             f"{PROTOCOL_REPLY}\n{AGENT_DIGEST}",
-            f"{PROTOCOL_TASK_LINE}\n{AGENT_DIGEST}",
-            id="the-digest-arrives-beside-the-token-it-followed",
-        ),
-        pytest.param(
-            f"{AGENT_DIGEST}\nПометка {SENTINEL} — служебная метка.",
-            f"{AGENT_DIGEST}\nПометка — служебная метка.",
-            id="a-mention-loses-the-token-and-nothing-else",
+            id="the-token-followed-by-something-else",
         ),
     ),
 )
-async def test_no_outbound_body_ever_carries_the_escalation_marker(
-    net: Net,
-    cfg: Config,
-    memory: Memory,
-    log: logging.Logger,
-    collected: str,
-    delivered: str,
+async def test_a_body_that_begins_with_the_marker_is_never_delivered_as_an_answer(
+    net: Net, cfg: Config, memory: Memory, log: logging.Logger, collected: str
 ) -> None:
-    # Given a collector that ends with text carrying the machine token -- the shape
-    # that put eleven `[[NEEDS_AGENT]]` messages in the owner's Telegram chat on the
-    # live run, because nothing between the session and `send_message` looked at it
+    """The D6 harm, and the reason the two cases above are separated.
+
+    **What changed, and why the old expectation was wrong.** This file used to assert
+    that a collected body carrying `[[NEEDS_AGENT]]` is delivered with the token line
+    removed -- `PROTOCOL_REPLY` arriving as its own task line, and a digest arriving
+    behind the signal. That is precisely the failure the third live run measured: on the
+    `deadline` branch the sweep cannot see the voice agent's marker (it is still being
+    written), the agent reads that marker in its own history and emits one itself, and
+    that echo sits after the collector's anchor -- so the user received a stripped echo
+    of their own question instead of the result (`qa/live-run-v3.md` §3, job
+    `e0974a5334ac`). `routing.transcript_sweep` already deletes such a message out of
+    the session, deliberately, so a collector that ships one is shipping protocol the
+    project has already decided is not conversation.
+
+    The delivery is therefore the stated one -- `NO_REPLY`, with a WARNING naming the
+    session -- which is the honest report: the agent did not answer. `for_human` is
+    untouched and still guards every OTHER outbound body, which
+    `test_a_digest_that_mentions_the_marker_still_arrives` below now pins in its place.
+    """
+    # Given a collector that ends with a routing signal rather than a result
     collector = FakeCollector(deque([collected]))
     worker = Worker(cfg, memory, log, opencode_backend=collector)
     document = job()
-    # When the job runs. `_run_job` is called directly rather than through the loop
-    # because the assertion is about the body the sender was handed, and a task this
-    # worker spawned would answer "what was sent" only after the test had finished.
-    await worker._run_job(await memory.create_job(document), document)
-    # Then the user reads exactly the human part of the collected text ...
-    assert net.sent == [delivered]
-    # ... and no outbound body anywhere carries the protocol token
+    job_id = await memory.create_job(document)
+    # When the job runs
+    await worker._run_job(job_id, document)
+    # Then the user is told the agent did not answer, and the protocol never reaches them
+    assert net.sent == [NO_REPLY]
     assert all(SENTINEL not in text for text in net.sent)
+    # ... and the job says the same thing, so no `done` row claims a signal was an answer
+    assert job_row(memory.db_path, job_id) == (DONE, NO_REPLY, None)
+
+
+async def test_a_digest_that_mentions_the_marker_still_arrives(
+    net: Net, cfg: Config, memory: Memory, log: logging.Logger, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`routing.for_human` is still the guard on every OTHER body a person may read.
+
+    The gate above withholds a COLLECTED answer that carries the token, because
+    `core.routing.transcript_sweep` treats such an assistant message as a control signal
+    rather than as conversation. A digest is not a collected answer: it is R2D2's own text,
+    and a mention of the token in one sentence of it must cost the token and nothing else.
+    """
+    # Given: a digest whose summary quotes the machine token in a sentence
+    entries = [
+        {"title": "RAG", "summary": "survey", "link": "http://arxiv.org/1", "published": ""},
+    ]
+
+    async def fake_fetch(query: str, max_results: int = 5, days: int | None = None) -> list[dict]:
+        return entries
+
+    async def fake_summarize(_cfg: Config, _query: str, _entries: list[dict]) -> str:
+        return f"Коротко: метка {SENTINEL} — служебная, статья одна."
+
+    monkeypatch.setattr(arxiv_tool, "arxiv_fetch", fake_fetch)
+    monkeypatch.setattr(arxiv_tool, "summarize_entries", fake_summarize)
+    worker = Worker(cfg, memory, log, opencode_backend=FakeCollector(deque([AGENT_REPLY])))
+    # When
+    await worker.start()
+    try:
+        net.clear()
+        await worker.enqueue({"type": "arxiv", "query": "RAG", "days": 3, "max_results": 1})
+        await asyncio.wait_for(net.delivered.wait(), timeout=NOW_S)
+    finally:
+        await worker.stop()
+    # Then: the digest arrived whole, with only the token removed
+    digest = arxiv_tool.build_digest("RAG", entries, "Коротко: метка — служебная, статья одна.")
+    assert net.sent == [digest]
+    assert SENTINEL not in net.sent[0]
+    assert "служебная, статья одна." in net.sent[0]
 
 
 # ---------------------------------------------------------------------------

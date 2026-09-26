@@ -28,6 +28,9 @@ ACCEPTED: Final = "Принято, выполняю: {title}."
 REFUSED: Final = "Отклонено: {title}."
 UNANSWERED: Final = "Подтверждение не получено, действие отклонено."
 UNANSWERABLE: Final = "Сервер не принял ответ, действие отклонено: {title}."
+#: An ask that arrived when the user already had as many open as the broker will hold. It
+#: never became a question, so this is the only sentence that has to explain itself.
+OVERLOADED: Final = "Запросов подтверждения слишком много, действие отклонено: {title}."
 UNTITLED: Final = "действие opencode"
 #: A logged ask is truncated as well as escaped: a title can be kilobytes long.
 PREVIEW_CHARS: Final = 120
