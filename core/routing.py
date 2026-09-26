@@ -36,6 +36,20 @@ Three decisions this module makes, all tested:
   escalation (the model could emit the real sentinel and have it read aloud),
   while treating it as a match would mute the voice path entirely. Neither is
   acceptable, and both are misconfiguration, so it is loud instead.
+* **A stored assistant message that carries the sentinel is a routing signal,
+  not an answer, and does not belong in the transcript.** `transcript_sweep`
+  is the fourth guard, and the only one that looks the other way: the first
+  three stop the token reaching a *human*, and this one stops it reaching the
+  *agent*. One `[[NEEDS_AGENT]]` left in the shared session is read back by
+  `r2d2-agent` on every later turn as part of its own conversation, and a model
+  that sees a token the voice agent was told to emit will emit it too -- after
+  which the session cannot do any work at all. The live run measured exactly
+  that: one escalation permanently disabled the agent path and the recovery
+  (`POST /session/:id/summarize`) returned `true` without compressing
+  anything, so a token that survives summarisation poisons forever. The fix
+  therefore deletes the message rather than relying on the server to summarise
+  it away, and it deletes it on the same turn that observed the escalation,
+  because the agent's turn is submitted immediately afterwards.
 * **A model id is never provider-less.** `split_model` is re-exported from
   `core.opencode.wire`, the one implementation the client and this module
   share, so `"/x"` gets the same `("opencode", "x")` the wire body needs rather
@@ -51,18 +65,27 @@ still found here (`test_truncation_cannot_hide_the_sentinel`).
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
-from core.opencode.wire import split_model
+from core.opencode.wire import MessageRecord, split_model
 
 __all__ = [
+    "ASSISTANT_ROLE",
     "RouteDecision",
+    "TranscriptSweep",
     "for_human",
     "parse_voice_reply",
     "sanitize_for_speech",
     "split_model",
+    "transcript_sweep",
 ]
+
+#: The one `info.role` that speaks (C7). Duplicated rather than imported from
+#: `core.backends.opencode_session` so this module stays a leaf; the suite
+#: asserts the two copies agree.
+ASSISTANT_ROLE: Literal["assistant"] = "assistant"
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +103,22 @@ class RouteDecision:
     kind: Literal["speak", "escalate"]
     spoken: str
     task_hint: str
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptSweep:
+    """What one pass over a session transcript must delete, and where to anchor.
+
+    `signal_ids` are the stored assistant messages that carry the sentinel: the
+    control signal, not an answer. `since_message_id` is the newest message that
+    SURVIVES the sweep, and the two are decided from the same snapshot on
+    purpose -- anchoring at a message that is about to be deleted is how a
+    collector starts replaying the whole conversation, because a marker the
+    server no longer lists is a marker it cannot position.
+    """
+
+    since_message_id: str
+    signal_ids: tuple[str, ...]
 
 
 def _require_sentinel(sentinel: str) -> None:
@@ -164,3 +203,36 @@ def for_human(raw: str | None, *, sentinel: str) -> str:
         if remainder:
             kept.append(remainder)
     return "\n".join(kept)
+
+
+def transcript_sweep(records: Sequence[MessageRecord], *, sentinel: str) -> TranscriptSweep:
+    """The routing signals stored in one transcript, and the anchor left behind.
+
+    `records` is one `GET /session/:id/message` snapshot, which is chronological
+    (C7), so "newest that survives" is the last entry that is not being deleted.
+    A caller that deleted first and anchored second would point the collector at
+    a message the server has just dropped, and a missing marker means "everything
+    is newer" -- the whole conversation, replayed into Telegram.
+
+    **Only assistant messages are swept.** A user who says the token out loud
+    has put it in their own transcript, and that is their content: the one-session
+    model exists so it survives. The role is what separates the protocol from the
+    conversation, not the string.
+
+    An assistant message that merely *quotes* the token is swept as well, and
+    that is a deliberate trade rather than an oversight: the protocol makes a
+    leading token a routing signal and `for_human` already refuses to show such a
+    body to a person unedited, so a stored assistant message carrying it is not
+    something the model should be reading back. The alternative -- trusting that
+    the model never quotes its own instruction -- is the exact dependence this
+    fix exists to remove.
+    """
+    _require_sentinel(sentinel)
+    signal_ids = tuple(
+        record.id
+        for record in records
+        if record.role == ASSISTANT_ROLE and sentinel in record.text
+    )
+    doomed = set(signal_ids)
+    anchor = next((record.id for record in reversed(records) if record.id not in doomed), "")
+    return TranscriptSweep(since_message_id=anchor, signal_ids=signal_ids)

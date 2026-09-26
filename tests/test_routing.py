@@ -44,14 +44,20 @@ import ast
 import random
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import Final
 
 import pytest
 
+from core.opencode.wire import MessageRecord
 from core.routing import (
+    ASSISTANT_ROLE,
     RouteDecision,
+    TranscriptSweep,
+    for_human,
     parse_voice_reply,
     sanitize_for_speech,
     split_model,
+    transcript_sweep,
 )
 
 #: The value `app/config.py` ships; every test that cares about "the real
@@ -285,6 +291,125 @@ def test_sanitized_parse_output_is_itself_speech_safe() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The fourth guard: the signal must not stay in the transcript either
+# ---------------------------------------------------------------------------
+
+
+def stored(message_id: str, role: str, text: str) -> MessageRecord:
+    return MessageRecord(id=message_id, role=role, text=text)
+
+
+#: The transcript the live run left behind: the user asked for real work, the
+#: voice agent answered with the routing signal, and the agent read it back.
+POISONED: Final[tuple[MessageRecord, ...]] = (
+    stored("msg_u1", "user", "Найди статьи про RAG и сделай сводку."),
+    stored("msg_a1", "assistant", f"{SENTINEL} Сводка статей про RAG за неделю."),
+    stored("msg_u2", "user", "Пользователь попросил голосом: Найди статьи про RAG."),
+    stored("msg_a2", "assistant", f"{SENTINEL} Просканировать /tmp и найти большие файлы."),
+)
+
+
+def test_the_sweep_finds_the_stored_routing_signal() -> None:
+    # Given: a session where the voice agent escalated and the agent then copied
+    # the token -- the live run's transcript, verbatim in shape
+    # When: the transcript is swept
+    sweep = transcript_sweep(POISONED, sentinel=SENTINEL)
+    # Then: both stored signals are named, because both are the model repeating
+    # an instruction rather than answering
+    assert sweep.signal_ids == ("msg_a1", "msg_a2")
+
+
+def test_the_sweep_anchors_at_a_message_that_survives_it() -> None:
+    # Given: the same transcript, whose LAST message is one of the signals
+    # When: the sweep decides the collector's anchor
+    sweep = transcript_sweep(POISONED, sentinel=SENTINEL)
+    # Then: the anchor is the newest message the server will still list.
+    # Anchoring at `msg_a2` would delete the anchor, and a marker the server
+    # cannot position means "everything is newer" -- the whole conversation
+    # replayed into Telegram.
+    assert sweep.since_message_id == "msg_u2"
+
+
+def test_a_sweep_that_keeps_everything_still_anchors_at_the_newest() -> None:
+    # Given: a session with no signal in it -- the deadline branch, where the
+    # voice turn is still running and has written nothing
+    records = (stored("msg_u1", "user", "Сколько будет два плюс два?"),)
+    # When / Then: nothing is deleted and the anchor is the last message, exactly
+    # as it was before this guard existed
+    sweep = transcript_sweep(records, sentinel=SENTINEL)
+    assert sweep == TranscriptSweep(since_message_id="msg_u1", signal_ids=())
+
+
+def test_an_empty_session_anchors_nowhere() -> None:
+    # Given: C8 -- a brand new session, where the first turn goes straight to the
+    # agent and the transcript is empty
+    # When / Then: the empty anchor the collector already understands
+    assert transcript_sweep((), sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="", signal_ids=()
+    )
+
+
+def test_a_user_message_carrying_the_token_is_never_swept() -> None:
+    # Given: the owner said the token out loud, so it is in THEIR message. The
+    # one-session-per-human model exists so their content survives.
+    records = (
+        stored("msg_u1", "user", f"Что такое {SENTINEL}?"),
+        stored("msg_a1", "assistant", "Это маркер передачи хода агенту."),
+    )
+    # When / Then: the role decides, not the string
+    sweep = transcript_sweep(records, sentinel=SENTINEL)
+    assert sweep.signal_ids == ()
+    assert sweep.since_message_id == "msg_a1"
+
+
+def test_a_whole_session_of_signals_still_yields_an_anchor() -> None:
+    # Given: a session where nothing but protocol is stored, which no real
+    # session looks like and which must not raise
+    records = (stored("msg_a1", "assistant", SENTINEL), stored("msg_a2", "assistant", SENTINEL))
+    # When / Then: everything is swept and the anchor degrades to "everything is
+    # newer", which is the documented meaning of an empty marker
+    assert transcript_sweep(records, sentinel=SENTINEL) == TranscriptSweep(
+        since_message_id="", signal_ids=("msg_a1", "msg_a2")
+    )
+
+
+def test_the_sweep_refuses_an_empty_sentinel_like_every_other_guard() -> None:
+    # Given: a misconfigured empty sentinel, which `in` would match everywhere
+    # When / Then: it is loud, because a sweep that matched every assistant
+    # message would delete the user's whole conversation
+    with pytest.raises(ValueError, match="non-empty literal"):
+        transcript_sweep(POISONED, sentinel="")
+
+
+def test_the_sweep_and_the_collector_agree_on_which_role_speaks() -> None:
+    # Given: two modules that each name the role the sweep must not delete
+    # When / Then: the copies have not drifted
+    from core.backends.opencode_session import ASSISTANT_ROLE as COLLECTOR_ROLE
+
+    assert ASSISTANT_ROLE == COLLECTOR_ROLE == "assistant"
+
+
+def test_the_outbound_guard_still_strips_a_token_a_survivor_quoted() -> None:
+    # Given: an answer that quotes the token in a sentence, and a session that
+    # kept it because the sweep only sees assistant messages
+    quoted = f"Ты просил {SENTINEL} — это маркер шлюза, задача выполнена."
+    # When / Then: the Telegram boundary is unchanged -- the token is out, the
+    # answer is in. A fourth guard pointing the other way must not blunt this one.
+    spoken = for_human(quoted, sentinel=SENTINEL)
+    assert SENTINEL not in spoken
+    assert "задача выполнена" in spoken
+
+
+def test_the_sweep_result_is_frozen() -> None:
+    # Given: a decision two modules act on -- the brain deletes `signal_ids` and
+    # writes `since_message_id` into a job row
+    sweep = transcript_sweep(POISONED, sentinel=SENTINEL)
+    # When / Then: it cannot be edited on the way to either
+    with pytest.raises(FrozenInstanceError):
+        sweep.since_message_id = "other"
+
+
+# ---------------------------------------------------------------------------
 # The property check (the test this todo exists for)
 # ---------------------------------------------------------------------------
 
@@ -447,8 +572,10 @@ def test_the_module_imports_nothing_but_the_standard_library() -> None:
             roots.update(alias.name.split(".")[0] for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
             roots.add((node.module or "").split(".")[0])
-    # Then: no config singleton, no HTTP client, no logging, no event loop
-    assert roots <= {"__future__", "dataclasses", "typing", "core"}, roots
+    # Then: no config singleton, no HTTP client, no logging, no event loop.
+    # `collections.abc` is here for `transcript_sweep`'s `Sequence` parameter --
+    # stdlib, and a type, not a capability.
+    assert roots <= {"__future__", "collections", "dataclasses", "typing", "core"}, roots
 
 
 def test_the_module_never_logs_and_never_does_io() -> None:

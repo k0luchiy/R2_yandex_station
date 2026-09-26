@@ -83,7 +83,7 @@ FS_PREFIXES = (
 )
 #: Every `_request(...)` call in the client: the verb and the path template it
 #: sends.  This is the authoritative route list -- not a hand-kept copy.
-REQUEST_CALL = re.compile(r'_request\(\s*"(?P<verb>GET|POST)",\s*f?"(?P<path>[^"]+)"')
+REQUEST_CALL = re.compile(r'_request\(\s*"(?P<verb>GET|POST|DELETE)",\s*f?"(?P<path>[^"]+)"')
 #: Fences, with their info string, so a `verbatim` block can name its origin.
 FENCE = re.compile(r"^```(?P<lang>[^\n`]*)\n(?P<body>.*?)^```", re.M | re.S)
 #: Fence languages that are legitimately NOT committed source: an operator's
@@ -154,7 +154,7 @@ def documented_endpoints(text: str) -> list[tuple[str, str]]:
     """(verb, path) claimed by every table row of the document."""
     claims: list[tuple[str, str]] = []
     for row in table_rows(text):
-        verb = next((c for c in row if re.fullmatch(r"`(?:GET|POST)`", c)), None)
+        verb = next((c for c in row if re.fullmatch(r"`(?:GET|POST|DELETE)`", c)), None)
         if verb is None:
             continue
         for cell in row:

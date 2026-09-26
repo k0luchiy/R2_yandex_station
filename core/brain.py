@@ -42,6 +42,17 @@ Three more decisions, each load-bearing:
   `routing.for_human` in `core/async_worker.py:_deliver`, because a collected
   answer is read out of the session rather than out of a model reply and reaches
   a chat no cleaner ever sees.
+* **And it does not stay in the session either.** Those four guards all point the
+  same way -- out to a human -- and the failure that mattered was the opposite
+  one: the token sits in the one artefact the design calls durable context, so
+  `r2d2-agent` reads its own history, copies the token, and the session can do no
+  work again for the rest of its life. `summarize` is not a way out: it answers
+  `true` and leaves the transcript alone, so a signal that outlives one
+  summarisation is permanent. `_collect_later` therefore deletes the stored
+  message on the same turn that observed the escalation, before the agent's turn
+  is submitted, and `routing.transcript_sweep` decides both the deletion and the
+  collector's anchor from a single snapshot so the anchor cannot be the message
+  being deleted.
 
 `authorized()` is unchanged and is still the only thing between a network-exposed
 webhook and a stranger's laptop.
@@ -123,9 +134,10 @@ JOB_OPENCODE_REPLY: Final = "opencode_reply"
 #: The collector's ceiling, stated in the job rather than left to the reader. It
 #: is a ceiling and not a wait: `collect_reply` ends on the idle condition first.
 COLLECT_TIMEOUT_S: Final = 600.0
-#: What the deadline path may spend finding its marker message. It has already
-#: spent the whole voice budget, so this is small and absolute -- a server that
-#: will not answer here costs the answer, never the acknowledgement.
+#: What an escalating turn may spend on the transcript: reading it once, and per
+#: routing signal deleting the message the sweep found. It has already spent the
+#: whole voice budget, so this is small and absolute -- a server that will not
+#: answer here costs the answer, never the acknowledgement.
 MARKER_TIMEOUT_S: Final = 0.5
 #: What a brokered permission answer is spoken as. The title opencode supplies is
 #: deliberately absent: it is server-controlled, and it can be kilobytes long.
@@ -354,12 +366,15 @@ class Brain:
         escalates cannot forget the collector, because returning the ack at all IS
         this call.
 
-        The marker is read BEFORE the submit, so it anchors the collector to the
-        last message the session held while the turn was still this turn's own
-        business: the collector then returns the agent's answer and can never
-        replay the conversation the user already had. Reading it afterwards would
-        race opencode's own write of the submitted message and make the anchor
-        depend on which of the two arrived first.
+        `_collect_later` runs first and reads the transcript BEFORE the submit, so
+        the marker is the last message the session held while this turn was still
+        its own business: the collector then returns the agent's answer and can
+        never replay the conversation the user already had. It is also what deletes
+        the voice agent's routing signal, and that has to happen before the agent's
+        turn is queued -- an agent asked to work in a session whose newest message is
+        `[[NEEDS_AGENT]]` is an agent that answers with `[[NEEDS_AGENT]]`. Reading
+        it after the submit would race opencode's own write of the task message and
+        make the marker depend on which of the two arrived first.
 
         A refused submit does not turn into a failed turn. The user has already been
         told a result is coming, the collector is armed either way, and it still
@@ -411,13 +426,31 @@ class Brain:
         return count > 0
 
     async def _collect_later(self, wiring: HybridWiring, app_id: str, session_id: str) -> None:
-        """Hand the still-running turn to the worker, which ships the answer to Telegram.
+        """Take the routing signal out of the transcript, and hand the still-running
+        turn to the worker that ships the answer to Telegram.
 
-        The marker is the last message the session held when the deadline fired, so
-        the collector can only return text produced after this turn and never
-        replays the session. Finding it costs one GET on a path that has already
-        spent the whole voice budget, and it is bounded: a server that will not
-        answer here loses the answer, never the acknowledgement.
+        Both halves read the session ONCE, and the order is the whole point. The
+        snapshot says which stored messages are routing signals and which is the
+        newest message that survives them; the signals are deleted, and only then
+        is the collector armed with the surviving id. Anchoring first and
+        deleting afterwards would leave the collector pointing at a message the
+        server no longer lists, and a marker it cannot position means "everything
+        in the session is newer" -- the entire conversation replayed into Telegram.
+
+        Deleting is not a repair of the user's transcript. Only ASSISTANT messages
+        carrying the sentinel are removed, so every utterance the user made and
+        every real answer survives; what goes is a control signal that the protocol
+        never meant to be conversation, and leaving it is what let one escalation
+        disable the agent path for good (the live run's `POST .../summarize`
+        answered `true` and compressed nothing, so no summariser could have saved
+        it). The escalation hint is not lost with the message: it is already part
+        of the task text submitted below.
+
+        Finding the marker costs one GET on a path that has already spent the
+        whole voice budget, and it is bounded: a server that will not answer here
+        loses the answer, never the acknowledgement. The deletes carry the same
+        bound, because they happen between the model's reply and the words Alice
+        is waiting for.
         """
         try:
             records = await asyncio.wait_for(
@@ -429,15 +462,50 @@ class Brain:
                 "collected: %s", wiring.spec.name, session_id, app_id, exc,
             )
             return
+        sweep = routing.transcript_sweep(
+            records, sentinel=self.cfg.r2d2_needs_agent_sentinel
+        )
+        for message_id in sweep.signal_ids:
+            await self._erase_signal(wiring, app_id, session_id, message_id)
         await self.worker.enqueue(
             {
                 "type": JOB_OPENCODE_REPLY,
                 "application_id": app_id,
                 "session_id": session_id,
-                "since_message_id": records[-1].id if records else "",
+                "since_message_id": sweep.since_message_id,
                 "timeout_s": COLLECT_TIMEOUT_S,
             }
         )
+
+    async def _erase_signal(
+        self, wiring: HybridWiring, app_id: str, session_id: str, message_id: str
+    ) -> None:
+        """Delete one stored routing signal, and say so loudly if it survived.
+
+        A failure here is not a failed turn: the user has already been
+        acknowledged, the collector is armed either way, and the agent's own
+        prompt tells it the token is the gateway's. What a failure does cost is
+        the guarantee, so it is logged with the reason rather than swallowed --
+        a session that keeps a signal is a session whose agent may start copying
+        it, and the operator is the one who can see that happening.
+        """
+        try:
+            removed = await asyncio.wait_for(
+                wiring.client.delete_message(session_id, message_id), MARKER_TIMEOUT_S
+            )
+        except (TimeoutError, httpx.HTTPError, OpencodeError) as exc:
+            self.logger.warning(
+                "opencode %r: the routing signal %s is still stored in session %s of %s and "
+                "the agent reads it as its own history: %s",
+                wiring.spec.name, message_id, session_id, app_id, exc,
+            )
+            return
+        if not removed:
+            self.logger.warning(
+                "opencode %r: asked to delete the routing signal %s from session %s of %s; the "
+                "server did not remove it, and the agent reads it as its own history",
+                wiring.spec.name, message_id, session_id, app_id,
+            )
 
     async def _chain_turn(self, app_id: str, command: str, dangerous: bool) -> tuple[str, bool]:
         rec = metrics.current()

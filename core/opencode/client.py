@@ -29,8 +29,8 @@ The value types and the error hierarchy live in `core.opencode.wire` and are
 re-exported here, so `core.opencode.client` stays the single import that todos 8,
 9 and 14 need.
 
-allow: SIZE_OK -- 307 pure LOC. The vocabulary half is already split out into
-`core.opencode/wire.py`; what is left is the 15 routes of the opencode wire
+allow: SIZE_OK -- 326 pure LOC. The vocabulary half is already split out into
+`core.opencode/wire.py`; what is left is the 16 routes of the opencode wire
 contract in `docs/11-opencode-contract.md` (each 3-8 lines) plus 5 HTTP
 internals. The route set is fixed by that contract and by the API plan todos 8,
 9 and 14 call, and every route needs the same `_request`/`_scoped_params`, so
@@ -206,6 +206,24 @@ class OpencodeClient:
         """`POST /session/:id/abort` -> whether the server stopped the turn."""
         response = await self._request("POST", f"/session/{session_id}/abort", params=self._scoped_params())
         return decode(response, bool)
+
+    async def delete_message(self, session_id: str, message_id: str) -> bool:
+        """`DELETE /session/:id/message/:messageID` -> whether it was removed.
+
+        The route exists for one caller and one reason: the escalation sentinel
+        is a control signal, and a control signal stored in the session is read
+        back by the next agent as part of its own conversation (see
+        `core.routing.transcript_sweep`). Summarising the session away is not a
+        substitute -- the server answers `true` and leaves the transcript
+        untouched -- so the message is deleted, by id, on the turn that observed
+        it. The id is quoted because a message id is server-controlled text.
+        """
+        removed = await self._request(
+            "DELETE",
+            f"/session/{session_id}/message/{quote(message_id, safe='')}",
+            params=self._scoped_params(),
+        )
+        return decode(removed, bool)
 
     async def summarize(self, session_id: str, *, provider: str, model: str) -> bool:
         """`POST /session/:id/summarize {"providerID", "modelID"}` -> the server's bool."""

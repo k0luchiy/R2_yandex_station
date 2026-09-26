@@ -247,6 +247,11 @@ class FakeOpencode:
         #: record as `since_message_id`, because at the moment the deadline fires
         #: that user turn is the last thing the session holds.
         self.hung_ids: list[str] = []
+        #: `(session_id, message_id)` of every `DELETE .../message/...` the brain
+        #: asked for, and the status the server answered with. The routing signal
+        #: must leave the session on the very turn that observed it.
+        self.deleted: list[tuple[str, str]] = []
+        self.delete_status: int = 200
         self._hung: dict[str, tuple[str, str]] = {}
         self._answered: set[str] = set()
         self._delivered: set[str] = set()
@@ -271,6 +276,8 @@ class FakeOpencode:
             return httpx.Response(204)
         if method == "GET" and path.endswith("/message"):
             return self._poll(session_id)
+        if method == "DELETE" and "/message/" in path:
+            return self._delete(session_id, parts[4])
         if method == "POST" and path.endswith("/summarize"):
             self.summarizes.append((session_id, json.loads(request.content)))
             return httpx.Response(200, json=True)
@@ -357,9 +364,16 @@ class FakeOpencode:
 
     def _answer(self, session_id: str, turn: Turn) -> httpx.Response:
         parts = [] if self.empty_turn else [{"type": "text", "text": self.reply}]
+        message_id = f"msg_a{len(self.turns)}"
         self.seed(session_id, said(turn.text, f"msg_u{len(self.turns)}", role="user"))
+        # The real server STORES the assistant message, and the id it reports in
+        # `info.id` is the id that message has. A fake that returned the text
+        # without keeping it would hide the whole escalation-signal defect: the
+        # routing token would never enter the transcript the agent reads back.
+        if not self.empty_turn:
+            self.seed(session_id, said(self.reply, message_id))
         return httpx.Response(
-            200, json={"info": {"id": f"msg_a{len(self.turns)}", "role": "assistant"}, "parts": parts}
+            200, json={"info": {"id": message_id, "role": "assistant"}, "parts": parts}
         )
 
     @staticmethod
@@ -383,6 +397,19 @@ class FakeOpencode:
                 self._delivered.add(session_id)
                 self.seed(session_id, said(AGENT_REPLY, "msg_agent"))
         return httpx.Response(200, json=self.transcript.get(session_id, []))
+
+    def _delete(self, session_id: str, message_id: str) -> httpx.Response:
+        held = self.transcript.get(session_id, [])
+        kept = [entry for entry in held if entry["info"].get("id") != message_id]
+        removed = len(kept) != len(held)
+        if removed:
+            self.transcript[session_id] = kept
+        self.deleted.append((session_id, message_id))
+        if self.delete_status != 200:
+            return httpx.Response(
+                self.delete_status, json={"name": "UnknownError", "data": {"message": "no"}}
+            )
+        return httpx.Response(200, json=removed)
 
 
 def replying(content: str):
@@ -886,6 +913,171 @@ async def test_two_turns_that_escalate_arm_one_collector_each_and_never_twice(
     # on a phone reads as two answers and is the failure a duplicate Telegram
     # message looks like to the user
     assert all(job["timeout_s"] == COLLECT_TIMEOUT_S for job in jobs)
+
+
+# ---------------------------------------------------------------------------
+# 2b. The signal must not stay in the session either
+# ---------------------------------------------------------------------------
+
+
+def stored_texts(rig: Rig, session_id: str) -> list[str]:
+    """Every message text the server still holds for this session."""
+    return [str(entry["parts"][0]["text"]) for entry in rig.server.transcript[session_id]]
+
+
+async def test_an_escalation_removes_the_routing_signal_from_the_session(rig: Rig) -> None:
+    # Given a warm session and a voice agent that escalated
+    rig.server.reply = f"Это займёт времени. {SENTINEL} собрать последние статьи про RAG"
+    session_id = await rig.warm()
+    # When
+    assert await rig.say() == ACK
+    # Then the signal was deleted from the session, by id, on this very turn.
+    # Left in place it is the newest thing `r2d2-agent` reads when the task is
+    # submitted microseconds later, and a model shown a token the voice agent was
+    # told to emit will emit it too -- which is how one escalation disabled the
+    # agent path for good on the live run.
+    assert rig.server.deleted == [(session_id, "msg_a1")]
+    assert stored_texts(rig, session_id) == [QUESTION]
+    assert all(SENTINEL not in text for text in stored_texts(rig, session_id))
+
+
+async def test_the_sweep_keeps_the_users_own_conversation(rig: Rig) -> None:
+    # Given a session with real history in it -- the one-session-per-human model
+    # exists so this content survives, and a fix for a poisoned session must not
+    # be a fix that empties it
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    session_id = await rig.warm()
+    rig.server.seed(
+        session_id,
+        said("что такое RAG", "msg_old_u", role="user"),
+        said("Retrieval augmented generation.", "msg_old_a"),
+    )
+    # When
+    assert await rig.say() == ACK
+    # Then every message that was not the protocol is still there, byte for byte
+    assert stored_texts(rig, session_id) == [
+        "что такое RAG",
+        "Retrieval augmented generation.",
+        QUESTION,
+    ]
+    assert [mid for _sid, mid in rig.server.deleted] == ["msg_a1"]
+
+
+async def test_the_collector_anchors_at_a_message_the_server_still_lists(rig: Rig) -> None:
+    # Given an escalation, where the newest message IS the signal being deleted
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    session_id = await rig.warm()
+    # When
+    assert await rig.say() == ACK
+    # Then the anchor is a message that survives the sweep. Anchoring at the
+    # message about to be deleted would leave the collector holding an id the
+    # server no longer lists, and `collect_reply` reads an unpositionable marker as
+    # "everything is newer" -- the whole conversation, replayed into Telegram.
+    job = rig.brain.worker.jobs[0]
+    live = {str(entry["info"]["id"]) for entry in rig.server.transcript[session_id]}
+    assert job["since_message_id"] == "msg_u1"
+    assert job["since_message_id"] in live
+    assert job["since_message_id"] not in {mid for _sid, mid in rig.server.deleted}
+
+
+async def test_the_signal_goes_even_when_summarise_answered_true_and_did_nothing(
+    rig: Rig,
+) -> None:
+    # Given a long session, so `_prepare` calls the server's summariser -- and the
+    # server answers `true` and compresses nothing, which is what the live run
+    # measured (39 messages, all originals, sentinel still present). A fix that
+    # leaned on summarisation would therefore be a fix that does not work.
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    session_id = await rig.warm(count=rig.cfg.r2d2_session_soft_limit + 10)
+    # When
+    assert await rig.say() == ACK
+    # Then the summariser was asked, and the signal was deleted anyway
+    assert [sid for sid, _body in rig.server.summarizes] == [session_id]
+    assert rig.server.deleted == [(session_id, "msg_a1")]
+    assert stored_texts(rig, session_id) == [QUESTION]
+
+
+async def test_a_session_poisoned_by_an_earlier_turn_is_repaired_on_the_next_escalation(
+    rig: Rig,
+) -> None:
+    # Given a session that already holds a signal -- written by a turn that
+    # outran the deadline and landed after R2D2 had stopped looking, which is the
+    # one way a signal can still arrive without anybody escalating
+    rig.server.reply = f"Понял. {SENTINEL} новая задача"
+    session_id = await rig.warm()
+    rig.server.seed(
+        session_id,
+        said("старый вопрос", "msg_old_u", role="user"),
+        said(f"{SENTINEL} сигнал прошлого хода", "msg_stale"),
+    )
+    # When
+    assert await rig.say() == ACK
+    # Then the sweep is not a one-message patch: it takes out every stored signal,
+    # so a session that is already poisoned recovers on its next escalation
+    assert [mid for _sid, mid in rig.server.deleted] == ["msg_stale", "msg_a1"]
+    assert stored_texts(rig, session_id) == ["старый вопрос", QUESTION]
+
+
+async def test_a_user_message_carrying_the_token_is_never_deleted(rig: Rig) -> None:
+    # Given the owner said the words out loud, so the token is in THEIR message
+    asked = f"что значит {SENTINEL}"
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    session_id = await rig.warm()
+    # When
+    assert await rig.say(asked) == ACK
+    # Then only the model's own message was deleted. The role decides, not the
+    # string: a user's content is never this module's to remove.
+    assert [mid for _sid, mid in rig.server.deleted] == ["msg_a1"]
+    assert asked in stored_texts(rig, session_id)
+
+
+async def test_a_refused_delete_leaves_the_turn_successful_and_says_why(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Given a server that will not remove the message
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    rig.server.delete_status = 500
+    await rig.warm()
+    # When
+    with caplog.at_level(logging.WARNING, logger="r2d2.brain"):
+        text = await rig.say()
+    # Then the user is still acknowledged -- the failure is not theirs to hear --
+    # and the reason is in the log, because a session that keeps a signal is a
+    # session whose agent may start copying it
+    assert text == ACK
+    assert rig.server.turns[1].agent == TASK_AGENT
+    assert any("routing signal" in record.getMessage() for record in caplog.records)
+
+
+async def test_the_collected_answer_is_the_agents_and_not_a_replay(
+    rig: Rig, net: Net
+) -> None:
+    # Given the real worker with todo 16's branch, and an escalating turn in a
+    # session that already holds an earlier answer -- the collector's window has to
+    # survive a deletion on the way to being anchored, so it is observed end to end
+    # and not only in the job row.
+    rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
+    session_id = await rig.warm()
+    rig.server.seed(
+        session_id, said("прошлый вопрос", "msg_old_u", role="user"),
+        said("Прошлый ответ.", "msg_old_a"),
+    )
+    assert await rig.say() == ACK
+    job = rig.brain.worker.jobs[0]
+    # When the agent's work lands in the session and the job is dispatched for real
+    rig.server.seed(session_id, said(AGENT_REPLY, "msg_agent"))
+    worker = CollectorWorker(rig.cfg, rig.memory, rig.backend)
+    await worker.start()
+    try:
+        net.delivered.clear()
+        await worker.enqueue(job)
+        await asyncio.wait_for(net.delivered.wait(), timeout=5.0)
+    finally:
+        await worker.stop()
+    # Then Telegram gets the agent's answer alone. An anchor that pointed at a
+    # deleted message is unpositionable, and the collector reads that as
+    # "everything is newer" -- the earlier answer and the signal in one message.
+    assert net.telegram == [AGENT_REPLY]
 
 
 # ---------------------------------------------------------------------------

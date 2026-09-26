@@ -167,6 +167,10 @@ class FakeOpencode:
     permission_answers: list[tuple[str, str, dict[str, Any]]] = field(default_factory=list)
     aborted: list[str] = field(default_factory=list)
     summarized: list[str] = field(default_factory=list)
+    #: `(session_id, message_id)` of every accepted `DELETE .../message/...`, in
+    #: order. Empty is the assertion that matters: a turn that escalated and never
+    #: asked the server to remove the routing signal is the D6 defect.
+    deleted: list[tuple[str, str]] = field(default_factory=list)
 
     _streams: list[asyncio.Queue] = field(default_factory=list, init=False, repr=False)
     _arrived: asyncio.Condition = field(
@@ -329,6 +333,19 @@ class FakeOpencode:
         @api.get("/session/{session_id}/message")
         async def list_messages(session_id: str) -> Any:
             return _json(server._polled(session_id))
+
+        @api.delete("/session/{session_id}/message/{message_id}")
+        async def delete_message(session_id: str, message_id: str) -> Any:
+            kept = [
+                envelope
+                for envelope in server.transcript.get(session_id, [])
+                if envelope["info"].get("id") != message_id
+            ]
+            removed = len(kept) != len(server.transcript.get(session_id, []))
+            if removed:
+                server.transcript[session_id] = kept
+            server.deleted.append((session_id, message_id))
+            return _json(removed)
 
         @api.post("/session/{session_id}/abort")
         async def abort(session_id: str) -> Any:
