@@ -1,5 +1,25 @@
 # T21 — live end-to-end proof against a real `opencode serve`
 
+> **This file records the state BEFORE the fixes.** Every number, verdict and
+> finding below is what the run measured, and they are left exactly as measured —
+> that is the value of the document. The eight defects it found (D1–D8) have since
+> been fixed and committed, so nothing below describes the code as it stands now:
+>
+> | Defect | Fixing commit |
+> |---|---|
+> | D1 — SSE read timeout is the voice deadline | `ac13620` |
+> | D2, D5 — escalation never collected, slow turn dropped | `4bebbcf` |
+> | D3 — `/tg/webhook` cannot answer an Alice-side ask | `91d2c4f` |
+> | D4 — raw sentinel delivered to Telegram | `636d327` |
+> | D6, D7 — sentinel poisons the session, foreign tools unguarded | `1c89380` |
+> | D8 — fallback chain has no working member | `86e8922` |
+>
+> Two method names moved in the later refactors, so a pointer below can send you
+> to a file rather than to the old `Brain`: `_opencode_turn` is now
+> `core/session_route.py:turn`, and `_collect_later` is now
+> `core/session_collector.py:_collect_later`, reached through
+> `SessionCollector.hand_to_agent`.
+
 Plan: `.omo/plans/opencode-brain.md` lines 472–479. Nothing in the repository was
 modified to produce this file; every number below was measured on this machine
 against `opencode serve` **v1.18.32** on `127.0.0.1:4599` and R2D2 on
@@ -165,8 +185,9 @@ marker visible only inside the session:
 
 **FAIL — the Telegram half.** The agent produced a report, and it was never
 delivered: 45 s after the ack, `grep -c "api.telegram.org" uvicorn.log` was `0`.
-The reason is in the code, not in the run: `Brain._opencode_turn` enqueues an
-`opencode_reply` collector job **only** on the `OpencodeDeadlineExceeded` branch.
+The reason is in the code, not in the run: `Brain._opencode_turn` (now
+`core/session_route.py:turn`) enqueues an `opencode_reply` collector job **only**
+on the `OpencodeDeadlineExceeded` branch.
 Both escalation branches — C8 (cold session) and the `[[NEEDS_AGENT]]` branch —
 call `submit_task()` and return the ack, and then nobody ever reads the answer
 back out of the session. See [D2](#d2--the-escalation-path-has-no-collector).
@@ -515,8 +536,8 @@ was given the wrong one.
 
 ### D2 — the escalation path has no collector
 
-`core/brain.py:_opencode_turn` enqueues an `opencode_reply` job **only** in the
-`except OpencodeDeadlineExceeded` branch. The C8 branch and the
+`core/brain.py:_opencode_turn` (now `core/session_route.py:turn`) enqueues an
+`opencode_reply` job **only** in the `except OpencodeDeadlineExceeded` branch. The C8 branch and the
 `decision.kind == "escalate"` branch both call `submit_task()` and return the ack,
 and nothing ever reads the reply back out of the session. The `r2d2-agent` prompt
 says "Твой финальный текст доставляется в телеграм" — a promise no code keeps.
@@ -535,8 +556,8 @@ Measured: the pending row survived the `да` untouched, and
 
 ### D4 — the collector ships the raw escalation sentinel to Telegram
 
-`_collect_later` → `Worker._opencode_reply` → `send_message` has no sentinel
-guard. `sanitize_for_speech` and `Brain._speakable` protect Alice's `text`/`tts`
+`SessionCollector._collect_later` → `Worker._opencode_reply` → `send_message`
+has no sentinel guard. `sanitize_for_speech` and `Brain._speakable` protect Alice's `text`/`tts`
 only. During this run **11** `opencode_reply` jobs delivered text beginning with
 the literal `[[NEEDS_AGENT]]` to the owner's Telegram chat, e.g. job
 `777ca88c0741`. The user has been sent eleven protocol markers.

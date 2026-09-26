@@ -74,7 +74,8 @@ from core.tools import arxiv_tool
 #: The job type `core/brain.py` writes (todo 15, `JOB_OPENCODE_REPLY`) and this
 #: todo dispatches. The brain is the spec: a rename there must fail here.
 JOB_TYPE: Final = "opencode_reply"
-#: The exact key set `Brain._collect_later` enqueues. Anything else this worker
+#: The exact key set `SessionCollector.hand_to_agent` enqueues (via
+#: `core/session_collector.py:_collect_later`). Anything else this worker
 #: reads is a key nobody writes.
 JOB_KEYS: Final = frozenset(
     {"type", "application_id", "session_id", "since_message_id", "timeout_s"}
@@ -221,7 +222,7 @@ class Net:
 
 
 def job(**overrides: object) -> dict[str, object]:
-    """A job shaped exactly as `Brain._collect_later` enqueues one."""
+    """A job shaped exactly as `SessionCollector.hand_to_agent` enqueues one."""
     base: dict[str, object] = {
         "type": JOB_TYPE,
         "application_id": APP,

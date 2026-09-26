@@ -34,12 +34,6 @@ The event vocabulary and the frame decoder are not here: they are in
 `core/opencode.sse_frames`, which knows nothing about sockets, and every name it
 defines is re-exported below so `EventSource` stays the single import the rest of
 R2D2 uses.
-
-allow: SIZE_OK -- 197 pure LOC, the transport half of what was one 315-LOC module.
-The split is by dependency, not by convenience: the vocabulary half has no timeout
-and no socket, so it is testable without one, and this half has no JSON. Growing it
-again would mean the reconnect policy, the session filter and the timeout policy
-have become one concern, and that is the day this route stops being readable.
 """
 
 from __future__ import annotations

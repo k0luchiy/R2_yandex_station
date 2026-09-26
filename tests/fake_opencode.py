@@ -451,8 +451,8 @@ class FakeOpencode:
         a turn that is still running) lands in the session as an assistant message
         afterwards, and the collector is what waits for it. Delivering on the FIRST
         read instead would be a different server -- one that answers before the ask
-        -- and it would make the marker `Brain._collect_later` takes equal to the
-        answer it is looking for.
+        -- and it would make the marker
+        `SessionCollector.hand_to_agent` takes equal to the answer it is looking for.
 
         A QUEUE, not one slot: a session that has accepted two turns owes two
         answers, and holding only the last one would lose a turn the server is
