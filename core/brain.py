@@ -1,74 +1,35 @@
 """R2D2's brain: one turn in, one spoken answer out -- or an acknowledgement and
 a result in Telegram (plan todo 15).
 
-Alice gives a webhook **4.5 s** and **1024 characters**. The opencode server gives
-one persistent session per user, a tool-less voice agent that answers inside
-`r2d2_fast_deadline`, and a full agent that does real work. This module decides
-which of the two a turn gets, and the decision is forced by measurements from
-`docs/11-opencode-contract.md` rather than by taste:
+Alice gives a webhook **4.5 s** and **1024 characters**. This module is the half of
+the orchestrator that stands on its own: the auth gate, the fixed intents, the choice
+between the two routes, and the chain a turn falls back to. The opencode session turn,
+the deadline it may outrun and the Telegram collector are the other two modules.
 
-* **C8 -- a cold session costs 15.5-18.6 s.** So a session whose message count is
-  zero skips the synchronous voice turn entirely, submits the work to the agent
-  and acknowledges in under a second. A warm session (p50 1.667 s, p95 2.247 s)
-  answers directly.
 * **C1 -- a 200 is not a reply.** `info.error` carries a 403 `FreeTierError` or a
   402 inside an HTTP 200, so the opencode turn is a failure, never an answer, and
-  the turn falls back to the provider chain. This is the headline hazard of the
-  rewrite: a refusal text that reaches a speaker is worse than no answer, because
-  the user cannot tell it from one.
-
-Three more decisions, each load-bearing:
-
-* **A deadline is not an abort, and not a loss.** A voice turn that outruns the
-  budget keeps running server-side; the user is acknowledged, the work is
-  submitted to the agent as well, and an `opencode_reply` job collects the answer
-  for Telegram. Aborting would destroy work already paid for; not submitting would
-  lose the request outright, because at the deadline nobody can know whether the
-  late turn will answer or ask for the agent. The collector needs a marker --
-  hence the last message the session held before this turn's work was submitted is
-  recorded in the job.
-* **The fallback chain excludes the session backend.** `config/backends.json`
-  lists `opencode` first, but the opencode route has just tried it, and a second
-  attempt on the same host would spend budget the turn no longer has. It is also
-  the only kind `build_chain` cannot build without the wiring, so leaving it in
-  made the whole chain raise `BackendConfigError` and every fallback turn answer
-  with `ERROR_TEXT`.
+  the turn falls back to the chain below. A refusal that reaches a speaker is
+  worse than no answer, because the user cannot tell it from one.
+* **The fallback chain excludes the session backend.** `config/backends.json` lists
+  `opencode` first, but the opencode route has just tried it, and a second attempt on
+  the same host would spend budget the turn no longer has. It is also the only kind
+  `build_chain` cannot build without the wiring, so leaving it in made every
+  fallback turn answer with `ERROR_TEXT`.
 * **The sentinel never reaches a human.** `parse_voice_reply` is the structural
-  guard, `sanitize_for_speech` the total one, and `_speakable` the third: it runs
-  on the RAW text of every turn, in `process`, BEFORE `render.clean` strips the
-  brackets the sentinel is written with and truncates at 1024 characters. A guard
-  after the cleaner would look for a string the cleaner had already dismantled and
-  would miss a sentinel past the cut. The Telegram direction has its own guard,
-  `routing.for_human` in `core/async_worker.py:_deliver`, because a collected
-  answer is read out of the session rather than out of a model reply and reaches
-  a chat no cleaner ever sees.
-* **And it does not stay in the session either.** Those four guards all point the
-  same way -- out to a human -- and the failure that mattered was the opposite
-  one: the token sits in the one artefact the design calls durable context, so
-  `r2d2-agent` reads its own history, copies the token, and the session can do no
-  work again for the rest of its life. `summarize` is not a way out: it answers
-  `true` and leaves the transcript alone, so a signal that outlives one
-  summarisation is permanent. `_collect_later` therefore deletes the stored
-  message on the same turn that observed the escalation, before the agent's turn
-  is submitted, and `routing.transcript_sweep` decides both the deletion and the
-  collector's anchor from a single snapshot so the anchor cannot be the message
-  being deleted.
+  guard, `sanitize_for_speech` the total one, and `_speakable` below the third: it
+  runs on the RAW text of every turn, BEFORE `render.clean` strips the brackets
+  the sentinel is written with and truncates at 1024 characters. Telegram has its
+  own guard, `routing.for_human`, because a collected answer is read out of the
+  session rather than out of a model reply.
 
 `authorized()` is unchanged and is still the only thing between a network-exposed
 webhook and a stranger's laptop.
-
-allow: SIZE_OK -- the whole orchestrator, in the one file plan todo 15 pins it to
-and `app/main.py` imports by name. Splitting it would mean a second module whose
-only entry point is `_handle`, and `_chain_turn` below is preserved code that
-cannot shrink without changing behaviour its tests assert.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
-from typing import Final
 
 import httpx
 
@@ -76,14 +37,18 @@ from app.config import Config
 from core import metrics, policies, render, routing
 from core.async_worker import Worker
 from core.backends.base import Choice
-from core.backends.config_loader import BackendChain, BackendSpec, load_backend_specs
+from core.backends.config_loader import BackendChain, load_backend_specs
 from core.backends.openai_compatible import BackendError
-from core.backends.opencode_session import OpencodeSessionBackend, current_application_id
 from core.backends.registry import build_chain
 from core.memory import Memory
-from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded, OpencodeError
-from core.opencode.session_store import OcSessionStore
-from core.permissions import PendingPermission, PermissionBroker, PermissionVerdict
+from core.permissions import PendingPermission
+#: The compatibility surface of the opencode half of the orchestrator. These
+#: names were DEFINED here before the split and are re-exported from the modules
+#: that own them now, because `app/main.py`, `app/diagnostics.py` and the tests
+#: import them from `core.brain`. `SessionRoute` is the one new name here: the
+#: route itself, which the orchestrator drives.
+from core.session_collector import COLLECT_TIMEOUT_S, JOB_OPENCODE_REPLY, MARKER_TIMEOUT_S, TASK_PREFIX
+from core.session_route import HybridWiring, PERMISSION_APPROVED, PERMISSION_REFUSED, SESSION_KIND, SessionRoute
 from core.tools.base import ToolContext
 from core.tools.registry import build_registry
 from core.tools.telegram_tool import send_message
@@ -124,49 +89,6 @@ HELP_WORDS = {"помощь", "help", "что ты умеешь", "что уме
 
 GREET_WORDS = {"привет", "здравствуй", "здравствуйте", "салют", "добрый день", "добрый вечер", "доброе утро", "hello", "hi", "хелоу"}
 
-#: The backend kind that answers from a persistent opencode session. It is the
-#: opencode ROUTE, never a member of the fallback chain -- see the module docstring.
-SESSION_KIND: Final = "opencode_session"
-#: The job type `core/async_worker.py` does not dispatch yet; todo 16 adds the
-#: branch. Until then the worker logs the failure, which is the sanctioned
-#: intermediate state rather than a silent loss.
-JOB_OPENCODE_REPLY: Final = "opencode_reply"
-#: The collector's ceiling, stated in the job rather than left to the reader. It
-#: is a ceiling and not a wait: `collect_reply` ends on the idle condition first.
-COLLECT_TIMEOUT_S: Final = 600.0
-#: What an escalating turn may spend on the transcript: reading it once, and per
-#: routing signal deleting the message the sweep found. It has already spent the
-#: whole voice budget, so this is small and absolute -- a server that will not
-#: answer here costs the answer, never the acknowledgement.
-MARKER_TIMEOUT_S: Final = 0.5
-#: What a brokered permission answer is spoken as. The title opencode supplies is
-#: deliberately absent: it is server-controlled, and it can be kilobytes long.
-PERMISSION_APPROVED: Final = "Принято, выполняю."
-PERMISSION_REFUSED: Final = "Отменяю."
-#: The agent turn carries the request in the user's own words, so the agent has
-#: it even when the voice model offered no hint.
-TASK_PREFIX: Final = "Пользователь попросил голосом: "
-
-
-@dataclass(frozen=True, slots=True)
-class HybridWiring:
-    """The opencode route's collaborators, as todo 18's composition root has them.
-
-    Grouped into one value because they are one thing: the route either exists
-    completely or is not used at all, and a half-wired route that silently
-    answered from the chain instead would be a bug nobody could see. `spec` is
-    carried because the brain needs `fast_model` and `summarize_model` from the
-    one place they are configured -- changing a model must stay a one-line edit in
-    `config/backends.json`. `broker` is optional so a deployment without todo 14
-    still routes; without it a pending ask is simply not answered here.
-    """
-
-    spec: BackendSpec
-    client: OpencodeClient
-    store: OcSessionStore
-    backend: OpencodeSessionBackend
-    broker: PermissionBroker | None = None
-
 
 class Brain:
     def __init__(
@@ -184,6 +106,7 @@ class Brain:
         self.logger = logger or logging.getLogger("r2d2.brain")
         self.registry = build_registry()
         self.opencode = opencode
+        self.session = SessionRoute(cfg, memory, worker, self.logger)
 
     def authorized(self, body: dict) -> bool:
         session = body.get("session", {})
@@ -250,14 +173,14 @@ class Brain:
         if new and (not low or low in GREET_WORDS):
             return GREETING, False
 
-        answered = await self._answer_permission(app_id, command)
+        answered = await self.session.answer_permission(self.opencode, app_id, command)
         if answered is not None:
             return answered, False
 
         wiring = self.opencode
         if wiring is not None and (await wiring.client.health()).reachable:
             try:
-                return await self._opencode_turn(wiring, app_id, command)
+                return await self.session.turn(wiring, app_id, command)
             except (BackendError, httpx.HTTPError) as exc:
                 # C1: a 200 whose body is a refusal arrives here, and it is a
                 # failure -- the chain below answers, and the refusal is never spoken.
@@ -267,245 +190,6 @@ class Brain:
                 )
         markup = request.get("markup") or {}
         return await self._chain_turn(app_id, command, bool(markup.get("dangerous_context")))
-
-    async def _answer_permission(self, app_id: str, command: str) -> str | None:
-        """What to speak for a brokered opencode ask, or None to carry on.
-
-        `unrelated` means there was no ask of ours, or the text is not an answer at
-        all, and it changes nothing -- the question is then answered normally and
-        the ask stays pending, which is the only way it can still be answered.
-        """
-        wiring = self.opencode
-        broker = wiring.broker if wiring is not None else None
-        if broker is None:
-            return None
-        verdict: PermissionVerdict = await broker.resolve_from_text(app_id, command)
-        match verdict:
-            case "approved":
-                return PERMISSION_APPROVED
-            case "rejected":
-                return PERMISSION_REFUSED
-            case _:
-                return None
-
-    async def _opencode_turn(self, wiring: HybridWiring, app_id: str, command: str) -> tuple[str, bool]:
-        """One turn in the user's own opencode session, or the ack for work started.
-
-        `complete()` resolves the session itself through the `ContextVar`, so the
-        store is consulted here for the two things it alone knows: which session
-        the agent turn belongs to, and whether this session has ever been used.
-
-        Every return below reports itself to the turn recorder, because this is the
-        PRIMARY route and the one whose latency decides whether we fit Alice's
-        4.5 s: a turn that reached opencode and said nothing is a turn nobody can
-        explain. `llm_ms` is measured around `complete()` alone -- `submit_task`
-        returns 204 with the work still to come, so timing it would put a worker's
-        queue in a field that means "the model answered".
-
-        The three branches that leave for the agent all return through
-        `_hand_to_agent`, which submits the work AND arms the collector that ships
-        the answer. Neither half is optional: submitting without collecting is the
-        agent working for nobody, and collecting without submitting is a collector
-        waiting for a turn that will never come.
-        """
-        rec = metrics.current()
-        rec.agent = wiring.spec.voice_agent
-        session_id = await wiring.store.resolve(app_id)
-        if not await self._prepare(wiring, app_id, session_id):
-            # C8: the first message in a fresh session costs 15.5-18.6s, so it is
-            # submitted to the agent and acknowledged rather than waited on.
-            self._handoff(rec, wiring)
-            return await self._hand_to_agent(wiring, app_id, session_id, command)
-        current_application_id.set(app_id)
-        try:
-            choice = await rec.measure(
-                wiring.backend.complete(
-                    [{"role": "user", "content": command}],
-                    timeout=self.cfg.r2d2_fast_deadline,
-                    model=wiring.spec.fast_model,
-                )
-            )
-        except OpencodeDeadlineExceeded:
-            # NOT aborted: the turn is still running server-side, and the collector
-            # fetches it. The work is submitted anyway, because at the deadline
-            # nobody can know whether the late voice turn will answer or ask for the
-            # agent -- and guessing that it will is what dropped every request that
-            # ran long: on the live run six laptop-control attempts all overran
-            # 3.2s and the agent saw none of them. The record stays a `deadline`,
-            # because the turn that outran the budget was the voice turn and
-            # `llm_ms` is its cost.
-            rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
-            rec.path = metrics.PATH_DEADLINE
-            return await self._hand_to_agent(wiring, app_id, session_id, command)
-        rec.answered(route=metrics.ROUTE_OPENCODE, model=choice.model, msgs=1, tools=())
-        decision = routing.parse_voice_reply(
-            choice.content, sentinel=self.cfg.r2d2_needs_agent_sentinel
-        )
-        if decision.kind == "speak":
-            return decision.spoken, False
-        self._handoff(rec, wiring)
-        return await self._hand_to_agent(
-            wiring, app_id, session_id, command, hint=decision.task_hint
-        )
-
-    async def _hand_to_agent(
-        self,
-        wiring: HybridWiring,
-        app_id: str,
-        session_id: str,
-        command: str,
-        *,
-        hint: str = "",
-    ) -> tuple[str, bool]:
-        """Give `r2d2-agent` the request, and arm the collector that ships its answer.
-
-        The one place this module submits a task or enqueues an `opencode_reply`
-        job, which is what makes "exactly one collector per turn" a property of the
-        code instead of a convention: the three branches that escalate -- C8, the
-        sentinel and the deadline -- cannot each grow a second, and a branch that
-        escalates cannot forget the collector, because returning the ack at all IS
-        this call.
-
-        `_collect_later` runs first and reads the transcript BEFORE the submit, so
-        the marker is the last message the session held while this turn was still
-        its own business: the collector then returns the agent's answer and can
-        never replay the conversation the user already had. It is also what deletes
-        the voice agent's routing signal, and that has to happen before the agent's
-        turn is queued -- an agent asked to work in a session whose newest message is
-        `[[NEEDS_AGENT]]` is an agent that answers with `[[NEEDS_AGENT]]`. Reading
-        it after the submit would race opencode's own write of the task message and
-        make the marker depend on which of the two arrived first.
-
-        A refused submit does not turn into a failed turn. The user has already been
-        told a result is coming, the collector is armed either way, and it still
-        ships whatever the session produces -- `NO_REPLY`'s "the agent did not
-        answer" when that is nothing. The reason is in this log line and in the
-        `jobs` row, not in an error spoken to a speaker who cannot act on it.
-        """
-        await self._collect_later(wiring, app_id, session_id)
-        suffix = f"\n{hint}" if hint else ""
-        try:
-            await wiring.backend.submit_task(session_id, f"{TASK_PREFIX}{command}{suffix}")
-        except (OpencodeError, httpx.HTTPError) as exc:
-            self.logger.warning(
-                "opencode %r: session %s of %s took no task from R2D2: %r. The collector is armed "
-                "and the user was acknowledged all the same, so the turn is not lost -- only the "
-                "work behind it is.",
-                wiring.spec.name, session_id, app_id, exc,
-            )
-        return self.cfg.r2d2_task_ack, False
-
-    @staticmethod
-    def _handoff(rec: metrics.Turn, wiring: HybridWiring) -> None:
-        """Record a turn that moves to the AGENT: the ack's own facts, not the voice's.
-
-        `msgs=1` and no tools are what the session route really sent (C3/U2: the
-        session already holds the conversation, and the voice protocol carries no
-        tool calls), and `escalated` is what makes the record read `path=escalate`
-        rather than `path=voice` -- the user was acknowledged, not answered, and
-        those are different facts about a 4.5 s turn.
-        """
-        rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.task_model, msgs=1, tools=())
-        rec.agent = wiring.spec.task_agent
-        rec.escalated = True
-
-    async def _prepare(self, wiring: HybridWiring, app_id: str, session_id: str) -> bool:
-        """Count the turn, summarise a long session once, and report whether it is warm.
-
-        The count is read BEFORE it is bumped, because zero is the C8 signal and
-        bumping first would make every session look warm.
-        """
-        count = await wiring.store.message_count(app_id)
-        if count > self.cfg.r2d2_session_soft_limit:
-            provider, model = routing.split_model(wiring.spec.summarize_model)
-            await wiring.client.summarize(session_id, provider=provider, model=model)
-            self.logger.info(
-                "opencode %r: summarised the session of %s after %d messages", session_id, app_id, count
-            )
-        await self.memory.touch_oc_session(app_id, message_delta=1)
-        return count > 0
-
-    async def _collect_later(self, wiring: HybridWiring, app_id: str, session_id: str) -> None:
-        """Take the routing signal out of the transcript, and hand the still-running
-        turn to the worker that ships the answer to Telegram.
-
-        Both halves read the session ONCE, and the order is the whole point. The
-        snapshot says which stored messages are routing signals and which is the
-        newest message that survives them; the signals are deleted, and only then
-        is the collector armed with the surviving id. Anchoring first and
-        deleting afterwards would leave the collector pointing at a message the
-        server no longer lists, and a marker it cannot position means "everything
-        in the session is newer" -- the entire conversation replayed into Telegram.
-
-        Deleting is not a repair of the user's transcript. Only ASSISTANT messages
-        carrying the sentinel are removed, so every utterance the user made and
-        every real answer survives; what goes is a control signal that the protocol
-        never meant to be conversation, and leaving it is what let one escalation
-        disable the agent path for good (the live run's `POST .../summarize`
-        answered `true` and compressed nothing, so no summariser could have saved
-        it). The escalation hint is not lost with the message: it is already part
-        of the task text submitted below.
-
-        Finding the marker costs one GET on a path that has already spent the
-        whole voice budget, and it is bounded: a server that will not answer here
-        loses the answer, never the acknowledgement. The deletes carry the same
-        bound, because they happen between the model's reply and the words Alice
-        is waiting for.
-        """
-        try:
-            records = await asyncio.wait_for(
-                wiring.client.list_messages(session_id), MARKER_TIMEOUT_S
-            )
-        except (TimeoutError, httpx.HTTPError, OpencodeError) as exc:
-            self.logger.warning(
-                "opencode %r: the turn in session %s of %s keeps running but cannot be "
-                "collected: %s", wiring.spec.name, session_id, app_id, exc,
-            )
-            return
-        sweep = routing.transcript_sweep(
-            records, sentinel=self.cfg.r2d2_needs_agent_sentinel
-        )
-        for message_id in sweep.signal_ids:
-            await self._erase_signal(wiring, app_id, session_id, message_id)
-        await self.worker.enqueue(
-            {
-                "type": JOB_OPENCODE_REPLY,
-                "application_id": app_id,
-                "session_id": session_id,
-                "since_message_id": sweep.since_message_id,
-                "timeout_s": COLLECT_TIMEOUT_S,
-            }
-        )
-
-    async def _erase_signal(
-        self, wiring: HybridWiring, app_id: str, session_id: str, message_id: str
-    ) -> None:
-        """Delete one stored routing signal, and say so loudly if it survived.
-
-        A failure here is not a failed turn: the user has already been
-        acknowledged, the collector is armed either way, and the agent's own
-        prompt tells it the token is the gateway's. What a failure does cost is
-        the guarantee, so it is logged with the reason rather than swallowed --
-        a session that keeps a signal is a session whose agent may start copying
-        it, and the operator is the one who can see that happening.
-        """
-        try:
-            removed = await asyncio.wait_for(
-                wiring.client.delete_message(session_id, message_id), MARKER_TIMEOUT_S
-            )
-        except (TimeoutError, httpx.HTTPError, OpencodeError) as exc:
-            self.logger.warning(
-                "opencode %r: the routing signal %s is still stored in session %s of %s and "
-                "the agent reads it as its own history: %s",
-                wiring.spec.name, message_id, session_id, app_id, exc,
-            )
-            return
-        if not removed:
-            self.logger.warning(
-                "opencode %r: asked to delete the routing signal %s from session %s of %s; the "
-                "server did not remove it, and the agent reads it as its own history",
-                wiring.spec.name, message_id, session_id, app_id,
-            )
 
     async def _chain_turn(self, app_id: str, command: str, dangerous: bool) -> tuple[str, bool]:
         rec = metrics.current()

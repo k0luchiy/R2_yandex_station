@@ -709,13 +709,13 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
    какой голосовой бюджет, поэтому ход с пустой сессией сразу уходит агенту, а
    пользователь получает подтверждение. Это и есть C8 в коде:
 
-```verbatim core/brain.py
+```verbatim core/session_route.py
         session_id = await wiring.store.resolve(app_id)
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
             self._handoff(rec, wiring)
-            return await self._hand_to_agent(wiring, app_id, session_id, command)
+            return await self.collector.hand_to_agent(wiring, app_id, session_id, command)
         current_application_id.set(app_id)
 ```
 
@@ -925,7 +925,7 @@ def title_for(application_id: str) -> str:
 | `core/backends/openai_compatible.py` | один OpenAI-совместимый клиент для `zen`, `openrouter`, `yandexgpt` |
 | `core/backends/opencode_session.py` | сессия opencode за обычным интерфейсом `Backend` плюс два агентных метода |
 | `core/backends/registry.py` | `kind` → конструктор, фильтр непригодных, порядок цепочки |
-| `core/brain.py` | один ход: маршрутизация, эскалация, фолбэк, замер |
+| `core/brain.py` | один ход: маршрутизация, фолбэк, замер |
 | `core/memory.py` | SQLite: `sessions`, `oc_sessions`, `pending_actions`, `jobs` |
 | `core/metrics.py` | одна запись на ход: `route`, `path`, `llm_ms`, `total_ms` |
 | `core/opencode/client.py` | 12 HTTP-маршрутов `opencode serve` |
@@ -938,6 +938,8 @@ def title_for(application_id: str) -> str:
 | `core/policies.py` | риск команды и разбор ответа «да/нет» |
 | `core/render.py` | ответ Алисе: `text`/`tts`, обрезка 1024, чистка markdown |
 | `core/routing.py` | сентинел эскалации и три guard'а против его озвучивания |
+| `core/session_collector.py` | эскалация: отдать ход агенту и вооружить сборщик ответа в Telegram |
+| `core/session_route.py` | ход в сессии opencode: C8, дедлайн, сентинел, `HybridWiring` |
 | `core/tools/arxiv_tool.py` | поиск статей на arxiv и сборка сводки |
 | `core/tools/base.py` | `ToolContext` и `ToolResult` |
 | `core/tools/laptop_tool.py` | заряд, память, аптайм, запуск приложений |

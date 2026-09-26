@@ -30,12 +30,12 @@ Three properties are load-bearing:
 * `deadline` -- the voice turn outran `r2d2_fast_deadline` and was handed to the
   collector, and `route=opencode` for the branch that answers from a session.
 
-Both of those belong to `Brain._opencode_turn`, which reports them itself since
-todo 18: it is the only branch that knows which agent spoke and whether the voice
-turn ran out of budget, so a recorder that could not be told would be a recorder
-nobody fills in. `docs/11-opencode-contract.md`'s measured p50 of 1.667 s against
-the 2.5 s budget is the number the record exists to keep watching, and it lands
-on that branch.
+Both of those belong to `core/session_route.py:SessionRoute.turn`, which reports
+them itself since todo 18: it is the only branch that knows which agent spoke and
+whether the voice turn ran out of budget, so a recorder that could not be told
+would be a recorder nobody fills in. `docs/11-opencode-contract.md`'s measured
+p50 of 1.667 s against the 2.5 s budget is the number the record exists to keep
+watching, and it lands on that branch.
 """
 
 from __future__ import annotations
