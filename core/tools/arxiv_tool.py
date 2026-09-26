@@ -6,7 +6,7 @@ import httpx
 from app.config import Config
 from core.backends.config_loader import load_backend_specs
 from core.backends.openai_compatible import BackendError
-from core.backends.registry import build_chain
+from core.backends.registry import build_chain, fallback_chain
 from core.tools.base import ToolContext, ToolResult
 
 SCHEMA = {
@@ -90,7 +90,11 @@ async def summarize_entries(cfg: Config, query: str, entries: list[dict]) -> str
     ]
     # The model now comes from the spec (the `gpt://folder/model` URI for
     # YandexGPT), which replaces the old `cfg.yandex_model_big_uri` override.
-    backends = build_chain(specs, chain)
+    # The session backend is filtered out the way `core/brain.py` filters it:
+    # this function has no `OpencodeWiring`, so handing `build_chain` an order
+    # that still contains `opencode` raises `BackendConfigError` instead of
+    # summarising -- which is every deployment where `R2D2_OC_PASSWORD` is set.
+    backends = build_chain(specs, fallback_chain(specs, chain))
     try:
         for backend in backends:
             try:

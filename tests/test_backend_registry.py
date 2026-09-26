@@ -16,7 +16,12 @@
 * `core.providers` is gone -- unimportable, and absent from disk;
 * `core/brain.py:_call_llm` walks the chain: built once per call, advancing to
   the next backend on `BackendError` or a timeout, ending in the same
-  recognisable `RuntimeError` the old provider factory produced.
+  recognisable `RuntimeError` the old provider factory produced;
+* the model the `openrouter` fallback is configured with is one a live sweep
+  actually saw answer -- because D8 was a configured id that had quietly stopped
+  existing (HTTP 404), which no structural assertion in this file could see: a
+  well-formed registry naming a model the provider no longer serves is
+  indistinguishable from a working one until a turn needs it.
 
 Nothing here opens a socket: the registry constructs backends, and an
 `OpenAICompatibleBackend` builds its `httpx.AsyncClient` only on first use, so
@@ -30,6 +35,7 @@ import json
 import logging
 from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import MappingProxyType
 
 import httpx
 import pytest
@@ -440,6 +446,97 @@ def test_drop_warning_never_embeds_a_credential_value(
         build_chain(loaded, BackendChain(order=("zen", "openrouter")))
     # Then
     assert SENTINEL not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# 11. the configured fallback model is one a live sweep saw answer
+# ---------------------------------------------------------------------------
+
+#: What a sweep has to see before an id may sit in `config/backends.json`.
+ANSWERS: str = "answers"
+#: Every free OpenRouter id the 2026-09-26 sweep called, and what it did.
+#: `qa/d8-openrouter-probe.md` holds the transcript -- request shapes, status
+#: codes, latencies and the provider's own words -- and this table is the part
+#: the suite depends on. Free ids are volatile: a row here goes stale, and the
+#: repair is to sweep again, never to delete the assertion.
+SWEEP: Mapping[str, str] = MappingProxyType(
+    {
+        # The id D8 found: absent from `GET /models`, HTTP 404 on completion.
+        "inclusionai/ling-3.0-flash:free": "HTTP 404, 'This model is unavailable for free'",
+        # The only id that answered every probe: 9 of 9, 0.84-4.35 s.
+        "inclusionai/ling-3.0-flash-sante:free": ANSWERS,
+        # HTTP 200 whose content is EMPTY: the reasoning ate the whole budget.
+        # Answering a status check is not answering a turn.
+        "inclusionai/ling-3.0-flash-fin:free": "HTTP 200, empty content, 0 of 5 one-word probes",
+        "liquid/lfm-2.5-2.6b:free": "HTTP 200, empty content, 0 of 5 one-word probes",
+        "cohere/north-mini-code:free": "HTTP 200, empty content, 0 of 3 one-word probes",
+        "poolside/laguna-xs-2.1:free": "HTTP 200, empty content, 0 of 3 one-word probes",
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free": (
+            "answers on 2 of 4 one-word probes, one draw 57.32 s"
+        ),
+        # Throttled or shedding, every time.
+        "google/gemma-4-31b-it:free": "HTTP 429 'Provider returned error', 6 of 6 probes",
+        "google/gemma-4-26b-a4b-it:free": "HTTP 429 'Provider returned error'",
+        "qwen/qwen3.8-27b:free": "HTTP 429 'Provider returned error', 6 of 6 probes",
+        "poolside/laguna-s-2.1:free": "HTTP 429 on 2 of 6 probes",
+        # Answered, but not inside a voice budget: an 82 s draw and a 55 s draw.
+        "nvidia/nemotron-3-ultra-550b-a55b:free": "answers, but one probe took 82.12 s",
+        "nvidia/nemotron-3.5-lightning:free": "answers, but one probe took 55.01 s",
+        "nvidia/nemotron-3-super-120b-a12b:free": "answers with its reasoning, not an answer",
+        "dots-studio/dots-3-note-preview:free": "HTTP 200 with empty content",
+        "nvidia/nemotron-3.5-content-safety:free": "HTTP 200 with empty content",
+        # Refused a plain completion: agentic harnesses only.
+        "thinkingmachines/inkling:free": "HTTP 403 'only available on agentic harnesses'",
+        "thinkingmachines/inkling-small:free": "HTTP 403 'only available on agentic harnesses'",
+    }
+)
+
+
+def unanswerable_fallback_models(document: dict) -> list[str]:
+    """Configured `openai_compatible` models the sweep did not see answer.
+
+    Keyed on the whole id, which is the string `config/backends.json` carries and
+    the one `GET /models` advertises: a model nobody swept under this exact id is
+    nobody swept, and widening the match would only widen the hole.
+    """
+    offenders = []
+    for entry in document["backends"]:
+        model = entry.get("model")
+        if entry.get("kind") != "openai_compatible" or not isinstance(model, str):
+            continue
+        outcome = SWEEP.get(model)
+        if outcome is not None and outcome != ANSWERS:
+            offenders.append(f"{model} ({outcome})")
+    return sorted(offenders)
+
+
+def test_the_configured_fallback_model_is_one_the_sweep_saw_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Given the shipped registry, loaded rather than read so the guard is on what
+    # the code would actually send
+    monkeypatch.setenv("YANDEX_FOLDER_ID", "")
+    monkeypatch.setenv("OPENROUTER_API_KEY", SENTINEL)
+    _, specs = load_backend_specs(Config(backends_path=SHIPPED))
+    # Then
+    assert unanswerable_fallback_models(SHIPPED_DOC) == []
+    assert SWEEP.get(specs["openrouter"].model) == ANSWERS, (
+        f"{specs['openrouter'].model} is not an id the sweep recorded as answering"
+    )
+
+
+def test_guard_rejects_a_configured_model_the_sweep_measured_failing() -> None:
+    # Given the registry as it stood when D8 was found: a well-formed entry whose
+    # model the provider had stopped serving
+    document = json.loads(json.dumps(SHIPPED_DOC))
+    for entry in document["backends"]:
+        if entry["name"] == "openrouter":
+            entry["model"] = "inclusionai/ling-3.0-flash:free"
+    # When / Then -- the 404 is named with the reason, not merely counted
+    assert unanswerable_fallback_models(SHIPPED_DOC) == [], "the shipped config is already wrong"
+    offenders = unanswerable_fallback_models(document)
+    assert len(offenders) == 1
+    assert "inclusionai/ling-3.0-flash:free" in offenders[0] and "404" in offenders[0]
 
 
 # ---------------------------------------------------------------------------

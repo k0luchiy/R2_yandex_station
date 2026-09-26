@@ -22,7 +22,7 @@
     {"name": "zen", "kind": "openai_compatible", "base_url": "https://opencode.ai/zen/v1",
      "api_key": "${R2D2_ZEN_KEY}", "model": "space-bunny-free", "auth_style": "bearer"},
     {"name": "openrouter", "kind": "openai_compatible", "base_url": "https://openrouter.ai/api/v1",
-     "api_key": "${OPENROUTER_API_KEY}", "model": "inclusionai/ling-3.0-flash:free", "auth_style": "bearer"},
+     "api_key": "${OPENROUTER_API_KEY}", "model": "inclusionai/ling-3.0-flash-sante:free", "auth_style": "bearer"},
     {"name": "yandexgpt", "kind": "openai_compatible",
      "base_url": "https://llm.api.cloud.yandex.net/foundationModels/v1",
      "api_key": "${YANDEX_API_KEY}", "model": "gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite-5",
@@ -73,6 +73,38 @@
 
 Поэтому рекомендации вида «возьми бесплатную `:free`-модель» здесь больше не
 работают, и в таблице фолбэков модели указаны явно, а не «выбери что хочешь».
+Но и «бесплатных моделей нет» было бы неправдой: ниже — свежий свип, а не
+пересказ старого замера.
+
+### 2.1 Свип бесплатных моделей OpenRouter: 26.09.2026
+
+Из 17 идентификаторов, которые `GET /models` отдаёт с бесплатным тарифом,
+**отвечает один**: `inclusionai/ling-3.0-flash-sante:free`, 9 проб из 9,
+0,84–4,35 с. Остальные шестнадцать либо отклоняются (HTTP 429, 403, 502), либо
+**молчат**: HTTP 200 с пустым `content`, потому что модель потратила бюджет
+токенов на рассуждение. Для голосового ассистента молчание равно отказу, поэтому
+в конфигурацию попал ответчик, а не «любая `:free`-строка».
+
+Прежний идентификатор `inclusionai/ling-3.0-flash:free` был в `config/backends.json`
+и **молчал**: HTTP 404, `This model is unavailable for free`. Ни один структурный
+тест этого не видел — запись была корректной, а провайдер её не обслуживал.
+Теперь измеренный свип лежит в `tests/test_backend_registry.py` и проверяется
+тестом, который падает, как только настроенный идентификатор начинает
+не отвечать; полный протокол с задержками и формулировками провайдера — в
+[qa/d8-openrouter-probe.md](../qa/d8-openrouter-probe.md).
+
+Три оговорки, из-за которых `openrouter` остаётся «последним резервом», а не
+вторым мозгом:
+
+* **бесплатный тариф ограничен 50 запросами в сутки** на этом ключе
+  (`free-models-per-day`, `X-RateLimit-Limit: 50`, измерено 26.09.2026);
+  исчерпанный лимит — HTTP 429, а не деградация;
+* **свободный идентификатор исчезает без предупреждения** — так и случилось с
+  предыдущим;
+* **длинный ответ в голосовой бюджет не помещается**: короткий вопрос
+  0,84–1,85 с — влезает в `r2d2_fast_deadline` = 3,2 с, а сводка на 1200 токенов
+  (4,0–4,4 с) уже нет. Фолбэк годится для короткого ответа и не годится для
+  длинного.
 
 ## 3. Состав цепочки фолбэков и их цена
 
@@ -80,7 +112,7 @@
 |---|---|---|---|
 | `zen` | `https://opencode.ai/zen/v1` | `space-bunny-free` | opencode-сервер поднят, но ход не прошёл (503, таймаут, отказ модели) |
 | `yandexgpt` | `https://llm.api.cloud.yandex.net/foundationModels/v1` | `gpt://<folder>/yandexgpt-lite-5` | Zen недоступен; серверы в РФ, низкая задержка |
-| `openrouter` | `https://openrouter.ai/api/v1` | `inclusionai/ling-3.0-flash:free` | последний резерв; бесплатная, поэтому самая капризная |
+| `openrouter` | `https://openrouter.ai/api/v1` | `inclusionai/ling-3.0-flash-sante:free` | последний резерв; единственная из 17 бесплатных, ответившая на все пробы (26.09.2026), поэтому самая капризная |
 
 Различия между ними — **схема авторизации**, а не разный код:
 `auth_style: "bearer"` шлёт `Authorization: Bearer <api_key>`, `auth_style:

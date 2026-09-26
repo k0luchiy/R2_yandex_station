@@ -30,6 +30,19 @@ filter runs BEFORE dispatch, so the shipped `opencode` entry (no
 `R2D2_OC_PASSWORD` on this machine) is skipped with a reason instead of taking
 the whole chain down. An empty result is a `BackendConfigError`, never `[]`.
 
+`fallback_chain(specs, chain)` is the one step every FALLBACK caller owes
+`build_chain`, and it lives here rather than in each caller because getting it
+wrong is not a degradation, it is a crash: the session backend is the one kind
+`build_backends` cannot construct without an `OpencodeWiring`, so an order that
+still contains it makes `build_chain` raise and takes every member of the chain
+down with it. `core/tools/arxiv_tool.py` learned that the hard way -- it passed
+the declared order through unfiltered, and every arxiv digest raised
+`BackendConfigError` in any deployment where `R2D2_OC_PASSWORD` is set.
+`core/brain.py` and `app/diagnostics.py` each filtered it themselves; the second
+copy of that filter is the first draft of this function, and
+`tests/test_arxiv_fallback_chain.py` compares the three call sites so the copies
+cannot drift apart silently.
+
 No log line or error message here embeds a field VALUE -- in this config file
 every value is a credential. Names, kinds and field names only.
 """
@@ -51,7 +64,7 @@ from core.backends.config_loader import (
 from core.backends.openai_compatible import OpenAICompatibleBackend
 from core.backends.opencode_session import OpencodeSessionBackend, OpencodeWiring
 
-__all__ = ["build_backends", "build_chain"]
+__all__ = ["SESSION_KIND", "build_backends", "build_chain", "fallback_chain"]
 
 log = logging.getLogger(__name__)
 
@@ -77,6 +90,11 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
     }
 )
 
+#: The one kind `build_backends` cannot construct without an `OpencodeWiring`.
+#: `core/brain.py` names it too, for the same reason it keeps its own inline copy
+#: of the filter below; `tests/test_arxiv_fallback_chain.py` compares the two.
+SESSION_KIND: Final[str] = "opencode_session"
+
 
 def _blocked_field(spec: BackendSpec) -> str | None:
     """The first field that makes this backend unusable, or None if it is usable.
@@ -88,6 +106,21 @@ def _blocked_field(spec: BackendSpec) -> str | None:
         if not getattr(spec, name):
             return name
     return None
+
+
+def fallback_chain(specs: Mapping[str, BackendSpec], chain: BackendChain) -> BackendChain:
+    """`chain` without the session backend: the order a FALLBACK caller walks.
+
+    The session backend is the primary route, not a chain member. It has just been
+    tried, so a second attempt on that host would spend budget the turn no longer
+    has, and it is the one kind `build_chain` cannot construct without an
+    `OpencodeWiring` -- so an order that still contains it makes `build_chain`
+    raise, and the raise takes every other member down with it.
+    """
+    return BackendChain(
+        order=tuple(name for name in chain.order if specs[name].kind != SESSION_KIND),
+        unused=chain.unused,
+    )
 
 
 def build_backends(

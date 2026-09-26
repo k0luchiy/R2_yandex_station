@@ -10,7 +10,7 @@
     {"name": "zen", "kind": "openai_compatible", "base_url": "https://opencode.ai/zen/v1",
      "api_key": "${R2D2_ZEN_KEY}", "model": "space-bunny-free", "auth_style": "bearer"},
     {"name": "openrouter", "kind": "openai_compatible", "base_url": "https://openrouter.ai/api/v1",
-     "api_key": "${OPENROUTER_API_KEY}", "model": "inclusionai/ling-3.0-flash:free", "auth_style": "bearer"},
+     "api_key": "${OPENROUTER_API_KEY}", "model": "inclusionai/ling-3.0-flash-sante:free", "auth_style": "bearer"},
     {"name": "yandexgpt", "kind": "openai_compatible",
      "base_url": "https://llm.api.cloud.yandex.net/foundationModels/v1",
      "api_key": "${YANDEX_API_KEY}", "model": "gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite-5",
