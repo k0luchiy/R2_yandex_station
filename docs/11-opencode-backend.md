@@ -590,7 +590,6 @@ assert ANSWERS == frozenset({"once", "reject"}) and DURABLE_GRANT not in ANSWERS
 ### 5.4 Откуда берётся вопрос, в зависимости от режима
 
 ```verbatim core/permissions.py
-KIND: Final = "opencode_permission"
 #: The plan's sweep cadence, and the window the operator dials with
 #: `r2d2_permission_timeout`.
 SWEEP_INTERVAL_S: Final = 30.0
@@ -934,7 +933,9 @@ def title_for(application_id: str) -> str:
 | `core/opencode/sse.py` | чтение `GET /event`: соединение, границы таймаутов, фильтр по сессии |
 | `core/opencode/sse_frames.py` | словарь событий opencode и разбор кадра SSE (`OpencodeEvent`, `turn_is_complete`) |
 | `core/opencode/wire.py` | типы и разбор ответов opencode, иерархия `OpencodeError` |
+| `core/pending_permission.py` | неотвеченный запрос как значение: `pending_actions` (`kind`, `as_record`/`from_record`) |
 | `core/permissions.py` | брокер `permission.asked`: вопрос, ответ, отказ по таймауту |
+| `core/permission_words.py` | шесть фраз, которые читает пользователь, и обрезка заголовка для лога |
 | `core/policies.py` | риск команды и разбор ответа «да/нет» |
 | `core/render.py` | ответ Алисе: `text`/`tts`, обрезка 1024, чистка markdown |
 | `core/routing.py` | сентинел эскалации и три guard'а против его озвучивания |

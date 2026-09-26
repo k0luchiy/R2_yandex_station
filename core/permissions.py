@@ -1,50 +1,20 @@
 """The permission broker: opencode asks, a human answers, nothing else (plan todo 14).
 
 opencode raises `permission.asked` *before* it runs a risky command and blocks the
-turn until somebody answers. R2D2 is on the other end of that block, so this is the
-narrowest and most dangerous seam in the project: a wrong answer here is arbitrary
-code execution on somebody's laptop. Everything below follows from that.
+turn until somebody answers, so a wrong answer here is arbitrary code execution.
 
-* **Two answers, and one of them is a trap.** The server also accepts a durable
-  grant and offers the mask for it in `properties.always` (U4 measured
-  `["echo *"]`); one such grant is not a per-turn answer but a RULE that outlives
-  the session. So the answer domain is the two-value `Literal` below, the client's
-  `respond_permission` is annotated with the same `Literal` and takes no third value
-  either, and the masks are LOGGED -- an operator has to see what one grant would
-  have bought -- and sent nowhere.
-* **Every ambiguous path refuses.** No answer, an unreachable server, a `200 false`,
-  a 404 for a session the server dropped, an ask whose stored clock cannot be read:
-  all end in `reject`, and the pending row is cleared even then, because an ask that
-  can never be answered is a confirmation the user cannot get out of.
-* **The ask is a row, not a variable.** It lives in `pending_actions.action_json`
-  with `kind: "opencode_permission"` (no schema change), which is what lets the
-  sweep find it after a crash, what keeps it out of the shell confirmation
-  `core/brain.py` writes into the same one-row-per-user table, and what makes the
-  row -- not a session binding -- the population the sweep enumerates.
-* **Both halves of the conversation are keyed by ONE `application_id`.** The row is
-  written under the id of the turn that raised the ask, so the answer is only ever
-  read under that same id -- which is why the Telegram ingress resolves its chat to
-  a *declared* application id (`app/main.py:tg_application_id`) instead of deriving
-  one from the chat id. A derived id is not merely a second session: it is an answer
-  delivered to a session the question was never asked in, and a second identity for
-  one human, whose two sessions then hold two halves of one conversation.
-* **A replayed event does not extend the window.** A second `permission.asked` for
-  an already-pending permission keeps the original `requested_at`; a second ask for a
-  *different* permission refuses the one it evicts, which by then nobody can answer.
+* **Two answers, one of them a trap.** The server also offers a durable grant in
+  `properties.always` -- a RULE, not a per-turn answer -- so the domain is the
+  two-value `Literal` below, the masks are LOGGED and never sent, no third typechecks.
 
-Alice cannot push, so the question goes to Telegram
-(`core.tools.telegram_tool.send_message`) and the answer comes back as text through
-`resolve_from_text`. Nothing here speaks and nothing here builds an Alice payload:
-there is no import of `core.render` in this file, and `on_permission_requested`
-returns `None`. Turn completion is `core.opencode.sse.turn_is_complete` and is
-deliberately not reimplemented: this module answers a permission id, not a turn.
+* **Every ambiguous path refuses**, and the row is cleared even then. A replayed ask
+  keeps the original clock; a different ask refuses the one it evicts.
 
-allow: SIZE_OK -- 326 pure LOC: 212 of code and 129 of docstring carrying the
-measured C5 contract and the fail-safe reasoning a reviewer of a module this
-dangerous is entitled to. The only separable piece is `PendingPermission`, and
-splitting it out would give it exactly one caller while `core/permissions.py`
-stays the import todos 15 and 18 pin -- the same trade `core/opencode/client.py`
-records, and the same profile `core/opencode/sse.py` carries at 315.
+* **One `application_id` per human**: the row is written and read under the id of
+  the turn that raised it, which is why the ingress declares one id per chat.
+
+Alice cannot push, so the question goes to Telegram and the answer returns as text;
+no `core.render` is imported, and the ask is `core/pending_permission.py`'s value.
 """
 
 from __future__ import annotations
@@ -52,9 +22,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from contextlib import suppress
-from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Final, Literal, TypeAlias
 
@@ -64,15 +33,21 @@ from app.config import Config
 from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeError
 from core.opencode.sse import EVENT_MODE
+from core.pending_permission import KIND, PendingPermission
+from core.permission_words import ACCEPTED, PREVIEW_CHARS, QUESTION, REFUSED, UNANSWERABLE, UNANSWERED, UNTITLED, preview
 from core.policies import confirmation_verdict
 from core.routing import for_human
 from core.tools.telegram_tool import send_message
 
+# `KIND` and `PREVIEW_CHARS` are imported for compatibility only: both were
+# reachable as `core.permissions.NAME` before the split and are used by the two
+# modules that now own them, so a caller reaching through this path still resolves.
+
 log = logging.getLogger(__name__)
 
 __all__ = [
-    "ANSWERS", "APPROVE_ONCE", "ASK_SOURCE", "DURABLE_GRANT", "PendingPermission",
-    "PermissionAnswer", "PermissionBroker", "PermissionVerdict", "REFUSE", "SWEEP_INTERVAL_S",
+    "ANSWERS", "APPROVE_ONCE", "ASK_SOURCE", "DURABLE_GRANT", "PendingPermission", "PermissionAnswer",
+    "PermissionBroker", "PermissionVerdict", "REFUSE", "SWEEP_INTERVAL_S",
 ]
 
 #: The whole answer domain. `respond_permission` carries the same `Literal` in
@@ -99,10 +74,6 @@ APPROVED: Final[PermissionVerdict] = "approved"
 REJECTED: Final[PermissionVerdict] = "rejected"
 UNRELATED: Final[PermissionVerdict] = "unrelated"
 
-#: The `kind` that marks a `pending_actions` row as this module's. The table holds
-#: one row per user and `core/brain.py` writes a shell confirmation into it, so a row
-#: without this key is somebody else's and is never answered here.
-KIND: Final = "opencode_permission"
 #: The plan's sweep cadence, and the window the operator dials with
 #: `r2d2_permission_timeout`.
 SWEEP_INTERVAL_S: Final = 30.0
@@ -117,84 +88,14 @@ ASK_SOURCE: Final[Mapping[str, str]] = MappingProxyType(
     }
 )
 
-#: The question, the four answers, and the label for an ask opencode described with
-#: nothing readable in it. Telegram is the only channel that can push, and these
-#: sentences are the whole user-facing contract of this module.
-QUESTION: Final = "Нужно подтверждение: {title}. Ответь в телеграм «да» или «нет»."
-ACCEPTED: Final = "Принято, выполняю: {title}."
-REFUSED: Final = "Отклонено: {title}."
-UNANSWERED: Final = "Подтверждение не получено, действие отклонено."
-UNANSWERABLE: Final = "Сервер не принял ответ, действие отклонено: {title}."
-UNTITLED: Final = "действие opencode"
-#: A logged ask is truncated as well as escaped: a title can be kilobytes long.
-PREVIEW_CHARS: Final = 120
-
-
-@dataclass(frozen=True, slots=True)
-class PendingPermission:
-    """One unanswered ask: which permission, what it wanted, and since when.
-
-    Frozen and hashed because it is a value: the whole module compares asks rather
-    than editing them, and the pending row is this object, not a loose dict.
-    """
-
-    session_id: str
-    permission_id: str
-    title: str
-    masks: tuple[str, ...]
-    requested_at: float
-
-    def is_same(self, other: PendingPermission) -> bool:
-        """Whether `other` is the same ask of the same permission, clock aside."""
-        return (self.session_id, self.permission_id) == (other.session_id, other.permission_id)
-
-    def as_record(self) -> dict[str, object]:
-        """The `pending_actions.action_json` blob -- the only place it is written.
-
-        The masks are stored for whoever reads the row, never to be sent: the wire
-        form of an answer is a single key holding one of the two values above, and
-        nothing else -- that is what keeps a durable grant off the wire.
-        """
-        return {
-            "kind": KIND,
-            "session_id": self.session_id,
-            "permission_id": self.permission_id,
-            "title": self.title,
-            "always": list(self.masks),
-            "requested_at": self.requested_at,
-        }
-
-    @classmethod
-    def from_record(cls, record: Mapping[str, object]) -> PendingPermission | None:
-        """The stored blob as a value, or `None` when it is not an ask we can answer.
-
-        Every accessor is total: the blob is free-form JSON written by this module,
-        by another feature and by older builds, so a row that cannot be read must
-        read as absent rather than raise mid-sweep. A missing or non-numeric clock
-        becomes `0.0`, which expires the ask: an age nobody can compute must not keep
-        a tool blocked for the rest of the session.
-        """
-        session_id = _text(record.get("session_id"))
-        permission_id = _text(record.get("permission_id"))
-        if record.get("kind") != KIND or session_id is None or permission_id is None:
-            return None
-        requested_at = record.get("requested_at")
-        return cls(
-            session_id=session_id,
-            permission_id=permission_id,
-            title=_text(record.get("title")) or "",
-            masks=_texts(record.get("always")),
-            requested_at=float(requested_at) if isinstance(requested_at, (int, float)) else 0.0,
-        )
-
 
 class PermissionBroker:
     """Turns an opencode permission ask into a human decision -- and only that.
 
     The four collaborators are the same ones todo 8 assembled: the pending row in
-    `Memory`, the opencode client, the operator's config, and Telegram. There is no
-    second source of truth for "what is waiting", because a broker that kept the ask
-    in a variable would forget it exactly when a restart matters most.
+    `Memory` (`core/pending_permission.py` -- a value, not a variable), the opencode
+    client, the operator's config, and Telegram. There is no second source of truth
+    for "what is waiting", and no variable that could forget an ask on a restart.
     """
 
     def __init__(
@@ -258,7 +159,7 @@ class PermissionBroker:
         log.info(
             "opencode permissions: %s must confirm %r; a durable grant (%s) would cover %s for "
             "the rest of the session and is never sent",
-            app_id, _preview(ask.title), DURABLE_GRANT, ", ".join(ask.masks) or "nothing",
+            app_id, preview(ask.title), DURABLE_GRANT, ", ".join(ask.masks) or "nothing",
         )
         await self._tell(QUESTION.format(title=ask.title or UNTITLED))
 
@@ -316,7 +217,7 @@ class PermissionBroker:
                 refused += int(landed)
             log.warning(
                 "opencode permissions: %s left the %r ask of session %s unanswered for %.0fs; %s",
-                app_id, _preview(ask.title), ask.session_id, self._window_s,
+                app_id, preview(ask.title), ask.session_id, self._window_s,
                 "it was refused" if landed else "the server did NOT take the refusal",
             )
             await self._tell(UNANSWERED if landed else UNANSWERABLE.format(title=ask.title or UNTITLED))
@@ -411,21 +312,3 @@ class PermissionBroker:
         if lock is None:
             lock = self._claims[app_id] = asyncio.Lock()
         return lock
-
-
-def _text(value: object) -> str | None:
-    """A `str`, or nothing: a wrong-typed value in a hand-writable blob must read as
-    absent rather than reach a URL."""
-    return value if isinstance(value, str) else None
-
-
-def _texts(value: object) -> tuple[str, ...]:
-    """The mask list as strings, dropping anything that is not one."""
-    return tuple(mask for mask in value if isinstance(mask, str)) if isinstance(value, list) else ()
-
-
-def _preview(text: str) -> str:
-    """A bounded title for a log record. Only the size is handled here: one line is
-    guaranteed by the `%r` the log calls render the title with, which escapes the
-    control characters a server-controlled string could carry."""
-    return text[:PREVIEW_CHARS]
