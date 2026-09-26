@@ -124,6 +124,8 @@ opencode/space-bunny-free через подписку opencode
 
 ### 5. Клиент opencode (`core/opencode/`)
 - `client.py` — 12 маршрутов `opencode serve` с явными таймаутами.
+- `transport.py` — соединение, которое эти маршруты делят: адрес, basic-auth,
+  `?directory=`, общее тело хода, non-2xx как исключение.
 - `sse.py` — чтение `GET /event` (глобальный поток, фильтр по `sessionID`),
   режимы `sse` / `poll` / `deny`.
 - `models.py` — проверка всех `model id` против каталога сервера на старте:

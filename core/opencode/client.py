@@ -2,46 +2,38 @@
 which timeout.
 
 Every endpoint was measured against a live `opencode serve` v1.18.32 in todo 1;
-`docs/11-opencode-contract.md` is the evidence and the ADOPTED lines in it are
-the contract this file implements. Three of its findings are honoured here
-because each one already broke something, and the vocabulary that implements
-them lives in `core.opencode.wire`:
+`docs/11-opencode-contract.md` is the evidence and the ADOPTED lines in it are the
+contract this file implements. This module is the CATALOGUE half of it: the routes
+the deployment sends, each with the body it sends and the reading of the answer.
+The other half -- the base URL, the credentials, the one `httpx.AsyncClient`, the
+`?directory=` scope (C6), the shared turn body, the non-2xx rule and the
+credential scrub -- is `core.opencode.transport.OpencodeTransport`, and this class
+is that class plus the routes. Keeping the routes HERE is not a free choice:
+`tests/test_docs.py` reads this file's source and takes the authoritative list of
+routes from every `_request("VERB", "path"...)` in it, in both directions against
+the endpoint table of `docs/11-opencode-backend.md`.
 
-* **C1** -- a 200 is not a reply: `info.error` carries the failure (403 free-tier,
-  402 no funds) inside an HTTP 200, so `reply_of` raises instead of returning an
-  empty answer. What this file adds is the model split that feeds the request.
-* **C6** -- the directory is the query parameter `?directory=<abs path>`; the same
-  key in the body is accepted with a 200 and silently ignored, and the server does
-  not validate the path at all, so `_scoped_params` refuses locally.
+**C1** is honoured here because it already broke something: a 200 is not a reply,
+`info.error` carries the failure (403 free-tier, 402 no funds) inside an HTTP 200,
+so `reply_of` raises instead of returning an empty answer, and the model split
+that feeds the request is validated against `GET /config/providers` at startup in
+plan todo 9.
+
 The deadline belongs to the caller and is enforced here, but the turn is NOT
 aborted when it expires: a cold first message in a fresh session measured
 15.5-18.6 s, far outside any voice budget, and a background collector fetches that
 result later, so aborting would destroy work already paid for. A refused model is
-the opposite case and must be loud: an unknown `modelID` is not an error at all
-(opencode substitutes another model and answers 200), so ids are validated
-against `GET /config/providers` at startup in plan todo 9.
-
-The configured password never leaves this module: scrubbed from every error
-excerpt, absent from every log line, absent from `repr`, and the `Authorization`
-header is never logged.
+the opposite case and must be loud.
 
 The value types and the error hierarchy live in `core.opencode.wire` and are
 re-exported here, so `core.opencode.client` stays the single import that todos 8,
 9 and 14 need.
-
-allow: SIZE_OK -- 326 pure LOC. The vocabulary half is already split out into
-`core.opencode/wire.py`; what is left is the 16 routes of the opencode wire
-contract in `docs/11-opencode-contract.md` (each 3-8 lines) plus 5 HTTP
-internals. The route set is fixed by that contract and by the API plan todos 8,
-9 and 14 call, and every route needs the same `_request`/`_scoped_params`, so
-there is no second class to split them into without duplicating those internals.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from collections.abc import Mapping
 from types import MappingProxyType
 from typing import Final, Literal
@@ -49,7 +41,10 @@ from urllib.parse import quote
 
 import httpx
 
-from core.backends.config_loader import BackendSpec
+# The base class, not a compatibility re-export: this file has no connection of
+# its own, and every route below reaches the socket, the credentials and the
+# `?directory=` scope through it.
+from core.opencode.transport import OpencodeTransport
 from core.opencode.wire import (
     MessageRecord,
     OpencodeDeadlineExceeded,
@@ -61,11 +56,9 @@ from core.opencode.wire import (
     OpencodeStatusError,
     SessionInfo,
     decode,
-    excerpt,
     records,
     reply_of,
     required_text,
-    split_model,
     text_of_parts,
 )
 
@@ -87,36 +80,13 @@ HEALTH_TIMEOUT_S: Final = 1.5
 DEADLINE_GRACE_S: Final = 0.5
 
 
-class OpencodeClient:
+class OpencodeClient(OpencodeTransport):
     """Sessions, turns and permissions on one `opencode serve` instance.
 
-    The `httpx.AsyncClient` is injectable so tests can drive every route through
-    `MockTransport`; without one, this client builds its own on first use (so
-    construction opens no socket) and `aclose()` closes exactly what it built.
+    One method per route of the wire contract in `docs/11-opencode-contract.md`,
+    each saying which verb and path it sends, what body, and how the answer is
+    read. The connection every one of them shares is `OpencodeTransport`'s.
     """
-
-    def __init__(
-        self, spec: BackendSpec, directory: str, *, client: httpx.AsyncClient | None = None
-    ) -> None:
-        self._name = spec.name
-        self._base_url = spec.base_url.rstrip("/")
-        self._directory = directory
-        self._timeout = spec.timeout
-        self._password = spec.password
-        self._auth: httpx.Auth | None = (
-            httpx.BasicAuth(spec.username, spec.password)
-            if spec.username and spec.password
-            else None
-        )
-        self._client = client
-        self._owns_client = client is None
-        log.info(
-            "opencode client: base_url=%s workspace=%s auth=%s",
-            self._base_url, directory, "basic" if self._auth is not None else "none",
-        )
-
-    def __repr__(self) -> str:
-        return f"OpencodeClient(base_url={self._base_url!r}, directory={self._directory!r})"
 
     async def health(self) -> OpencodeHealth:
         """`GET /global/health` -> `{healthy, version}`. Never raises.
@@ -311,75 +281,3 @@ class OpencodeClient:
         """`GET /agent` -> the agent definitions, for validating names at startup."""
         response = await self._request("GET", "/agent", params=self._scoped_params())
         return records(response, "the agent list")
-
-    async def aclose(self) -> None:
-        """Close the client only if this object created it.
-
-        An injected client stays open AND stays attached: dropping the reference
-        would make the next call build a real one and hit the network.
-        """
-        client = self._client
-        if client is not None and self._owns_client:
-            self._client = None
-            await client.aclose()
-
-    # -- internals ---------------------------------------------------------
-
-    def _turn_body(self, text: str, *, agent: str, model: str) -> dict[str, object]:
-        """The body both message routes send, per U2's ADOPTED line (C1, C6)."""
-        provider, model_id = split_model(model)
-        body: dict[str, object] = {
-            "model": {"providerID": provider, "modelID": model_id},
-            "parts": [{"type": "text", "text": text}],
-        }
-        if agent:
-            # An unknown agent is a 500 whose body explains nothing (the real
-            # reason is only in the server log under a `ref`), so an empty name
-            # is dropped rather than sent.
-            body["agent"] = agent
-        return body
-
-    def _scoped_params(self) -> Mapping[str, str]:
-        """The `?directory=` every session-scoped route needs -- checked locally (C6).
-
-        The server accepts a directory that does not exist and answers 200, so a
-        typo would hand the agent's file tools a root that is not there. The check
-        lives here, inseparable from the parameter it guards.
-        """
-        if not os.path.isdir(self._directory):
-            raise OpencodeError(
-                f"opencode {self._name}: workspace {self._directory!r} does not exist and the server "
-                "does not validate ?directory=, so no session-scoped request was sent"
-            )
-        return {"directory": self._directory}
-
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        timeout: float | None = None,
-        params: Mapping[str, str] | None = None,
-        json_body: object = None,
-    ) -> httpx.Response:
-        """One request: absolute URL, basic auth, explicit timeout, non-2xx raised."""
-        response = await self._http().request(
-            method,
-            f"{self._base_url}{path}",
-            params=params,
-            json=json_body,
-            auth=self._auth,
-            timeout=self._timeout if timeout is None else timeout,
-        )
-        if not response.is_success:
-            raise OpencodeStatusError(
-                f"opencode {self._name}: {method} {path} -> HTTP {response.status_code} ({excerpt(response, self._password)})",
-                status_code=response.status_code,
-            )
-        return response
-
-    def _http(self) -> httpx.AsyncClient:
-        """The shared client, built on first use so construction opens no socket."""
-        if self._client is None:
-            self._client = httpx.AsyncClient(timeout=self._timeout)
-        return self._client

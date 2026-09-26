@@ -88,7 +88,7 @@ fi
 query тоже принимается. Поэтому проверка живёт в клиенте, рядом с параметром,
 который она охраняет:
 
-```verbatim core/opencode/client.py
+```verbatim core/opencode/transport.py
     def _scoped_params(self) -> Mapping[str, str]:
         """The `?directory=` every session-scoped route needs -- checked locally (C6).
 
@@ -846,7 +846,7 @@ def turn_is_complete(events: Iterable[OpencodeEvent]) -> bool:
 | **C3** | `system` действует **на одно сообщение**. Системные промпты лежат в определениях агентов, а не в теле каждого запроса | `config/opencode/r2d2.opencode.json` |
 | **C4** | `tools` — это `Record<string, boolean>`, и он перекрывает `permission` агента на время хода. Но в `GET /agent` поле `tools` читается как `null`, а объявленный `tools` нормализуется в правила `permission` — проверять надо `permission` | `config/opencode/r2d2.opencode.json` |
 | **C5** | Строки событий точные: `server.connected`, `permission.asked`, `permission.replied`, `session.idle`, `message.part.delta`. События «ход завершён» **не существует**. `GET /event` глобальный — фильтровать по `properties.sessionID`. `always` не отправлять никогда. `server.heartbeat` идёт раз в **10,0 с**, поэтому граница чтения потока — `event_read_timeout`, а не голосовой `timeout` | `core/opencode/sse.py`, `core/opencode/sse_frames.py`, `core/permissions.py` |
-| **C6** | Каталог сессии — **query-параметр** `?directory=`. Тот же ключ в теле принимается с 200 и молча игнорируется, а сам путь сервер **не проверяет** — проверяет клиент | `core/opencode/client.py`, `core/opencode/session_store.py` |
+| **C6** | Каталог сессии — **query-параметр** `?directory=`. Тот же ключ в теле принимается с 200 и молча игнорируется, а сам путь сервер **не проверяет** — проверяет клиент | `core/opencode/transport.py`, `core/opencode/session_store.py` |
 | **C7** | `GET /session/{session_id}/message` возвращает `{info, parts}`, а не плоский список: чтение `role` верхнего уровня молча даёт `None`. Неизвестный агент — **500** с бесполезным телом; неизвестный `model id` — **не ошибка** | `core/opencode/wire.py`, `core/opencode/models.py` |
 | **C8** | Измеренная задержка: p50 1.667 с, p95 2.247 с, `r2d2_fast_deadline` = 3.2 с. **Первый ход в новой сессии — 15.5–18.6 с** и не должен стоять на синхронном голосовом пути | `app/config.py`, `core/brain.py` |
 
@@ -932,6 +932,7 @@ def title_for(application_id: str) -> str:
 | `core/opencode/session_store.py` | одна сессия на пользователя плюс сборщик зависших |
 | `core/opencode/sse.py` | чтение `GET /event`: соединение, границы таймаутов, фильтр по сессии |
 | `core/opencode/sse_frames.py` | словарь событий opencode и разбор кадра SSE (`OpencodeEvent`, `turn_is_complete`) |
+| `core/opencode/transport.py` | соединение с `opencode serve`: адрес, basic-auth, `?directory=` (C6), тело хода, non-2xx как исключение |
 | `core/opencode/wire.py` | типы и разбор ответов opencode, иерархия `OpencodeError` |
 | `core/pending_permission.py` | неотвеченный запрос как значение: `pending_actions` (`kind`, `as_record`/`from_record`) |
 | `core/permissions.py` | брокер `permission.asked`: вопрос, ответ, отказ по таймауту |
