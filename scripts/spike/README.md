@@ -12,8 +12,9 @@
 
 - venv репозитория рабочий: `.venv/bin/python` с `httpx` (`python -m py_compile` как
   проверка);
-- живой бинарь: `/home/koluchiy/.opencode/bin/opencode` (1.18.32). Не `/usr/bin/opencode`
-  (1.18.5) и не `~/.npm-global/bin/opencode` (1.18.21);
+- живой бинарь: `$HOME/.opencode/bin/opencode` (1.18.32) — тот, что кладёт
+  установочный скрипт opencode. Не `/usr/bin/opencode` (1.18.5) и не
+  `~/.npm-global/bin/opencode` (1.18.21);
 - свободный порт. В этом прогоне — **4598**;
 - Zen-учётка пользователя: opencode подхватывает её сам из
   `~/.local/share/opencode/auth.json`. **Читать, копировать и печатать её нельзя** и
@@ -44,7 +45,7 @@ cp scripts/spike/spike-config.opencode.json /tmp/r2d2-qa/spike-config/opencode.j
 cd /tmp/r2d2-qa/workspace
 OPENCODE_CONFIG_DIR=/tmp/r2d2-qa/spike-config \
 OPENCODE_LOG_LEVEL=warn \
-  /home/koluchiy/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4598 &
+  "$HOME/.opencode/bin/opencode" serve --hostname 127.0.0.1 --port 4598 &
 echo $! > /tmp/r2d2-qa/serve.pid
 ```
 
@@ -63,7 +64,7 @@ kill -TERM "$(cat /tmp/r2d2-qa/serve.pid)"
 ## Прогон пробника
 
 ```bash
-cd /home/koluchiy/Documents/R2_yandex_station
+cd "$(git rev-parse --show-toplevel)"
 .venv/bin/python scripts/spike/probe_opencode.py \
   --base-url http://127.0.0.1:4598 --out /tmp/r2d2-qa/spike.json
 ```
