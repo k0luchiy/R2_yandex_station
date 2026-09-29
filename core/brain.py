@@ -22,8 +22,18 @@ the deadline it may outrun and the Telegram collector are the other two modules.
   own guard, `routing.for_human`, because a collected answer is read out of the
   session rather than out of a model reply.
 
-`authorized()` is unchanged and is still the only thing between a network-exposed
-webhook and a stranger's laptop.
+`authorized()` is the only thing between a network-exposed webhook and a stranger's
+laptop, and it **fails closed**: a deployment that has not declared which Alice skill
+and which user it serves refuses every request, because an unconfigured value is not a
+match, it is an absence of a decision. The one exception is
+`Config.r2d2_allow_unauthenticated`, which exists so a developer can drive the voice
+path before the skill is registered, and which is named in a startup ERROR and in the
+health output rather than being something you find out from a stranger's request.
+
+The earlier form read "if a value is set, compare it", which made an empty value skip
+the check entirely -- and `.env.example` described the opposite of what the code did,
+so a deployment that believed the comment would have exposed an unauthenticated webhook
+controlling the machine, with the opencode agent and the `r2d2_do` shim behind it.
 """
 
 from __future__ import annotations
@@ -109,12 +119,22 @@ class Brain:
         self.session = SessionRoute(cfg, memory, worker, self.logger)
 
     def authorized(self, body: dict) -> bool:
+        """Whether this body came from the one skill and the one user we serve.
+
+        Fails closed on an undeclared id: a deployment with no `ALICE_SKILL_ID` or
+        no `ALICE_USER_ID` is a deployment that has not decided who it is for, and it
+        refuses rather than serving everyone. `r2d2_allow_unauthenticated` is the one
+        way past that, and it exists for driving the voice path before the skill is
+        registered -- not for production, which is why the startup check names it.
+        """
+        if self.cfg.r2d2_allow_unauthenticated:
+            return True
         session = body.get("session", {})
         skill_id = session.get("skill_id")
         user_id = (session.get("user") or {}).get("user_id")
-        if self.cfg.alice_skill_id and skill_id != self.cfg.alice_skill_id:
+        if not self.cfg.alice_skill_id or skill_id != self.cfg.alice_skill_id:
             return False
-        if self.cfg.alice_user_id and user_id != self.cfg.alice_user_id:
+        if not self.cfg.alice_user_id or user_id != self.cfg.alice_user_id:
             return False
         return True
 

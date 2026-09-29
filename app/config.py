@@ -33,8 +33,13 @@ class Config:
 
     alice_skill_id: str = ""
     alice_user_id: str = ""
+    #: Development only. Set it to serve the webhook before the Alice skill is
+    #: registered. `Brain.authorized` refuses everything otherwise, so a deployment
+    #: that forgets the two ids above is closed rather than open -- and the startup
+    #: check in `app/main.py` names this variable in the refusal it logs.
+    r2d2_allow_unauthenticated: bool = False
 
-    server_host: str = "0.0.0.0"
+    server_host: str = "127.0.0.1"
     server_port: int = 8080
 
     db_path: str = "db/sessions.db"

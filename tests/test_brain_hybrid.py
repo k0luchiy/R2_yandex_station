@@ -2104,6 +2104,94 @@ async def test_the_authorised_identity_is_answered(rig: Rig) -> None:
     assert rig.brain.authorized(alice_body(QUESTION)) is True
 
 
+@pytest.mark.parametrize("missing", ("alice_skill_id", "alice_user_id"))
+async def test_an_undeclared_identity_refuses_rather_than_admitting_everyone(
+    rig: Rig, missing: str
+) -> None:
+    """An unset id is an absence of a decision, not a wildcard.
+
+    The code used to read "if a value is set, compare it", so a blank variable
+    skipped the check and the webhook served whoever asked. Behind /webhook sit the
+    opencode agent and the `r2d2_do` shim, so that is the difference between a private
+    skill and a remote control for the machine.
+    """
+    # Given a deployment that has not declared one half of who it serves
+    setattr(rig.cfg, missing, "")
+    # When
+    verdict = rig.brain.authorized(alice_body(QUESTION))
+    # Then it refuses, and it refuses the body that would otherwise be served
+    assert verdict is False
+
+
+async def test_the_refusal_reaches_the_caller_and_touches_nothing_else(rig: Rig) -> None:
+    # Given the same undeclared deployment
+    rig.cfg.alice_skill_id = ""
+    # When a real question arrives over the wire
+    payload = await rig.ask(QUESTION)
+    # Then the caller is told, and nothing downstream ran
+    assert payload["response"]["text"] == "Доступ запрещён."
+    assert payload["response"]["end_session"] is True
+    assert rig.server.requests == []
+    assert rig.net.fallback_calls() == 0
+    assert rig.net.telegram == []
+
+
+async def test_the_development_escape_hatch_opens_the_door_it_names(rig: Rig) -> None:
+    # Given the one variable whose whole job is to bypass the check
+    rig.cfg.alice_skill_id = ""
+    rig.cfg.alice_user_id = ""
+    rig.cfg.r2d2_allow_unauthenticated = True
+    # When
+    verdict = rig.brain.authorized(alice_body(QUESTION))
+    # Then it admits, because that is what it is for
+    assert verdict is True
+    # And a declared deployment is unaffected by it either way
+    rig.cfg.r2d2_allow_unauthenticated = False
+    rig.cfg.alice_skill_id = SKILL_ID
+    rig.cfg.alice_user_id = USER_ID
+    assert rig.brain.authorized(alice_body(QUESTION)) is True
+
+
+def test_the_startup_refusal_names_the_variables_an_operator_has_to_set() -> None:
+    """A closed webhook that says nothing looks like a broken skill.
+
+    The message is the difference between "my skill stopped answering" and "I have
+    not told it who I am", so it must carry both variable names and the opt-in, and
+    it must not carry an id value.
+    """
+    from app.main import authorisation_posture
+
+    missing_skill = authorisation_posture(Config(alice_user_id=USER_ID))
+    assert missing_skill is not None
+    assert "ALICE_SKILL_ID" in missing_skill
+    assert "ALICE_USER_ID" not in missing_skill
+    assert "R2D2_ALLOW_UNAUTHENTICATED" in missing_skill
+
+    missing_user = authorisation_posture(Config(alice_skill_id=SKILL_ID))
+    assert missing_user is not None
+    assert "ALICE_USER_ID" in missing_user
+    assert "ALICE_SKILL_ID" not in missing_user
+
+    # A configured deployment is told nothing, because there is nothing to tell.
+    assert authorisation_posture(
+        Config(alice_skill_id=SKILL_ID, alice_user_id=USER_ID)
+    ) is None
+
+
+def test_the_development_escape_hatch_is_announced_as_the_risk_it_is() -> None:
+    from app.main import authorisation_posture
+
+    message = authorisation_posture(Config(r2d2_allow_unauthenticated=True))
+    assert message is not None
+    assert "ALICE_SKILL_ID" in message
+    assert "r2d2_do" in message
+
+
+def test_the_default_listener_is_loopback_not_the_world() -> None:
+    """A default of 0.0.0.0 plus a blank id is the combination this fix removes."""
+    assert Config().server_host == "127.0.0.1"
+
+
 # ---------------------------------------------------------------------------
 # 10. Concurrency
 # ---------------------------------------------------------------------------
@@ -2218,7 +2306,8 @@ async def test_a_brain_built_without_the_wiring_answers_from_the_chain(
     backends_path = tmp_path / "backends.json"
     backends_path.write_text(BACKENDS_JSON, encoding="utf-8")
     memory = await Memory(str(tmp_path / "sessions.db")).connect()
-    cfg = Config(backends_path=str(backends_path), telegram_chat_id="42")
+    cfg = Config(backends_path=str(backends_path), telegram_chat_id="42",
+                 alice_skill_id=SKILL_ID, alice_user_id=USER_ID)
     try:
         brain = Brain(cfg, memory, RecordingWorker(cfg, memory), logging.getLogger("r2d2.test"))
         # When a question arrives with no opencode route wired at all

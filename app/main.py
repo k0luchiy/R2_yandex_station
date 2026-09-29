@@ -133,6 +133,41 @@ async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
     return health
 
 
+def authorisation_posture(cfg: Config) -> str | None:
+    """What to tell the operator at startup about who this webhook serves, or `None`.
+
+    `Brain.authorized` fails closed, so an undeclared id is a closed webhook and not
+    an open one -- which is the safe state, and also a state that looks like a broken
+    skill to anyone who has not read the source. Saying it once, at startup, with the
+    variable names in the message, is what turns "my skill stopped answering" into
+    "I have not told it who I am".
+
+    Returns `None` when the deployment is configured, and a message when it is not.
+    The message is an operator instruction, not a diagnostic, so it is phrased as the
+    command to run and never mentions an id value.
+    """
+    if cfg.r2d2_allow_unauthenticated:
+        return (
+            "R2D2_ALLOW_UNAUTHENTICATED is set: /webhook answers ANY caller, and the "
+            "opencode agent and the r2d2_do shim are reachable behind it. Set "
+            "ALICE_SKILL_ID and ALICE_USER_ID and unset this before exposing the port."
+        )
+    missing = [
+        name for name, value in
+        (("ALICE_SKILL_ID", cfg.alice_skill_id), ("ALICE_USER_ID", cfg.alice_user_id))
+        if not value
+    ]
+    if not missing:
+        return None
+    return (
+        f"{' and '.join(missing)} not set: /webhook refuses every request, because an "
+        "undeclared id is nobody in particular. Register the private skill at "
+        "dialogs.yandex.ru, put its skill_id and your user_id in .env, and restart. "
+        "To drive the voice path before registering, set R2D2_ALLOW_UNAUTHENTICATED=1 "
+        "and keep the port on loopback."
+    )
+
+
 def build_app() -> FastAPI:
     cfg = Config.load()
 
@@ -159,12 +194,16 @@ def build_app() -> FastAPI:
         # backends `build_chain` could actually build, while `/health`'s `chain` is
         # the declared order minus the session backend. Two different numbers under
         # one name is how an operator concludes the health probe is lying.
+        auth = authorisation_posture(cfg)
+        if auth is not None:
+            logger.error("%s", auth)
         logger.info(
-            "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s",
+            "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s, alice=%s",
             cfg.resolved_db_path(),
             "wired" if route is not None else "unwired",
             route.models_label if route is not None else "none",
             fallback,
+            auth or "closed",
         )
         try:
             yield

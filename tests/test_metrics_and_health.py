@@ -134,6 +134,10 @@ SPOKEN: Final = "Собираю сводку, пришлю в телеграм."
 HELP_PREFIX: Final = "Я Р2Д2"
 ERROR_TEXT: Final = "Что-то пошло не так. Попробуй ещё раз."
 ACK: Final = Config().r2d2_task_ack
+#: The identity the rig declares. `Brain.authorized` fails closed, so a turn only
+#: reaches the metrics code once the deployment has said who it serves.
+SKILL_ID: Final = "skill-abc"
+USER_ID: Final = "user-xyz"
 
 #: `/diagnostics/providers` returns what the server said, unedited, so the fake's
 #: payloads are distinctive enough that a paraphrase could not pass for them.
@@ -418,7 +422,8 @@ def alice_body(command: str, app_id: str = "alice-app-1") -> dict[str, Any]:
         "session": {
             "new": False,
             "application": {"application_id": app_id},
-            "user": {"user_id": "user-1"},
+            "skill_id": SKILL_ID,
+            "user": {"user_id": USER_ID},
         },
         "version": "1.0",
     }
@@ -468,6 +473,8 @@ def environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 r2d2_event_poll_interval=0.05,
                 telegram_bot_token=TELEGRAM_TOKEN,
                 telegram_chat_id="4242",
+                alice_skill_id=SKILL_ID,
+                alice_user_id=USER_ID,
                 openrouter_api_key=OPENROUTER_KEY,
                 yandex_api_key=YANDEX_KEY,
                 yandex_folder_id=YANDEX_FOLDER,
