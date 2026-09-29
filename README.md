@@ -278,7 +278,7 @@ so the task can be collected before it runs. The action happened and the user wa
 told nothing, with nothing in the logs to say why. Every other `create_task` in
 the project kept its task; this was the one that did not, and it now does.
 
-**The type checker is advisory, and says so.** `mypy` reports **42** findings
+**The type checker is advisory, and says so.** `mypy` reports **43** findings
 over `app/`, `core/` and `opencode/`: 23 `union-attr` on a `Connection | None`
 in `core/memory.py` that no annotation narrows, 8 `valid-type` on
 dataclass-shaped callables used as types, 6 `arg-type` and 3 `assignment` from
