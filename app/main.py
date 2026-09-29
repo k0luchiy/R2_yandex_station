@@ -175,7 +175,7 @@ def build_app() -> FastAPI:
             "wired" if route is not None else "unwired",
             route.models_label if route is not None else "none",
             fallback,
-            auth or "closed",
+            "declared" if auth is None else "closed",
             status.reason,
             "declared" if telegram["declared"] else "unbound",
         )
