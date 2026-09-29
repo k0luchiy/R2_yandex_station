@@ -29,6 +29,37 @@ def _expand_home(value: str) -> str:
 
 @dataclass
 class Config:
+    """Every knob one deployment has, and the two rules that govern all of them.
+
+    One dataclass, loaded once from the environment by `Config.load`, is the whole
+    configuration surface: there is no second source of truth anywhere in R2D2. A
+    field is read through the uppercase of its name, so `r2d2_fast_deadline` is
+    `R2D2_FAST_DEADLINE`; a field with no environment variable is still settable in
+    `.env` and is there for the tests, not for an operator.
+
+    **Two of these fields are the difference between a private skill and a remote
+    control for the machine.** `alice_skill_id` and `alice_user_id` are how
+    `/webhook` knows who it is serving, and `Brain.authorized` refuses every request
+    while either is unset. A deployment that has not decided who it is for serves
+    nobody. `r2d2_allow_unauthenticated` is the single documented way past that, for
+    driving the voice path before a skill is registered, and startup says so in an
+    ERROR. Behind `/webhook` sit the opencode agent and the `r2d2_do` shim, so the
+    empty-value case is the one this class is shaped around.
+
+    The second rule is the fallback chain. `backends_path` points at
+    `config/backends.json`, which declares the backends and their order; a backend
+    left without a credential is dropped with a WARNING naming the field rather
+    than failing the process, because a dead primary should not mean a dead
+    assistant. What must not happen is a silent substitution of a model the
+    operator did not choose -- opencode answers an unknown `modelID` with HTTP 200
+    from a *different* model, which is finding C1 in `docs/11-opencode-contract.md`
+    and the reason `validate_models` exists.
+
+    Two path-shaped fields, `r2d2_workspace` and `r2d2_cli_path`, default to a home
+    reference rather than a machine, and are read through `resolved_workspace()` and
+    `resolved_cli_path()` so the `~` is expanded in one place.
+    """
+
     llm_provider: str = "openrouter"
     fallback_provider: str = ""
 
