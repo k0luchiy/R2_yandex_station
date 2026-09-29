@@ -1,4 +1,4 @@
-#!/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python
+#!@R2D2_REPO@/.venv/bin/python
 """R2D2's tools as a one-line-JSON CLI: the ONLY sanctioned path from the
 opencode agent to this machine (plan todo 11).
 
@@ -8,6 +8,18 @@ The installed copy lives at ``~/.r2d2/r2d2_do.py`` and is allowlisted in
 real ``ToolContext`` and calls an **existing** ``core/tools/*`` handler; no tool
 logic is reimplemented here -- ``shell`` in particular goes through
 ``shell_tool.handler`` and therefore ``core.policies.risk_level`` unchanged.
+
+THE VENV IS DISCOVERED, NEVER ASSUMED.  ``VENV_PY`` and the shebang above are
+one template -- ``@R2D2_REPO@`` is the checkout this file belongs to -- and
+``scripts/install.sh`` substitutes the real path into the copy it writes to
+``~/.r2d2/r2d2_do.py``.  A template is what makes this file portable: a
+committed absolute path is a path to somebody else's machine, and the failure it
+caused was measured -- ``os.execv`` on a missing interpreter raises before any
+handler runs, so the agent got a raw traceback on stderr and *nothing* on
+stdout, which is the one thing the contract below forbids.  A copy that was
+never substituted (run straight out of a checkout, or copied by hand) finds its
+own venv from ``__file__`` instead, and one that cannot is told to run the
+installer.  It is never re-exec'd into an interpreter that does not exist.
 
 STDOUT CONTRACT -- exactly one line of JSON, nothing else::
 
@@ -66,16 +78,70 @@ from typing import AsyncIterator, NoReturn
 # `sys.executable`, which resolves to /usr/bin/python3.13 for BOTH interpreters on
 # this machine and would let a dependency-less python3.13 skip the re-exec -- is
 # what actually answers "am I already inside the venv".
-VENV_PY = "/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python"
+EXIT_OK, EXIT_FAIL, EXIT_CONFIRM = 0, 1, 2
+
+#
+# `@R2D2_REPO@` below, and the shebang on line 1, are the SAME template: the
+# installer substitutes the checkout it was run from, so the committed file names
+# no machine. A plain string literal, not an f-string, because the test that pins
+# the contract reads this line out of the source and the shebang must be the same
+# text.
+VENV_PY = "@R2D2_REPO@/.venv/bin/python"
 VENV_DIR = Path(VENV_PY).parent.parent
 REPO_ROOT = VENV_DIR.parent
+#: A directory is believed to be this shim's checkout only if it holds the shim's
+#: own source, so an unrelated `$HOME/.venv` cannot redirect `core` imports at
+#: another project's tree.
+CHECKOUT_MARKER = Path("opencode") / "r2d2_cli" / "r2d2_do.py"
+
+
+def _own_venv() -> Path | None:
+    """The checkout's venv, found from `__file__` alone; `None` when there is none.
+
+    Nearest ancestor first, so a copy run straight out of a git clone -- never
+    substituted -- re-execs instead of dying in `os.execv`.
+    """
+    for base in Path(__file__).resolve().parents:
+        if not (base / CHECKOUT_MARKER).is_file():
+            continue
+        candidate = base / ".venv" / "bin" / "python"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _contract(ok: bool, text: str = "", *, needs_confirm: bool = False,
+              pending: object | None = None, error: str | None = None) -> dict[str, object]:
+    """The stdout contract as one object, for the guards that run before `ToolResult`."""
+    return {"ok": ok, "text": text, "needs_confirm": needs_confirm,
+            "pending": pending, "error": error}
+
+
+if not Path(VENV_PY).is_file():
+    # An unsubstituted copy: fall back to what `__file__` can prove. REPO_ROOT
+    # stays derived from the venv, because that derivation is the contract.
+    if (found := _own_venv()) is not None:
+        VENV_PY, VENV_DIR, REPO_ROOT = str(found), found.parent.parent, found.parent.parent.parent
+
 if os.environ.get("R2D2_DO_REEXEC") != "1" and Path(sys.prefix).resolve() != VENV_DIR.resolve():
+    if not Path(VENV_PY).is_file():
+        # Measured, not hypothetical: `os.execv` on a missing interpreter raises
+        # before any handler runs, and the agent is then handed a traceback on
+        # stderr and NOTHING on stdout -- the one output it cannot parse.
+        _msg = (f"no project venv at {VENV_PY}; run `bash scripts/install.sh` from the "
+                f"checkout, or invoke this shim through <checkout>/.venv/bin/python")
+        print(json.dumps(_contract(False, error=_msg), ensure_ascii=False), flush=True)
+        raise SystemExit(EXIT_FAIL)
     os.environ["R2D2_DO_REEXEC"] = "1"
-    os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__), *sys.argv[1:]])
+    try:
+        os.execv(VENV_PY, [VENV_PY, os.path.abspath(__file__), *sys.argv[1:]])
+    except OSError as exc:  # a venv that vanished between the check and the call
+        _msg = f"cannot re-exec into {VENV_PY}: {exc}"
+        print(json.dumps(_contract(False, error=_msg), ensure_ascii=False), flush=True)
+        raise SystemExit(EXIT_FAIL) from None
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-EXIT_OK, EXIT_FAIL, EXIT_CONFIRM = 0, 1, 2
 APPLICATION_ID_ENV = "R2D2_APPLICATION_ID"
 APPROVED_ENV = "R2D2_APPROVED_TOKEN"
 DEFAULT_APPLICATION_ID = "r2d2-cli"
@@ -101,8 +167,7 @@ try:
 except ImportError as exc:  # no project dependencies under this interpreter
     # The caller is an LLM, and a traceback on stderr with nothing on stdout is
     # the one failure it cannot act on -- so answer with the contract anyway.
-    _line = {"ok": False, "text": "", "needs_confirm": False, "pending": None,
-             "error": f"R2D2 is not importable here ({exc}); use {VENV_PY}"}
+    _line = _contract(False, error=f"R2D2 is not importable here ({exc}); use {VENV_PY}")
     print(json.dumps(_line, ensure_ascii=False), flush=True)
     raise SystemExit(EXIT_FAIL) from None
 
@@ -227,13 +292,11 @@ async def _dispatch(args: argparse.Namespace) -> ToolResult:
 
 
 def _payload(result: ToolResult) -> dict[str, object]:
-    return {
-        "ok": bool(result.ok),
-        "text": _redact(result.text),
-        "needs_confirm": bool(result.needs_confirm),
-        "pending": result.pending,
-        "error": _redact(result.error) if result.error else None,
-    }
+    return _contract(
+        bool(result.ok), _redact(result.text),
+        needs_confirm=bool(result.needs_confirm), pending=result.pending,
+        error=_redact(result.error) if result.error else None,
+    )
 
 
 def _emit(result: ToolResult) -> int:
