@@ -44,7 +44,9 @@ from fastapi.responses import JSONResponse
 
 from app import diagnostics
 from app.config import Config
+from app.diagnostics import TG_APPLICATION_ID_VAR
 from app.opencode_route import wire_opencode
+from app.route_status import route_status
 from core.async_worker import Worker
 from core.backends.config_loader import BackendConfigError, load_backend_specs
 from core.brain import Brain
@@ -57,10 +59,6 @@ logger = logging.getLogger("r2d2")
 
 #: What the owner runs when the gate below reports the server unreachable.
 LAUNCHER = "scripts/opencode_serve.sh"
-#: The variable that declares which human a Telegram chat belongs to. Named in the
-#: warning a chat with no binding gets, because the whole point of not inventing
-#: an identity is that the operator is told exactly which knob is missing.
-TG_APPLICATION_ID_VAR: Final = "R2D2_TG_APPLICATION_ID"
 #: What separates the `chat_id=application_id` pairs of that declaration.
 TG_BINDING_SEPARATORS: Final = re.compile(r"[,\s]+")
 
@@ -190,20 +188,43 @@ def build_app() -> FastAPI:
         # `opencode=wired`/`unwired` is the field that keeps this line from reading
         # as a guarantee: a startup that says only "started" is what an operator
         # with a dead opencode server (or a refused model) would take for a brain.
-        # The last field is `fallback` and NOT `chain` on purpose: these are the
-        # backends `build_chain` could actually build, while `/health`'s `chain` is
-        # the declared order minus the session backend. Two different numbers under
-        # one name is how an operator concludes the health probe is lying.
+        # `reason` is the same decision named, so "unwired" is never the whole
+        # answer -- it is one token of `app/route_status.py`'s vocabulary, and it
+        # says WHICH of the refusals this is. The last field is `fallback` and NOT
+        # `chain` on purpose: these are the backends `build_chain` could actually
+        # build, while `/health`'s `chain` is the declared order minus the session
+        # backend. Two different numbers under one name is how an operator
+        # concludes the health probe is lying.
         auth = authorisation_posture(cfg)
         if auth is not None:
             logger.error("%s", auth)
+        status = route_status()
+        telegram = diagnostics.telegram_binding(cfg)
+        if not telegram["declared"]:
+            # Discoverability, not a behaviour change: `/tg/webhook` already refuses
+            # an undeclared chat, and it must keep refusing. What was missing is
+            # that the deployment LOOKS complete while its headline feature is inert
+            # -- long results and permission questions never arrive, and the only
+            # symptom is a Telegram chat that answers nothing.
+            logger.warning(
+                "telegram: %s is empty, so no chat has an identity. Long results and "
+                "permission questions will not arrive, /tg/webhook drops every message with a "
+                "warning, and no identity is invented for it -- one chat, one application_id, "
+                "or a 'да' in Telegram cannot answer a question asked by voice. Declare %s='%s' "
+                "and restart (pairs are separated by commas or whitespace).",
+                TG_APPLICATION_ID_VAR, TG_APPLICATION_ID_VAR,
+                f"{diagnostics.TG_BINDING_FORMAT} for each chat",
+            )
         logger.info(
-            "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s, alice=%s",
+            "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s, alice=%s, reason=%s, "
+            "telegram=%s",
             cfg.resolved_db_path(),
             "wired" if route is not None else "unwired",
             route.models_label if route is not None else "none",
             fallback,
             auth or "closed",
+            status.reason,
+            "declared" if telegram["declared"] else "unbound",
         )
         try:
             yield

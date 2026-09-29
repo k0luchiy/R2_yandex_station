@@ -38,6 +38,7 @@ import httpx
 from fastapi.responses import JSONResponse
 
 from app.config import Config
+from app.route_status import route_status
 from core.backends.config_loader import BackendChain, BackendConfigError, BackendSpec
 from core.backends.registry import build_chain
 from core.brain import SESSION_KIND
@@ -49,8 +50,9 @@ from core.opencode.client import (
 )
 
 __all__ = [
-    "ClientFactory", "HEALTH_PROBE_TIMEOUT_S", "RegistryLoader", "UNREACHABLE",
-    "fallback_backends", "health_view", "probe_opencode", "providers_view", "unreachable",
+    "ClientFactory", "HEALTH_PROBE_TIMEOUT_S", "RegistryLoader", "TG_APPLICATION_ID_VAR",
+    "TG_BINDING_FORMAT", "UNREACHABLE", "fallback_backends", "health_view", "probe_opencode",
+    "providers_view", "route_view", "telegram_binding", "unreachable",
 ]
 
 log = logging.getLogger("r2d2")
@@ -61,6 +63,15 @@ HEALTH_PROBE_TIMEOUT_S: Final = 2.0
 #: The only body `/diagnostics/providers` answers 503 with, and the only error a
 #: caller has to parse.
 UNREACHABLE: Final = "opencode unreachable"
+#: The variable that declares which human a Telegram chat belongs to. Carried in
+#: the diagnostics body so an operator learns the NAME of the missing knob from
+#: the route they were already reading, instead of from a stranger's message that
+#: was silently dropped.
+TG_APPLICATION_ID_VAR: Final = "R2D2_TG_APPLICATION_ID"
+#: The exact shape of one declared pair, quoted in the same body. An id invented
+#: from a chat id is what this project refused to do, so the format is part of the
+#: answer: `chat_id=application_id`, pairs separated by commas or whitespace.
+TG_BINDING_FORMAT: Final = "chat_id=application_id"
 
 #: `(spec, directory) -> client`: what the composition root builds, handed in so
 #: the name `OpencodeClient` is resolved where it is imported.
@@ -129,13 +140,23 @@ async def health_view(
 async def providers_view(
     cfg: Config, load: RegistryLoader, factory: ClientFactory
 ) -> dict[str, object] | JSONResponse:
-    """The live `GET /config/providers` and `GET /agent` payloads, unedited.
+    """The live `GET /config/providers` and `GET /agent` payloads, unedited,
+    plus what this process made of them.
 
     Which models the server can reach and which agents it exposes is the pair of
     facts that decides whether a turn is answered or refused -- C1 measured a 403
     `FreeTierError` inside an HTTP 200 -- and neither is visible in a log line.
     An unparsed upstream body is never echoed back, so a 2xx the client cannot
     read is a 502 that says only that.
+
+    `route` and `telegram` are the two facts about THIS process rather than the
+    server, and they are the reason the route is reachable at all when it has
+    refused to wire: a server that answers, and an assistant that is nevertheless
+    not using it, looks exactly like a working deployment from the outside. They
+    are read from the recorded startup decision, not recomputed, so the body
+    cannot disagree with what the process is doing. The 503 and 502 bodies stay
+    one-field each: there is nothing to describe when the server is silent, and
+    that silence is the answer.
     """
     try:
         _chain, specs = load(cfg)
@@ -154,10 +175,60 @@ async def providers_view(
         return unreachable()
     finally:
         await client.aclose()
-    return {"providers": providers, "agents": agents}
+    return {
+        "providers": providers,
+        "agents": agents,
+        "route": await route_view(cfg, load),
+        "telegram": telegram_binding(cfg),
+    }
 
 
-async def fallback_backends(cfg: Config, load: RegistryLoader) -> list[str]:
+async def route_view(cfg: Config, load: RegistryLoader) -> dict[str, object]:
+    """The opencode wiring decision, and the backends that answer in its place.
+
+    `reason` is `app/route_status.py`'s closed vocabulary, so `"model-unknown"`
+    ("this server does not offer the model you configured"), `"models-unverified"`
+    ("it did not answer at startup") and an empty list under `fallback` ("and
+    nothing else can answer either") are three facts an operator can act on
+    separately -- which is the whole point, because the assistant is silent in all
+    three and they have nothing to do with each other.
+
+    The decision's `detail` is deliberately NOT here. It names the offending model
+    ids for a refusal, but `NO_WORKSPACE` and `REGISTRY_UNREADABLE` quote the very
+    paths this module's docstring forbids in a public body, and one reason is
+    enough to lose the other two. It is in the startup ERROR, which is where an
+    operator reads prose.
+    """
+    status = route_status()
+    return {
+        "wired": status.wired,
+        "models": list(status.models),
+        "reason": status.reason,
+        "fallback": await fallback_backends(cfg, load, loud=False),
+    }
+
+
+def telegram_binding(cfg: Config) -> dict[str, object]:
+    """Whether a Telegram chat has a DECLARED identity, and the exact declaration.
+
+    `declared` is deliberately not `bound`: resolving a chat to an `application_id`
+    is `app/main.py:tg_application_id`, and this body has no chat id to resolve.
+    What it reports is the deployment-level fact an operator is looking for when
+    the broker asks nothing and long results never arrive -- the variable is
+    empty, and while it is, `/tg/webhook` drops every message with a warning and
+    no `permission.asked` can be turned into a question.
+
+    No chat id, no application id and no token: this route is unauthenticated, and
+    the module docstring's rule is a count and a name, never an identity.
+    """
+    return {
+        "declared": bool(cfg.r2d2_tg_application_id.strip()),
+        "variable": TG_APPLICATION_ID_VAR,
+        "format": TG_BINDING_FORMAT,
+    }
+
+
+async def fallback_backends(cfg: Config, load: RegistryLoader, *, loud: bool = True) -> list[str]:
     """The names a turn can actually be answered by, or `[]` with the reason logged.
 
     Built through `build_chain`, so a backend with no credential or no model is
@@ -167,17 +238,22 @@ async def fallback_backends(cfg: Config, load: RegistryLoader) -> list[str]:
     excluded for the same reason `core/brain.py` excludes it: it is the route, not
     a fallback, and it is the one kind `build_chain` cannot build without the
     wiring this module does not have.
+
+    `loud=False` is for the unauthenticated diagnostics route, which a monitor may
+    poll every few seconds: an empty result is reported as `"fallback": []` in the
+    body, and repeating an ERROR on every poll would turn a read into a way to
+    fill the operator's log.
     """
     try:
         chain, specs = load(cfg)
     except BackendConfigError as exc:
-        log.error("backend chain: %s; every turn will answer with the graceful text", exc)
+        _no_brain(loud, exc)
         return []
     order = tuple(name for name in chain.order if specs[name].kind != SESSION_KIND)
     try:
         backends = build_chain(specs, BackendChain(order=order, unused=chain.unused))
     except BackendConfigError as exc:
-        log.error("backend chain: %s; every turn will answer with the graceful text", exc)
+        _no_brain(loud, exc)
         return []
     try:
         return [backend.name for backend in backends]
@@ -187,6 +263,14 @@ async def fallback_backends(cfg: Config, load: RegistryLoader) -> list[str]:
         # its pool at construction cannot leak one per startup.
         for backend in backends:
             await backend.aclose()
+
+
+def _no_brain(loud: bool, exc: BackendConfigError) -> None:
+    """The one ERROR this module owns, at the level the caller asked for."""
+    log.log(
+        logging.ERROR if loud else logging.INFO,
+        "backend chain: %s; every turn will answer with the graceful text", exc,
+    )
 
 
 def unreachable() -> JSONResponse:

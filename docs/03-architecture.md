@@ -23,6 +23,7 @@ uvicorn (FastAPI, локально на ноутбуке, порт 8099)
 │   ├─ GET  /diagnostics/providers → живой каталог opencode   │
 │   └─ app/opencode_route.py — сборка маршрута opencode:      │
 │          клиент → store → бэкенд → брокер → читалки событий │
+│      app/route_status.py  — решение «маршрут поднят? и почему»│
 ├────────────────────────────────────────────────────────────┤
 │  core/                                                      │
 │   ├─ brain.py        — один ход: маршрутизация и фолбэк     │
@@ -245,7 +246,7 @@ R2D2_TASK_ACK=Проверяю, пришлю в телеграм.
 R2D2_NEEDS_AGENT_SENTINEL=[[NEEDS_AGENT]]
 R2D2_VOICE_AGENT=r2d2-voice
 R2D2_TASK_AGENT=r2d2-agent
-R2D2_WORKSPACE=/home/koluchiy/r2d2-workspace
+R2D2_WORKSPACE=/home/<user>/r2d2-workspace
 R2D2_PERMISSION_TIMEOUT=300
 R2D2_BACKENDS_PATH=config/backends.json
 

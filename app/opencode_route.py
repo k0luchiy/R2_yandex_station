@@ -9,17 +9,25 @@ as the wiring:
 * **A model the server does not list is a silent brain swap (C1).** opencode
   substitutes a different model, answers HTTP 200, and the reply reads like a
   normal answer from a brain nobody chose. So `validate_models()` runs at startup
-  and a failure REFUSES the route: R2D2 keeps answering from the chain, and the
-  operator gets an ERROR naming the offending ids. That is the decision, and the
-  reason it is not fatal: the fallback chain exists for exactly this, and a config
-  typo must not take the voice assistant down. Refusing the ROUTE rather than only
-  logging is the other half of it -- a turn answered from a substituted model is
-  worse than a turn answered by the provider the owner configured.
+  and a failure REFUSES the route. That is the decision, and it is the same
+  decision for a deployment that is MISCONFIGURED and for one that is merely
+  UNCONFIGURED -- the shipped `config/backends.json` names a model id measured on
+  one machine, and a stranger's `opencode serve` has no reason to offer it.
+  Substituting a model to make the route work is the one thing that must not
+  happen: a silent swap is exactly the failure C1 was filed about, and the
+  alternative is already available -- the fallback chain, which is what the
+  design says a dead primary moves to. So the refusal STAYS, and what changed is
+  that it is now a *named* state (`RouteStatus.reason`) rather than one sentence
+  that reads the same whether the server is down, the model is absent or the
+  catalogue could not be read. An operator can only fix what the message
+  distinguishes.
 * **A server that is merely DOWN does not refuse the route.** The server is
   started by a systemd unit the owner controls, independently of this process, so
   refusing the wiring would mean a server started an hour later is ignored until
   R2D2 is restarted. The route is wired and marked unvalidated; the per-turn
-  `client.health()` in `core/brain.py` gates the actual routing.
+  `client.health()` in `core/brain.py` gates the actual routing. That is
+  `REASON_UNVERIFIED`: a *different* state from every refusal, and the one place
+  "wired" and "working" are not the same word.
 * **One `EventSource` per session, not one for the process.** `GET /event` is a
   GLOBAL stream (C5): it carries every session's events, and a reader that
   answered them all would answer a stranger's permission request on a stranger's
@@ -28,7 +36,8 @@ as the wiring:
   `SessionWatchingStore.resolve` is the one public method through which a new
   session can appear.
 
-allow: SIZE_OK -- 312 pure LOC, 126 of them docstrings carrying the C1/C5/C6
+allow: SIZE_OK -- 394 pure LOC, over the 250 ceiling because the C1 gate carries the
+closed vocabulary that names its outcomes, and most of that is docstrings recording
 decisions an operator has to be able to re-derive. The separable half is
 `SessionReaders` + `SessionWatchingStore` (the event fleet), and splitting it out
 would give `wire_opencode` an import whose only other caller is this module --
@@ -52,17 +61,40 @@ import httpx
 
 from app.config import Config
 from app.diagnostics import ClientFactory
+from app.route_status import (
+    CATALOGUE_UNREADABLE,
+    MODEL_UNCONFIGURED,
+    MODEL_UNKNOWN,
+    NO_BACKEND,
+    NO_WORKSPACE,
+    REGISTRY_UNREADABLE,
+    UNVERIFIED,
+    RouteStatus,
+    decide,
+)
 from core.backends.config_loader import BackendConfigError, BackendSpec, load_backend_specs
 from core.backends.opencode_session import OpencodeSessionBackend, OpencodeWiring
 from core.brain import HybridWiring
 from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeError, OpencodeHealth
+from core.opencode.models import (
+    OpencodeModelCheckFailed,
+    OpencodeModelUnconfigured,
+    OpencodeModelUnknown,
+)
 from core.opencode.session_store import OcSessionStore
 from core.opencode.sse import PERMISSION_ASKED, EventSource, OpencodeEvent
 from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker
 
-__all__ = ["OpencodeRoute", "SessionReaders", "SessionWatchingStore", "wire_opencode"]
+#: Re-exported so the wiring decision and its vocabulary stay one import from here:
+#: this is the module that makes them, and `app/route_status.py` exists to break a
+#: cycle, not to become the name an operator's tooling has to learn.
+__all__ = [
+    "CATALOGUE_UNREADABLE", "MODEL_UNCONFIGURED", "MODEL_UNKNOWN", "NO_BACKEND",
+    "NO_WORKSPACE", "REGISTRY_UNREADABLE", "OpencodeRoute", "RouteStatus", "SessionReaders",
+    "SessionWatchingStore", "UNVERIFIED", "decide", "route_status", "wire_opencode",
+]
 
 log = logging.getLogger("r2d2.opencode")
 
@@ -277,12 +309,13 @@ async def wire_opencode(
     health: OpencodeHealth | None,
     factory: ClientFactory,
 ) -> OpencodeRoute | None:
-    """Build the opencode route, or log the reason there is none. Never raises.
+    """Build the opencode route, or record the reason there is none. Never raises.
 
     `factory` is the composition root's `OpencodeClient` handed in rather than
     imported; `app/diagnostics.py` explains why the seam belongs to the caller.
     `None` means the route is NOT in use and every turn is answered by the chain --
-    a supported deployment, not a failure to boot.
+    a supported deployment, not a failure to boot, but never a silent one: the
+    reason is in `route_status()` before this returns, and at ERROR in the log.
     """
     spec = _spec(cfg)
     if spec is None:
@@ -291,7 +324,7 @@ async def wire_opencode(
         # C6: the server does not validate `?directory=`, so a workspace that is not
         # there would hand the agent's file tools a root that does not exist, and
         # every session request would fail -- one turn at a time, for ever.
-        return _refused(f"the workspace {cfg.r2d2_workspace!r} does not exist")
+        return _refused(NO_WORKSPACE, f"the workspace {cfg.r2d2_workspace!r} does not exist")
     client = factory(spec, cfg.r2d2_workspace)
     broker = PermissionBroker(memory, client, cfg)
     turns = TurnWatch()
@@ -299,12 +332,13 @@ async def wire_opencode(
     store = SessionWatchingStore(memory, client, cfg, readers)
     backend = OpencodeSessionBackend(spec, OpencodeWiring(client=client, store=store, cfg=cfg))
     await _reattach(readers, memory)
-    models = await _validated(backend, spec, reachable=bool(health and health.reachable))
-    if models is None:
-        return _refused(f"{spec.name!r} does not offer every model this deployment sends")
+    status = await _validated(backend, spec, reachable=bool(health and health.reachable))
+    if not status.wired:
+        return None
     wiring = HybridWiring(spec=spec, client=client, store=store, backend=backend,
                           broker=broker, turns=turns)
-    return OpencodeRoute(wiring=wiring, readers=readers, models=models)
+    decide(status)
+    return OpencodeRoute(wiring=wiring, readers=readers, models=status.models)
 
 
 # ---------------------------------------------------------------------------
@@ -313,7 +347,7 @@ async def wire_opencode(
 
 
 def _spec(cfg: Config) -> BackendSpec | None:
-    """The opencode backend's spec, or `None` with the cause already logged.
+    """The opencode backend's spec, or `None` with the cause already recorded.
 
     A missing one is an ERROR even though the chain-only deployment works: the
     shipped `config/backends.json` declares this backend and `.env.oc.example`
@@ -324,17 +358,29 @@ def _spec(cfg: Config) -> BackendSpec | None:
     try:
         _chain, specs = load_backend_specs(cfg)
     except BackendConfigError as exc:
-        log.error("opencode: cannot read %s: %s", cfg.backends_path, exc)
+        _refused(REGISTRY_UNREADABLE, f"cannot read {cfg.backends_path}: {exc}")
         return None
     spec = specs.get(BACKEND_NAME)
     if spec is None:
-        log.error("opencode: no %r backend in %s", BACKEND_NAME, cfg.backends_path)
+        _refused(NO_BACKEND, f"no {BACKEND_NAME!r} backend in {cfg.backends_path}")
     return spec
 
 
-def _refused(why: str) -> None:
-    """Say the route is not in use, in the one level an operator cannot miss."""
-    log.error("opencode: the brain route is NOT wired: %s", why)
+def _refused(reason: str, detail: str) -> None:
+    """Record and announce that the route is not in use. The only refusal path.
+
+    Says the one consequence it can honestly claim: the chain is what answers, and
+    no model is substituted for the one configured. Whether the chain HAS a
+    backend that can answer is not claimed here -- `fallback=` on the startup line
+    reports that, and claiming it here would be the misleading success this
+    replaces.
+    """
+    decide(RouteStatus(wired=False, reason=reason, detail=detail))
+    log.error(
+        "opencode: the brain route is NOT wired [%s]: %s. No model is substituted for the one "
+        "configured; the fallback chain is what answers, and the startup line's fallback= field "
+        "says whether it has a backend that can", reason, detail,
+    )
     return None
 
 
@@ -373,25 +419,40 @@ async def _reattach(readers: SessionReaders, memory: Memory) -> None:
 
 async def _validated(
     backend: OpencodeSessionBackend, spec: BackendSpec, *, reachable: bool
-) -> tuple[str, ...] | None:
-    """The verified model ids; `()` when unchecked, `None` when the route is refused.
+) -> RouteStatus:
+    """The C1 gate, as a decision. Never raises; never substitutes a model.
 
-    `None` and `()` are different on purpose: the first is "do not use this route",
-    the second is "use it, and say at startup that nobody could check the models".
+    Three refusal reasons, one per operator mistake, each with its own fix:
+
+    * `MODEL_UNKNOWN` -- the server answered and does not offer the id: a typo, or
+      the shipped `config/backends.json` naming a model measured elsewhere. The
+      message says so, because the file to edit is named in it.
+    * `MODEL_UNCONFIGURED` -- a slot is empty, so opencode would answer from ITS
+      own default. A different line, a different mistake.
+    * `CATALOGUE_UNREADABLE` -- `GET /config/providers` could not be read, so it is
+      UNKNOWN whether the models exist. Deliberately NOT `MODEL_UNKNOWN`: that
+      would send the operator after a config typo that is not the cause, which is
+      why `core/opencode/models.py` has a class for it.
+
+    `UNVERIFIED` is not a refusal: the route is wired, and the per-turn
+    `client.health()` in `core/brain.py` gates the actual routing.
     """
     if not reachable:
-        log.info(
-            "opencode: %r did not answer at startup, so %s is UNVALIDATED; every turn checks "
-            "liveness before it routes, and the models are checked when it does",
-            spec.name,
-            spec.fast_model,
+        detail = (
+            f"{spec.name!r} did not answer at startup, so {spec.fast_model!r} is UNVALIDATED; "
+            "every turn checks liveness before it routes, and the models are checked when it does"
         )
-        return ()
+        log.info("opencode: %s", detail)
+        return RouteStatus(wired=True, reason=UNVERIFIED, detail=detail)
     try:
-        return await backend.validate_models()
-    except (httpx.HTTPError, OpencodeError) as exc:
-        log.error(
-            "opencode: %r: the model ids this deployment sends are not all usable, and an "
-            "unknown modelID is answered 200 from a DIFFERENT model (C1): %s", spec.name, exc
+        return RouteStatus(wired=True, models=await backend.validate_models())
+    except (OpencodeModelUnknown, OpencodeModelUnconfigured) as exc:
+        _refused(
+            MODEL_UNKNOWN if isinstance(exc, OpencodeModelUnknown) else MODEL_UNCONFIGURED,
+            f"{exc} Read GET /config/providers and put a model it lists into config/backends.json",
         )
-        return None
+    except (OpencodeModelCheckFailed, httpx.HTTPError, OpencodeError) as exc:
+        # The third mode, and the one the old single sentence got wrong: the
+        # catalogue was never read, so nothing is known about the models.
+        _refused(CATALOGUE_UNREADABLE, f"{spec.name!r}: {exc}")
+    return RouteStatus(wired=False, reason=CATALOGUE_UNREADABLE)

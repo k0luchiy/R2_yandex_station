@@ -52,12 +52,26 @@ if opencode grows a new permission key.
 
 ## C1 — one model, because it is the only one that works
 
-`opencode/space-bunny-free` is the only model `opencode serve` accepts on this
-machine: every other free Zen model returns HTTP 200 with an inner 403
-`FreeTierError`, and paid models return an inner 402 because the Zen balance is
-empty. So the voice path, the task path and summarisation all use this one id,
-and the test asserts no other model id appears anywhere in the file. Funding
-Zen later changes three strings in `config/backends.json` and nothing here.
+`opencode/space-bunny-free` is the only model `opencode serve` accepts **on the
+machine this project was built on**: every other free Zen model returns HTTP 200
+with an inner 403 `FreeTierError`, and paid models return an inner 402 because
+the Zen balance is empty. So the voice path, the task path and summarisation all
+use this one id, and the test asserts no other model id appears anywhere in the
+file.
+
+**That is a measurement of one machine, not a property of opencode**, and the
+shipped `config/backends.json` inherits it: on a machine with a different
+account, a different balance or a different Zen catalogue, the id below is simply
+not offered. The consequence is deliberate and loud rather than silent — R2D2
+checks all three slots against `GET /config/providers` at startup and refuses the
+opencode route when the catalogue does not list them (`reason=model-unknown` in
+the startup line and in `/diagnostics/providers`), because an unknown `modelID`
+is answered **200 from a different model** and nobody would notice. Fixing it is
+three strings in `config/backends.json` and nothing here: run
+`curl -u opencode:… http://127.0.0.1:4599/config/providers` and put an id it lists
+into the `fast_model`, `task_model` and `summarize_model` slots. The steps are in
+[08-deployment.md](../docs/08-deployment.md) §2.5, the measurements in
+[11-opencode-contract.md](../docs/11-opencode-contract.md).
 
 ## C4 — assert on `permission`, never on `tools`
 
@@ -115,14 +129,24 @@ stack — 3.665 s and 4.13 s wall, the ack ahead of the question both times
 
 ### The 12 allowlisted commands
 
-The shim at `/home/koluchiy/.r2d2/r2d2_do.py` re-execs itself under the repo
-venv, so a model may spell the same tool three ways and all three must resolve:
+The shim re-execs itself under the repo venv, so a model may spell the same tool
+three ways and all three must resolve. Written here with placeholders, because
+the values are per-machine — the shim's path is whatever `R2D2_CLI_PATH` says
+(default `~/.r2d2/r2d2_do.py`) and the venv's is `<repo>/.venv/bin/python`:
 
 ```
-/home/koluchiy/.r2d2/r2d2_do.py *
-python3 /home/koluchiy/.r2d2/r2d2_do.py *
-/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *
+~/.r2d2/r2d2_do.py *
+python3 ~/.r2d2/r2d2_do.py *
+<repo>/.venv/bin/python ~/.r2d2/r2d2_do.py *
 ```
+
+**In `r2d2.opencode.json` those three patterns are absolute paths**, and they have
+to be: opencode matches the `bash` command string literally, so neither `~` nor
+`$HOME` would ever expand there. That makes the committed file specific to the
+machine whose paths it was written from — before deploying, replace every
+`/home/<user>` in it with the real `R2D2_CLI_PATH` and the real venv interpreter,
+or the three `allow` rules match nothing and every shim call escalates into a
+permission question.
 
 plus nine read-only status probes: `upower *`, `cat /sys/class/power_supply/*`,
 `df *`, `free *`, `uname *`, `hostname *`, `ps *`, `uptime`, `date`.
