@@ -10,6 +10,10 @@
 !.env.oc.example
 
 # Machine state and scratch output.
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
 db/
 .venv/
 .omo/

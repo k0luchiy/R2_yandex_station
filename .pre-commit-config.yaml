@@ -1,0 +1,56 @@
+# The fast subset: what a contributor should get an answer from in seconds,
+# before they have pushed anything.
+#
+# Not here, and why:
+#   * the full suite -- 979 tests, ~110 s. It belongs in CI, which runs it on
+#     three Python versions, not in a commit hook that blocks every save.
+#   * `ruff format` -- the repository is not formatted to ruff's style, and
+#     running it would be a 300-file diff.
+#   * mypy -- ~40 s and currently advisory (46 known findings, all in files
+#     this change could not edit). It runs in CI.
+#
+# Run it with the project venv active: `pre-commit install && pre-commit run`.
+# The pytest hook below uses `language: system`, so it uses whichever `python`
+# is on PATH, and it must be one that can import the project's dependencies.
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: check-added-large-files
+        args: [--maxkb=256]
+      - id: detect-private-key
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.16.9
+    hooks:
+      - id: ruff-check
+        args: [--exit-non-zero-on-fix, --output-format=full]
+        types_or: [python, pyi]
+
+  - repo: local
+    hooks:
+      - id: r2d2-consistency-guards
+        name: r2d2 docs/config consistency guards
+        entry: python -m pytest -q -p no:cacheprovider tests/test_docs.py tests/test_no_secrets_tracked.py
+        language: system
+        pass_filenames: false
+        always_run: true
+        # The repository's own two "is the world still consistent" guards, and
+        # the fastest ones it has. test_docs.py cross-checks the documents
+        # against the code (routes against the client, model ids against
+        # config/backends.json, permission values against
+        # config/opencode/r2d2.opencode.json, every module under core/ against
+        # the module table, and the README's doc table against docs/). It fails
+        # in about a second, which is the whole argument for a commit hook.
+        #
+        # test_no_secrets_tracked.py is the credential guard: 8 credential
+        # shapes, the live .env/.env.oc values, .env.example completeness, and
+        # the ignore rules proven with `git check-ignore` rather than by reading
+        # .gitignore. The second of its 13 tests skips when neither .env nor
+        # .env.oc exists -- which is the case in a fresh clone, and is why CI
+        # seeds a synthetic credential before running it. See .github/workflows/
+        # ci.yml for why, and do not remove that step.
