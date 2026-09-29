@@ -3,8 +3,9 @@
 `r2d2.opencode.json` is the source of truth. Install it with:
 
 ```sh
-bash scripts/install_r2d2_opencode_config.sh            # -> ~/.r2d2/opencode
-bash scripts/install_r2d2_opencode_config.sh --dest DIR # for tests and experiments
+bash scripts/install.sh                                  # the whole deployment
+bash scripts/install_r2d2_opencode_config.sh             # -> ~/.r2d2/opencode
+bash scripts/install_r2d2_opencode_config.sh --dest DIR  # for tests and experiments
 ```
 
 The opencode process is then started with `OPENCODE_CONFIG_DIR=~/.r2d2/opencode`
@@ -130,23 +131,43 @@ stack — 3.665 s and 4.13 s wall, the ack ahead of the question both times
 ### The 12 allowlisted commands
 
 The shim re-execs itself under the repo venv, so a model may spell the same tool
-three ways and all three must resolve. Written here with placeholders, because
-the values are per-machine — the shim's path is whatever `R2D2_CLI_PATH` says
-(default `~/.r2d2/r2d2_do.py`) and the venv's is `<repo>/.venv/bin/python`:
+three ways and all three must resolve. The committed patterns use the shim's own
+directory rather than a machine's home, and are written here with placeholders —
+the shim's path is whatever `R2D2_CLI_PATH` says (default `~/.r2d2/r2d2_do.py`)
+and the venv's is `<repo>/.venv/bin/python`:
 
 ```
-~/.r2d2/r2d2_do.py *
-python3 ~/.r2d2/r2d2_do.py *
-<repo>/.venv/bin/python ~/.r2d2/r2d2_do.py *
+*/.r2d2/r2d2_do.py *
+python3 */.r2d2/r2d2_do.py *
+*/.venv/bin/python */.r2d2/r2d2_do.py *
 ```
 
-**In `r2d2.opencode.json` those three patterns are absolute paths**, and they have
-to be: opencode matches the `bash` command string literally, so neither `~` nor
-`$HOME` would ever expand there. That makes the committed file specific to the
-machine whose paths it was written from — before deploying, replace every
-`/home/<user>` in it with the real `R2D2_CLI_PATH` and the real venv interpreter,
-or the three `allow` rules match nothing and every shim call escalates into a
-permission question.
+**Why they are globs and not absolute paths.** An absolute path is a path to one
+machine: it was `/home/<user>/.r2d2/r2d2_do.py` here, and on any other machine all
+three `allow` rules matched nothing, so the agent had **no tools at all** and every
+shim call escalated into a permission question. Substituting paths at install time
+is not available either, and for a hard reason rather than taste: the installed
+config must stay **byte-identical** to this file, because a stale installed copy
+keeps the *old* permission matrix alive and that matrix is R2D2's only defence
+(C2). `tests/test_r2d2_opencode_config.py::test_install_into_a_temp_dir_is_byte_identical`
+is what pins that. So portability has to live in the committed bytes.
+
+**What the glob does and does not widen.** opencode's matcher (`Wildcard.match`,
+transcribed in `tests/test_foreign_tool_surface.py`) is a general glob: `*`
+crosses `/`, and a trailing `" *"` is optional. So `*/.r2d2/r2d2_do.py *` matches
+`$HOME/.r2d2/r2d2_do.py` on any account, and it matches nothing that is not
+literally a `r2d2_do.py` inside a directory named `.r2d2` — the one directory
+`scripts/install.sh` creates. Creating a *different* `r2d2_do.py` to run instead is
+not free: it takes `edit` or an unlisted `bash` command, and both are `ask` on
+both agents. The failure mode is also the safe direction: if a future opencode
+ever stopped letting `*` cross `/`, these rules would match nothing and every call
+would become a question — not an allow.
+
+**What the shim itself has to carry.** The one thing a glob cannot express is
+*which checkout the shim's own imports come from*, so the shim does not hard-code
+it either: `VENV_PY` and the shebang carry an `@R2D2_REPO@` template, the
+installer substitutes the checkout it ran from, and a copy that was never
+substituted finds its venv from `__file__`. See `docs/08-deployment.md` §2.2.
 
 plus nine read-only status probes: `upower *`, `cat /sys/class/power_supply/*`,
 `df *`, `free *`, `uname *`, `hostname *`, `ps *`, `uptime`, `date`.

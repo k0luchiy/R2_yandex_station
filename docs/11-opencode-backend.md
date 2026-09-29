@@ -272,9 +272,9 @@ DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
         "grep": "allow",
         "bash": {
           "*": "ask",
-          "/home/koluchiy/.r2d2/r2d2_do.py *": "allow",
-          "python3 /home/koluchiy/.r2d2/r2d2_do.py *": "allow",
-          "/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *": "allow",
+          "*/.r2d2/r2d2_do.py *": "allow",
+          "python3 */.r2d2/r2d2_do.py *": "allow",
+          "*/.venv/bin/python */.r2d2/r2d2_do.py *": "allow",
           "upower *": "allow",
           "cat /sys/class/power_supply/*": "allow",
           "df *": "allow",
@@ -284,9 +284,9 @@ DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
           "ps *": "allow",
           "uptime": "allow",
           "date": "allow",
-          "/home/koluchiy/.r2d2/r2d2_do.py shell *": "deny",
-          "python3 /home/koluchiy/.r2d2/r2d2_do.py shell *": "deny",
-          "/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py shell *": "deny"
+          "*/.r2d2/r2d2_do.py shell *": "deny",
+          "python3 */.r2d2/r2d2_do.py shell *": "deny",
+          "*/.venv/bin/python */.r2d2/r2d2_do.py shell *": "deny"
         },
         "task": "deny",
         "skill": "deny",
@@ -346,9 +346,9 @@ prose после неё — нет, и это разговор, который �
         "grep": "allow",
         "bash": {
           "*": "ask",
-          "/home/koluchiy/.r2d2/r2d2_do.py *": "allow",
-          "python3 /home/koluchiy/.r2d2/r2d2_do.py *": "allow",
-          "/home/koluchiy/Documents/R2_yandex_station/.venv/bin/python /home/koluchiy/.r2d2/r2d2_do.py *": "allow",
+          "*/.r2d2/r2d2_do.py *": "allow",
+          "python3 */.r2d2/r2d2_do.py *": "allow",
+          "*/.venv/bin/python */.r2d2/r2d2_do.py *": "allow",
           "upower *": "allow",
           "cat /sys/class/power_supply/*": "allow",
           "df *": "allow",
