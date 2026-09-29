@@ -88,7 +88,7 @@
 prose. Ход агента начался после. Агент:
 
 ```
-r2d2-agent   bash   completed  {"command": "python3 /home/koluchiy/.r2d2/r2d2_do.py status 2>&1"}
+r2d2-agent   bash   completed  {"command": "python3 /home/<user>/.r2d2/r2d2_do.py status 2>&1"}
 ```
 
 и в Telegram (00:06:40):

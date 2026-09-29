@@ -24,7 +24,7 @@ import sys
 import time
 from dataclasses import replace
 
-sys.path.insert(0, "/home/koluchiy/Documents/R2_yandex_station")
+sys.path.insert(0, "/home/<user>/Documents/R2_yandex_station")
 
 from app.config import Config                                    # noqa: E402
 from core.backends.config_loader import load_backend_specs      # noqa: E402

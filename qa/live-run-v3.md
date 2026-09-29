@@ -44,15 +44,15 @@ directly, with a positive control in the same session.
 
 | | |
 |---|---|
-| opencode | `/home/koluchiy/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599`, started **fresh** (no hot reload), restarted once for the failure case |
+| opencode | `/home/<user>/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599`, started **fresh** (no hot reload), restarted once for the failure case |
 | opencode config | `~/.r2d2/opencode/opencode.json` (0600), **byte-identical** to `config/opencode/r2d2.opencode.json`; `r2d2-voice` 14 rules, `r2d2-agent` 16 including `"*_*": "deny"`; both prompts carry the D9 rule (voice rule 10, agent rule 8) — confirmed served live by `GET /diagnostics/providers` |
 | CLI shim | `~/.r2d2/r2d2_do.py` (0755), byte-identical to `opencode/r2d2_cli/r2d2_do.py` |
-| R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` sourced, plus `R2D2_TG_APPLICATION_ID='1087136471=t21-v3'` exported **for the process only** (`.env` untouched, as it is the owner's) |
-| workspace | `/home/koluchiy/r2d2-workspace` |
+| R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` sourced, plus `R2D2_TG_APPLICATION_ID='424242=t21-v3'` exported **for the process only** (`.env` untouched, as it is the owner's) |
+| workspace | `/home/<user>/r2d2-workspace` |
 | startup line | `R2D2 started, db=…/db/sessions.db, opencode=wired, models=opencode/space-bunny-free, fallback=['openrouter']` |
 | `application_id` | **`t21-v3`** for every Alice turn and for the Telegram chat. Two extra ids, `t21-v3b` and `t21-v3c`, were opened **only** for the D10 disambiguation and the D9 measurement, and are accounted for separately below |
 | `session_id` | **`ses_f235aebaeffeTZp7uX1Mp7FNe3`**, title `r2d2:alice:t21-v3` |
-| `db/sessions.db` before | 6 `oc_sessions` rows: `t21-live-proof-d`, `-e`, `-f`, `-g`, `t21-final`, `tg:1087136471`; all 6 reattached at startup, none rewritten |
+| `db/sessions.db` before | 6 `oc_sessions` rows: `t21-live-proof-d`, `-e`, `-f`, `-g`, `t21-final`, `tg:424242`; all 6 reattached at startup, none rewritten |
 | secrets | never printed. The one place a bot token appears (httpx INFO lines) is quoted as `bot<REDACTED>`; the raw logs stay in `/tmp/r2d2-qa/t21c/` and are **not** committed. The `curlrc` that held the server password was written 0600 and **deleted** at the end |
 | `~/.config/opencode/` | never written; the owner's other opencode processes were never signalled |
 
@@ -63,7 +63,7 @@ GET /global/health                -> {"healthy":true,"version":"1.18.32"}
 GET /session?limit=1000           -> 200 sessions   (the default limit is 100 and
                                      silently truncates; limit is required for
                                      an honest count)
-GET /session?directory=/home/koluchiy/r2d2-workspace&limit=1000 -> 9 sessions
+GET /session?directory=/home/<user>/r2d2-workspace&limit=1000 -> 9 sessions
 sessions with an "r2d2:" title    -> 17
 ```
 
@@ -213,15 +213,15 @@ supposed to carry.
 ### 4a — the ask arrives through R2D2's own reader, for the first time
 
 Command: `Выполни в терминале ровно эту команду и перескажи её результат своими
-словами: ls -la /home/koluchiy/r2d2-workspace`
+словами: ls -la /home/<user>/r2d2-workspace`
 
 ```
 {"response":{"text":"Проверяю, пришлю в телеграм.", …},"version":"1.0"}
 http=200 time_total=3.725124
 
 12:41:02,116 INFO r2d2 turn route=opencode path=escalate model=opencode/space-bunny-free agent=r2d2-agent llm_ms=3240 total_ms=3721 escalated=True permission_asked=False msgs=1 tools=()
-12:41:05,874 INFO core.opencode.sse opencode sse: permission.asked ls -la /home/koluchiy/r2d2-workspace
-12:41:05,886 INFO core.permissions opencode permissions: t21-v3 must confirm 'ls -la /home/koluchiy/r2d2-workspace'; a durable grant (always) would cover ls * for the rest of the session and is never sent
+12:41:05,874 INFO core.opencode.sse opencode sse: permission.asked ls -la /home/<user>/r2d2-workspace
+12:41:05,886 INFO core.permissions opencode permissions: t21-v3 must confirm 'ls -la /home/<user>/r2d2-workspace'; a durable grant (always) would cover ls * for the rest of the session and is never sent
 12:41:06,676 INFO httpx HTTP Request: POST https://api.telegram.org/bot<REDACTED>/sendMessage "HTTP/1.1 200 OK"
 ```
 
@@ -231,8 +231,8 @@ R2D2) recorded the same frame on the wire:
 ```json
 {"id":"evt_0dca91dce001oPumCeg7p3kLSI","type":"permission.asked","properties":{
   "id":"per_0dca91dcd0017YE2YM5bRcTJ6X","sessionID":"ses_f235aebaeffeTZp7uX1Mp7FNe3",
-  "permission":"bash","patterns":["ls -la /home/koluchiy/r2d2-workspace"],
-  "metadata":{"command":"ls -la /home/koluchiy/r2d2-workspace"},"always":["ls *"],
+  "permission":"bash","patterns":["ls -la /home/<user>/r2d2-workspace"],
+  "metadata":{"command":"ls -la /home/<user>/r2d2-workspace"},"always":["ls *"],
   "tool":{"messageID":"msg_0dca90fc0001l5Wc3nOOEgHiJE","callID":"call_function_oo5hyk4hzj89_1"}}}
 ```
 
@@ -242,7 +242,7 @@ and the pending row landed keyed by the **Alice** `application_id`:
 sqlite> select application_id, action_json from pending_actions;
 t21-v3 | {"kind": "opencode_permission", "session_id": "ses_f235aebaeffeTZp7uX1Mp7FNe3",
           "permission_id": "per_0dca91dcd0017YE2YM5bRcTJ6X",
-          "title": "ls -la /home/koluchiy/r2d2-workspace", "always": ["ls *"],
+          "title": "ls -la /home/<user>/r2d2-workspace", "always": ["ls *"],
           "requested_at": 1790408465.8745213}
 ```
 
@@ -250,7 +250,7 @@ t21-v3 | {"kind": "opencode_permission", "session_id": "ses_f235aebaeffeTZp7uX1M
 
 ```
 $ curl -s http://127.0.0.1:8099/tg/webhook -H 'Content-Type: application/json' \
-    -d '{"message":{"chat":{"id":1087136471},"text":"да"}}' -w '\nhttp=%{http_code} time_total=%{time_total}\n'
+    -d '{"message":{"chat":{"id":424242},"text":"да"}}' -w '\nhttp=%{http_code} time_total=%{time_total}\n'
 {"ok":true}
 http=200 time_total=1.190040
 
@@ -267,8 +267,8 @@ The independent tap recorded what the **server** accepted:
 The pending row was gone afterwards, and the command then ran:
 
 ```
-[20] assistant r2d2-agent 12:41:02 → 12:42:00  tool bash status=completed  {"command":"ls -la /home/koluchiy/r2d2-workspace"}
-[21] assistant r2d2-agent 12:42:00 → 12:42:09  "## Результат `ls -la /home/koluchiy/r2d2-workspace` …"
+[20] assistant r2d2-agent 12:41:02 → 12:42:00  tool bash status=completed  {"command":"ls -la /home/<user>/r2d2-workspace"}
+[21] assistant r2d2-agent 12:42:00 → 12:42:09  "## Результат `ls -la /home/<user>/r2d2-workspace` …"
 ```
 
 and the report was collected (job `44e03d5b5c13`, 71.2 s) and delivered to
@@ -277,7 +277,7 @@ Telegram (`sendMessage` 200 at 12:42:13.854, 0.5 s after the job closed).
 The `да` was answered in the **Alice** session `ses_f235aebaeffeTZp7uX1Mp7FNe3`,
 not in a Telegram-derived one: `POST /session` was issued **3** times in the whole
 run, once per `application_id` used, and never for a `да`. The stale
-`tg:1087136471` row from attempt 1 was reattached at startup and never used.
+`tg:424242` row from attempt 1 was reattached at startup and never used.
 
 ### 4c — a second full loop, same session
 
@@ -286,7 +286,7 @@ Command: `Скачай страницу https://example.com инструмент
 raised, and:
 
 ```
-$ curl -s …/tg/webhook -d '{"message":{"chat":{"id":1087136471},"text":"да"}}' …
+$ curl -s …/tg/webhook -d '{"message":{"chat":{"id":424242},"text":"да"}}' …
 {"ok":true}   http=200 time_total=1.197189
 
 12:52:25,279 POST http://127.0.0.1:4599/session/ses_f235aebaeffeTZp7uX1Mp7FNe3/permissions/per_0dcb2570e0019y23qjoEVIdqZX → 200
@@ -341,7 +341,7 @@ call of any kind from either agent in that turn. The agent's own report, job
 > - **Мои правила требуют**, чтобы действия с системой и приложениями шли строго через `r2d2_do` …
 
 `r2d2_do` is a **CLI**, not a tool. The matrix would allow it
-(`{"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2_do.py *","action":"allow"}`,
+(`{"permission":"bash","pattern":"/home/<user>/.r2d2/r2d2_do.py *","action":"allow"}`,
 served live by `/diagnostics/providers`), but the agent looked for a *tool* of
 that name, found none, and treated the prompt's rule 2 as a prohibition on the
 one path that would have worked. It had `Bash` in hand and chose not to use it.
@@ -386,7 +386,7 @@ where it came from. The turn that produced it:
      input {"command":"command -v curl && curl -s … http://export.arxiv.org/api/query?…"}
      error  "The user has specified a rule which prevents you from using this specific tool call.
              Here are some of the relevant rules [{…},{"permission":"bash","pattern":"*","action":"deny"},
-             {"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2_do.py *","action":"allow"}, …]"
+             {"permission":"bash","pattern":"/home/<user>/.r2d2/r2d2_do.py *","action":"allow"}, …]"
 [28] user      r2d2-agent 12:44:13  Пользователь попросил голосом: Сделай сводку статей с arxiv …
 [29] assistant r2d2-agent 12:44:22 → 12:44:38  "## Не выполнено — доступ к сети у меня закрыт"
 ```
@@ -437,7 +437,7 @@ plan's ordering is therefore not what broke scenario 6.** Two other things did:
 * **D13**, below: the collector had already closed at 8.2 s with the agent's
   *first sentence*, so even a completed digest would not have been delivered.
 * and, in this probe only, the ask could not be answered at all: the chat is
-  bound to `t21-v3`, so a `да` from chat 1087136471 is routed to `t21-v3`'s
+  bound to `t21-v3`, so a `да` from chat 424242 is routed to `t21-v3`'s
   broker, which had no pending row, and was answered as an ordinary question.
   That is the D3 design working as written — one chat, one identity — and it is
   a limitation of running a probe under a second id, not a defect.
@@ -500,7 +500,7 @@ Measured against this server's own catalogue: `webfetch` **allow**,
 `websearch` **allow**, `task` **ask**, `bash` **ask** for `r2d2-agent`.
 
 **Positive control, same session, before the refusal:** message `[20]` —
-`tool bash status=completed`, `{"command":"ls -la /home/koluchiy/r2d2-workspace"}`,
+`tool bash status=completed`, `{"command":"ls -la /home/<user>/r2d2-workspace"}`,
 followed by a 1768-character report the user received. The agent used a tool
 successfully in this session. The refusal is the discriminating variable.
 
@@ -537,7 +537,7 @@ Measured at the end of the six-scenario run, before any probe:
 | | before | after | delta |
 |---|---|---|---|
 | `GET /session?limit=1000` (all projects) | **200** | **201** | **+1** |
-| `GET /session?directory=/home/koluchiy/r2d2-workspace&limit=1000` | **9** | **10** | **+1** |
+| `GET /session?directory=/home/<user>/r2d2-workspace&limit=1000` | **9** | **10** | **+1** |
 | sessions with an `r2d2:` title | 17 | 18 | **+1** |
 | **`POST /session` issued by R2D2** | 0 | **1** | **+1** |
 | the one new id | — | `ses_f235aebaeffeTZp7uX1Mp7FNe3` | — |
@@ -555,7 +555,7 @@ sessions in the "before" snapshot, **0** changed `title`, `directory` or
 
 ```
 ses_f235d7f0fffeFLs3vVhB1W62BM | "T21 attempt 3 final live proof (@Sisyphus-Junior subagent)"
-    directory /home/koluchiy/Documents/R2_yandex_station   parentID ses_03299aaaaffewQIF7Gts3N7aPY
+    directory /home/<user>/Documents/R2_yandex_station   parentID ses_03299aaaaffewQIF7Gts3N7aPY
     updated 1790408140629 -> 1790408737458
 ```
 
@@ -579,7 +579,7 @@ this would have been the mistake attempt 2 also had to make.
 | pre-existing sessions whose **parentID** changed | **0** |
 | pre-existing sessions whose `time.updated` moved | **1** — this agent's own session, above |
 | pre-existing sessions read, written or deleted by R2D2 | **0** |
-| the 8 attempt-1 `r2d2:alice:t21-live-proof*` / `r2d2:alice:tg:1087136471` sessions | all 8 still present, untouched, reattached as event readers at startup and not written to |
+| the 8 attempt-1 `r2d2:alice:t21-live-proof*` / `r2d2:alice:tg:424242` sessions | all 8 still present, untouched, reattached as event readers at startup and not written to |
 | attempt 2's `t21-final` | still present, `ses_f23bb5dbeffePCgTNtG36cby0v`, untouched; its `db/sessions.db` row untouched |
 
 ---
@@ -590,7 +590,7 @@ this would have been the mistake attempt 2 also had to make.
 |---|---|---|---|
 | **D1** | the SSE reader's read timeout is the 3.2 s voice deadline, blind ~51.9 % of the time, 0 of 7 asks caught | **demonstrably fixed, measured again in this run** | R2D2's own readers recorded **0** `stream … failed` lines and **0** reconnects across the 16 minutes the server was up (12:36:09 → 12:52:xx), and caught **5 of 5** `permission.asked` events — the same 5 my independent tap counted. All 63 `stream … failed` lines fall in the 18 seconds I deliberately kept the server down (12:53:15–12:53:33), climbing the 1→2→4→5 s ladder, which is the correct behaviour for a down server. `deadline=3.2s event_read_timeout=30.0s` in the startup line |
 | **D2** | both escalation branches enqueue no collector, so the answer is never delivered | **the enqueue is now on all three branches, but it is not unconditional** | 12 `opencode_reply` jobs for this run's ids, every escalating turn armed one, and every branch that had none is represented: cold/C8 `487643e12927` (17.5 s), deadline `05ec4ad87b5b` (6.5 s) and `3e1b1eec4ba5` (19.2 s), sentinel `44e03d5b5c13` (71.2 s). 22 `sendMessage` 200s, each within a second of a job's `updated_at`. **But D15: a 0.5 s marker-read timeout skips the enqueue entirely** |
-| **D3** | `/tg/webhook` derives `tg:<chat_id>`, so `да` cannot answer and a second session is minted | **demonstrably fixed, both halves** | `да` in chat 1087136471 → `POST /session/ses_f235aebaeffeTZp7uX1Mp7FNe3/permissions/per_0dca91dcd0017YE2YM5bRcTJ6X` → 200 → `permission.replied … "reply":"once"` (twice, §4b and §4c). The pending row keyed by the Alice `application_id` was found and cleared. `POST /session` for the whole run: 3, one per id; **no** `tg:1087136471` session minted; the stale row from attempt 1 was never used |
+| **D3** | `/tg/webhook` derives `tg:<chat_id>`, so `да` cannot answer and a second session is minted | **demonstrably fixed, both halves** | `да` in chat 424242 → `POST /session/ses_f235aebaeffeTZp7uX1Mp7FNe3/permissions/per_0dca91dcd0017YE2YM5bRcTJ6X` → 200 → `permission.replied … "reply":"once"` (twice, §4b and §4c). The pending row keyed by the Alice `application_id` was found and cleared. `POST /session` for the whole run: 3, one per id; **no** `tg:424242` session minted; the stale row from attempt 1 was never used |
 | **D4** | the raw `[[NEEDS_AGENT]]` token reached Telegram 11 times | **demonstrably fixed** | Of the 12 job results this run produced, **1** contains the raw token (`e0974a5334ac`, the D6 case in §3). Running the shipped `routing.for_human` over all 12 gives **0** bodies containing it; that one sends `'Написать развёрнутый технический обзор…'` with the token line dropped. A stored assistant message can only reach Telegram through that one function, and it is the only path that carries session text: the other 12 of the 22 messages are the broker's own questions and notices (fixed strings plus the ask's `command`, and none of the four ask titles contains the token) and the replies `/tg/webhook` sends back into the chat. 0 of the 17 captured Alice `text`/`tts` values contain it either |
 | **D5** | a voice turn overrunning 3.2 s is acknowledged but never submitted | **the dropped-request half is fixed; the "voice agent never calls the shim" half is still broken** | Every `deadline` turn in this run submitted its work: 2c, scenario 3, scenario 4, scenario 5, scenario 6, the D9 probe, and the post-restart turn — 7 of 7, each with a job. Scenario 5: the shim was still never invoked, in either the plan order or the clean session |
 | **D6** | one `[[NEEDS_AGENT]]` poisons the shared session for ever | **still broken on the `path=deadline` branch; the harm has now materialised** | §3: the deadline branch's sweep ran while the voice turn was still in flight, found nothing to delete, anchored on the in-flight marker, and `r2d2-agent` then emitted the token itself — the first message after the anchor, and therefore what the collector shipped. Recovery: a later sentinel-branch sweep deleted all three (`message.removed` ×3) and the agent did real work in the very next turn, so the session heals — but the turn that creates the poison never heals it |
@@ -598,7 +598,7 @@ this would have been the mistake attempt 2 also had to make.
 | **D8** | the fallback chain has no working member | **a member exists, is called, and is rate-limited today** | With opencode down the chain called `openrouter` twice (one retry) and got `HTTP 429 … "Rate limit exceeded: free-models-per-day…","X-RateLimit-Limit":"50","X-RateLimit-Remaining":"0","X-RateLimit-Reset":"1790467200"` — the free daily cap, reset 2026-09-27T00:00:00Z. The plan's failure-case acceptance (graceful `ERROR_TEXT`, process up) is met; see `live-run-fail.md` |
 | **D9** | one tool denial disables every tool, for both agents, for ever | **still broken; the prompt-rule mitigation measured and ineffective** | §D9 above: refusal planted at `[27]`, then `[33]`/`[37]` — the agent states it has no tools and reaches for `bash` (needs a human) instead of `webfetch` (needs none), both of which its own matrix allows. Positive control in the same session before the refusal: `[20]`, `tool bash completed`. The rule is in both prompts, served live, and did not prevent it |
 | **D10** | the plan's own scenario order is unsafe: scenario 4 before 5 and 6 makes both fail | **a plan-ordering hazard, not a code defect — and not reproduced as a cause in this run** | §D10 above: both scenarios re-run first in clean sessions. Scenario 6 got *further* when it went first (two real `curl` asks against `export.arxiv.org` in its first four seconds) and failed for D9 + D13 + D14; scenario 5 got further too (it reached for the terminal) and failed because the ask was unanswerable. Neither failed because it ran after the permission scenario |
-| **D11** | the SSE decoder reads only the `event:` field, so every real frame decodes as `message` and the broker is never invoked | **demonstrably fixed, through the full R2D2 stack** | §4: a real `permission.asked` was decoded, logged by R2D2's own reader (`12:41:05,874 opencode sse: permission.asked ls -la /home/koluchiy/r2d2-workspace`), turned into a Telegram question, answered with `да` from `/tg/webhook`, and answered on the wire with `{"response":"once"}` — twice. My independent tap counted the same 5 asks R2D2 caught 5 of. Independently reconfirmed on the wire: **1044 `data:` lines, 0 `event:` lines** in 17 minutes of `GET /event` on this server |
+| **D11** | the SSE decoder reads only the `event:` field, so every real frame decodes as `message` and the broker is never invoked | **demonstrably fixed, through the full R2D2 stack** | §4: a real `permission.asked` was decoded, logged by R2D2's own reader (`12:41:05,874 opencode sse: permission.asked ls -la /home/<user>/r2d2-workspace`), turned into a Telegram question, answered with `да` from `/tg/webhook`, and answered on the wire with `{"response":"once"}` — twice. My independent tap counted the same 5 asks R2D2 caught 5 of. Independently reconfirmed on the wire: **1044 `data:` lines, 0 `event:` lines** in 17 minutes of `GET /event` on this server |
 | **D12** | the first question after an `opencode serve` restart raises a bare `httpx.ReadTimeout` and returns `ERROR_TEXT` against a healthy server | **still open — recurred identically** | `live-run-fail.md` §3: `GET /global/health` 200 at 12:53:40.686, then `12:53:43,901 WARNING r2d2 opencode 'opencode' could not answer t21-v3; the turn falls back to the chain: ReadTimeout('')` and `turn route= path=error … total_ms=4217` |
 
 ## New findings — D13 … D15
@@ -688,9 +688,9 @@ Reproduction for all three, without touching a line of the product:
 ## Reproduction
 
 ```bash
-cd /home/koluchiy/Documents/R2_yandex_station
+cd /home/<user>/Documents/R2_yandex_station
 set -a; . ./.env; . ./.env.oc; set +a
-export R2D2_TG_APPLICATION_ID='1087136471=t21-v3'    # declared, never derived
+export R2D2_TG_APPLICATION_ID='424242=t21-v3'    # declared, never derived
 bash scripts/opencode_serve.sh &                       # 127.0.0.1:4599, fresh
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099 &
 curl -s localhost:8099/health

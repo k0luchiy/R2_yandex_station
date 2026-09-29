@@ -10,7 +10,7 @@
 
 | | |
 |---|---|
-| opencode | `/home/koluchiy/.opencode/bin/opencode` v1.18.32, `serve --hostname 127.0.0.1 --port 4611` |
+| opencode | `/home/<user>/.opencode/bin/opencode` v1.18.32, `serve --hostname 127.0.0.1 --port 4611` |
 | конфиг | `OPENCODE_CONFIG_DIR=/tmp/r2d2-d13v/opencode`, там **побайтово** `config/opencode/r2d2.opencode.json` |
 | изоляция | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` — все в `/tmp/r2d2-d13v/xdg/` |
 | рабочее дерево | `/tmp/r2d2-d13v/workspace` (и сервер, и клиент смотрят только туда, `?directory=`) |
@@ -222,7 +222,7 @@ bash /tmp/opencode/d13v_up.sh
 setsid nohup bash /tmp/r2d2-d13v/serve.sh > /tmp/r2d2-d13v/serve.log 2>&1 &
 
 # D15 (обе половины), затем D14 + D13
-cd /home/koluchiy/Documents/R2_yandex_station
+cd /home/<user>/Documents/R2_yandex_station
 .venv/bin/python /tmp/opencode/d13v_live.py
 .venv/bin/python /tmp/opencode/d13v_focus.py
 ```

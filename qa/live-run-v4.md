@@ -12,7 +12,7 @@
 
 | | |
 |---|---|
-| opencode | `/home/koluchiy/.opencode/bin/opencode` v1.18.32, `serve --hostname 127.0.0.1 --port 4610` |
+| opencode | `/home/<user>/.opencode/bin/opencode` v1.18.32, `serve --hostname 127.0.0.1 --port 4610` |
 | конфиг | `OPENCODE_CONFIG_DIR=/tmp/r2d2-d9v/opencode`, там **побайтово** `config/opencode/r2d2.opencode.json` |
 | изоляция | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_CACHE_HOME` / `XDG_STATE_HOME` — все в `/tmp/r2d2-d9v/` |
 | рабочее дерево | `/tmp/r2d2-d9v/workspace` (сервер и клиент смотрят только туда, `?directory=`) |

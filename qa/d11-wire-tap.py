@@ -9,7 +9,7 @@ are captured live rather than reconstructed.
     cd /tmp/r2d2-d11/workspace
     OPENCODE_CONFIG_DIR=/tmp/r2d2-d11/config \
     OPENCODE_LOG_LEVEL=warn OPENCODE_SERVER_PASSWORD=<throwaway> \
-      /home/koluchiy/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4613 &
+      /home/<user>/.opencode/bin/opencode serve --hostname 127.0.0.1 --port 4613 &
     .venv/bin/python qa/d11-wire-tap.py --base-url http://127.0.0.1:4613 \
       --password "$OPENCODE_SERVER_PASSWORD"
 

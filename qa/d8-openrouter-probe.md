@@ -140,7 +140,7 @@ The chain **order** is unchanged, and no backend was added or removed. `zen` and
 ## Reproducing
 
 ```bash
-cd /home/koluchiy/Documents/R2_yandex_station
+cd /home/<user>/Documents/R2_yandex_station
 set -a; . ./.env; set +a            # OPENROUTER_API_KEY by name, never echoed
 # 1. the catalogue
 curl -s -H "Authorization: Bearer $OPENROUTER_API_KEY" \

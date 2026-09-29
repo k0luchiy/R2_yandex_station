@@ -143,7 +143,7 @@ and the server still holds exactly one session for that title:
 
 ```
 GET /session?limit=1000
-  sessions in /home/koluchiy/r2d2-workspace   9  (8 before this run, +1 = mine)
+  sessions in /home/<user>/r2d2-workspace   9  (8 before this run, +1 = mine)
   sessions titled r2d2:alice:t21-final        1  ses_f23bb5dbeffePCgTNtG36cby0v
   POST /session issued by R2D2                 1
 ```

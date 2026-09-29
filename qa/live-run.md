@@ -60,11 +60,11 @@ it look met.
 
 | | |
 |---|---|
-| opencode | `/home/koluchiy/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599` |
+| opencode | `/home/<user>/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599` |
 | opencode config | `~/.r2d2/opencode/opencode.json` (0600), byte-identical to `config/opencode/r2d2.opencode.json` |
 | CLI shim | `~/.r2d2/r2d2_do.py` (0755), byte-identical to `opencode/r2d2_cli/r2d2_do.py` |
 | R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` sourced |
-| workspace | `/home/koluchiy/r2d2-workspace` (empty) |
+| workspace | `/home/<user>/r2d2-workspace` (empty) |
 | startup line | `R2D2 started, db=.../db/sessions.db, opencode=wired, models=opencode/space-bunny-free, fallback=['openrouter']` |
 | secrets | never printed. The one place a bot token appears in a raw log is quoted as `bot<REDACTED>`. `~/.config/opencode/` was never written. |
 
@@ -80,7 +80,7 @@ GET /session?limit=1000           -> 194 sessions      (the DEFAULT limit is 100
                                                             silently truncates; the
                                                             `limit` parameter is required
                                                             for an honest count)
-GET /session?directory=/home/koluchiy/r2d2-workspace -> 0 sessions
+GET /session?directory=/home/<user>/r2d2-workspace -> 0 sessions
 titles starting with "r2d2:"      -> none
 ```
 
@@ -186,7 +186,7 @@ marker visible only inside the session:
 ```
 * user      r2d2-voice      Исследуй рабочий каталог и составь подробный отчёт…
 * assistant r2d2-voice      [[NEEDS_AGENT]]
-                           Исследовать рабочий каталог /home/koluchiy/r2d2-workspace…
+                           Исследовать рабочий каталог /home/<user>/r2d2-workspace…
 * user      r2d2-agent      Пользователь попросил голосом: Исследуй рабочий каталог…
 * assistant r2d2-agent      (tool calls: bash "ls -la …", bash "du -sh …")
 ```
@@ -221,8 +221,8 @@ R2D2) recorded every `permission.asked` the server emitted:
 ```json
 {"id":"evt_0db5bb1a4001…","type":"permission.asked","properties":{
   "id":"per_0db5bb1a3001KW927GRy6hQa7a","sessionID":"ses_f24a63be4ffeqdiwwhyYaF84oN",
-  "permission":"bash","patterns":["ls -la /home/koluchiy/r2d2-workspace 2>&1","head -50"],
-  "metadata":{"command":"ls -la /home/koluchiy/r2d2-workspace 2>&1 | head -50"},
+  "permission":"bash","patterns":["ls -la /home/<user>/r2d2-workspace 2>&1","head -50"],
+  "metadata":{"command":"ls -la /home/<user>/r2d2-workspace 2>&1 | head -50"},
   "always":["ls *","head *"],"tool":{"messageID":"msg_0db5ba43d001…","callID":"call_function_66d838q7cm12_1"}}}
 ```
 
@@ -307,7 +307,7 @@ The independent tap recorded what the **server** accepted:
 ### 4c — `да` through `/tg/webhook` does **not** answer it
 
 ```
-$ curl -s http://127.0.0.1:8099/tg/webhook -d '{"message":{"chat":{"id":1087136471},"text":"да"}}'
+$ curl -s http://127.0.0.1:8099/tg/webhook -d '{"message":{"chat":{"id":424242},"text":"да"}}'
 {"ok":true}  http=200 time=0.876844
 ```
 
@@ -320,7 +320,7 @@ The pending row is **still there** — the answer went nowhere. R2D2's log for t
 turn:
 
 ```
-07:28:56,791 core.opencode.session_store tg:1087136471 -> new session ses_f2474aac4ffeNnPg1OMFCtgQF5 (r2d2:alice:tg:1087136471)
+07:28:56,791 core.opencode.session_store tg:424242 -> new session ses_f2474aac4ffeNnPg1OMFCtgQF5 (r2d2:alice:tg:424242)
 07:28:56,907 turn route=opencode path=escalate … agent=r2d2-agent llm_ms=0 total_ms=160 escalated=True
 07:28:57,616 httpx HTTP Request: POST https://api.telegram.org/bot<REDACTED>/sendMessage "HTTP/1.1 200 OK"
 ```
@@ -368,7 +368,7 @@ Representative responses:
 |---|---|---|---|---|---|
 | 1 | `t21-live-proof-e` | Открой браузер на ноутбуке. | 0.750 s | `path=escalate llm_ms=0 total_ms=746 agent=r2d2-agent` | no |
 | 2 | `t21-live-proof-e` | Открой браузер. Используй инструмент r2d2_do с подкомандой open-app и аргументом browser. | 3.530 s | `path=deadline llm_ms=3273 total_ms=3456` | no |
-| 3 | `t21-live-proof-e` | Открой браузер. Тебе нужно выполнить в терминале ровно эту команду: `/home/koluchiy/.r2d2/r2d2_do.py open-app browser` | 3.444 s | `path=deadline llm_ms=3251` | no |
+| 3 | `t21-live-proof-e` | Открой браузер. Тебе нужно выполнить в терминале ровно эту команду: `/home/<user>/.r2d2/r2d2_do.py open-app browser` | 3.444 s | `path=deadline llm_ms=3251` | no |
 | 4 | `t21-live-proof-f` | Открой браузер на ноутбуке командой r2d2_do open-app browser. | 0.245 s | `path=escalate llm_ms=0 total_ms=240 agent=r2d2-agent` | no |
 | 5 | `t21-live-proof-e` | запусти r2d2_do open-app browser | 3.413 s | `path=deadline llm_ms=3273` | no |
 | 6 | `t21-live-proof-e` | r2d2_do open-app browser | 3.315 s | `path=deadline llm_ms=3229` | no |
@@ -377,10 +377,10 @@ Every `r2d2-voice` turn answered with the marker and no tool call:
 
 ```
 * assistant r2d2-voice   [[NEEDS_AGENT]] Выполнить в терминале r2d2_do open-app browser — открыть браузер на ноутбуке.
-* assistant r2d2-voice   [[NEEDS_AGENT]] Запустить в терминале команду /home/koluchiy/.r2d2/r2d2_do.py open-app browser, чтобы открыть браузер на ноутбуке.
+* assistant r2d2-voice   [[NEEDS_AGENT]] Запустить в терминале команду /home/<user>/.r2d2/r2d2_do.py open-app browser, чтобы открыть браузер на ноутбуке.
 ```
 
-`r2d2-voice` has `bash: {"*": "deny", "/home/koluchiy/.r2d2/r2d2_do.py *": "allow", …}`,
+`r2d2-voice` has `bash: {"*": "deny", "/home/<user>/.r2d2/r2d2_do.py *": "allow", …}`,
 so the shim *is* reachable from the voice agent — the model simply never emits the
 call. And when the voice turn overruns 3.2 s the brain takes the `deadline` branch,
 which acknowledges and hands the turn to a collector but **never** calls
@@ -406,7 +406,7 @@ The shim itself is fine. Run directly — the exact command the agent is
 allowlisted to run:
 
 ```
-$ /home/koluchiy/.r2d2/r2d2_do.py open-app browser
+$ /home/<user>/.r2d2/r2d2_do.py open-app browser
 {"ok": true, "text": "Открываю browser.", "needs_confirm": false, "pending": null, "error": null}
 exit=0   wall=0.926844954 s
 $ pgrep -a -f xdg-open
@@ -482,7 +482,7 @@ nothing.
 | `t21-live-proof-e` | `ses_f2474346affewMG7hh3Sv7Q5eo` | **1** |
 | `t21-live-proof-f` | `ses_f247037d9ffedbsLd6ngz3Qc5x` | **1** |
 | `t21-live-proof-g` | `ses_f246dff9cffeIE03I13nHGSMMd` | **1** |
-| `tg:1087136471` | `ses_f2474aac4ffeNnPg1OMFCtgQF5` | **1** |
+| `tg:424242` | `ses_f2474aac4ffeNnPg1OMFCtgQF5` | **1** |
 
 Eight application ids, eight sessions, **zero** duplicates — across roughly 40
 turns. `t21-live-proof` alone carried 12 counted turns and
@@ -505,13 +505,13 @@ POST /session count after 3 reuse turns = 5        ← zero new sessions
 | | before | after | delta |
 |---|---|---|---|
 | `GET /session?limit=1000` (all projects) | **194** | **202** | **+8** |
-| `GET /session?directory=/home/koluchiy/r2d2-workspace` | **0** | **8** | **+8** |
+| `GET /session?directory=/home/<user>/r2d2-workspace` | **0** | **8** | **+8** |
 | sessions with an `r2d2:` title | 0 | 8 | +8 |
 | **pre-existing sessions that disappeared** | — | — | **0** |
 
 **The plan's `delta == 1` is not met: the measured delta is 8.** The reason is
 mine, not the system's — I had to use eight distinct `application_id`s
-(`t21-live-proof`, `-b`, `-c`, `-d`, `-e`, `-f`, `-g`, plus the `tg:1087136471`
+(`t21-live-proof`, `-b`, `-c`, `-d`, `-e`, `-f`, `-g`, plus the `tg:424242`
 that `/tg/webhook` derives for itself) because the first session became
 unusable for later scenarios: see [D6](#d6--the-sentinel-poisons-the-shared-session).
 The invariant the delta is a proxy for — *one session per user, created once,
@@ -560,7 +560,7 @@ exists for — are the two that do not work.
 sent through `/tg/webhook` therefore finds no row, is treated as an ordinary
 question, and additionally creates a *second* opencode session for the same human.
 Measured: the pending row survived the `да` untouched, and
-`tg:1087136471 -> new session ses_f2474aac4ffeNnPg1OMFCtgQF5` was created.
+`tg:424242 -> new session ses_f2474aac4ffeNnPg1OMFCtgQF5` was created.
 
 ### D4 — the collector ships the raw escalation sentinel to Telegram
 
@@ -631,7 +631,7 @@ which reads like a working degradation and is not one.
 ## Reproduction
 
 ```bash
-cd /home/koluchiy/Documents/R2_yandex_station
+cd /home/<user>/Documents/R2_yandex_station
 set -a; . ./.env; . ./.env.oc; set +a
 bash scripts/opencode_serve.sh &                     # 127.0.0.1:4599
 .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099 &

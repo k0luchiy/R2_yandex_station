@@ -50,11 +50,11 @@ before: D11.**
 
 | | |
 |---|---|
-| opencode | `/home/koluchiy/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599`, started fresh (no hot reload) |
+| opencode | `/home/<user>/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599`, started fresh (no hot reload) |
 | opencode config | `~/.r2d2/opencode/opencode.json` (0600), **byte-identical** to `config/opencode/r2d2.opencode.json`; carries `"*_*": "deny"`, `"todowrite": "deny"` and the rule-7 prompt |
 | CLI shim | `~/.r2d2/r2d2_do.py` (0755), byte-identical to `opencode/r2d2_cli/r2d2_do.py` |
-| R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` sourced, plus `R2D2_TG_APPLICATION_ID='1087136471=t21-final'` exported for the process only (`.env` untouched) |
-| workspace | `/home/koluchiy/r2d2-workspace` |
+| R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` sourced, plus `R2D2_TG_APPLICATION_ID='424242=t21-final'` exported for the process only (`.env` untouched) |
+| workspace | `/home/<user>/r2d2-workspace` |
 | startup line | `R2D2 started, db=…/db/sessions.db, opencode=wired, models=opencode/space-bunny-free, fallback=['openrouter']` |
 | `application_id` | **one**, `t21-final`, for every Alice turn and for the Telegram chat |
 | `session_id` | **`ses_f23bb5dbeffePCgTNtG36cby0v`**, title `r2d2:alice:t21-final` |
@@ -179,7 +179,7 @@ Six attempts, all in the same session, all returning the ack:
 
 | # | command | wall |
 |---|---|---|
-| 1 | `Выполни в терминале ровно эту команду и перескажи её результат своими словами: ls -la /home/koluchiy/r2d2-workspace` | 3.502 s |
+| 1 | `Выполни в терминале ровно эту команду и перескажи её результат своими словами: ls -la /home/<user>/r2d2-workspace` | 3.502 s |
 | 2 | `Сколько именно файлов и папок лежит сейчас в каталоге /tmp? Выполни в терминале ровно эту команду: ls -1 /tmp \| wc -l` | 3.485 s |
 | 3 | `Создай в рабочем каталоге новый файл t21-permission-probe.txt …` (`write` → bucket `edit` → `ask`) | 3.443 s |
 | 4 | `Прочитай файл /etc/os-release …` (outside the workspace → `external_directory` → `ask`) | 3.622 s |
@@ -191,7 +191,7 @@ My always-connected tap recorded **zero** `permission.asked` and **zero**
 at every poll. `opencode`'s own transcript shows why, and it is not the timeout:
 
 ```json
-* assistant r2d2-voice  TOOL bash error {'command': 'ls -la /home/koluchiy/r2d2-workspace'}
+* assistant r2d2-voice  TOOL bash error {'command': 'ls -la /home/<user>/r2d2-workspace'}
   error: "The user has specified a rule which prevents you from using this specific tool
           call. Here are some of the relevant rules
           [{\"permission\":\"*\",\"action\":\"allow\",\"pattern\":\"*\"},
@@ -261,7 +261,7 @@ that module's tests fail against the decoder described above, and
 
 ```
 $ curl -s http://127.0.0.1:8099/tg/webhook -H 'Content-Type: application/json' \
-    -d '{"message":{"chat":{"id":1087136471},"text":"да"}}' -w '\nhttp=%{http_code} time_total=%{time_total}\n'
+    -d '{"message":{"chat":{"id":424242},"text":"да"}}' -w '\nhttp=%{http_code} time_total=%{time_total}\n'
 {"ok":true}
 http=200 time_total=3.344124
 
@@ -273,11 +273,11 @@ http=200 time_total=3.344124
 A `да` typed in Telegram was answered in **`ses_f23bb5dbeffePCgTNtG36cby0v`** —
 the same session as every Alice turn, the same `application_id` — and the
 answer went back to the chat. `POST /session` was **not** called: the total for
-the entire run is 1, and the only `tg:1087136471` string anywhere in the log is
+the entire run is 1, and the only `tg:424242` string anywhere in the log is
 the startup line that reattaches the owner's pre-existing database row:
 
 ```
-10:50:59,442 opencode events: watching session ses_f2474aac4ffeNnPg1OMFCtgQF5 of tg:1087136471 …
+10:50:59,442 opencode events: watching session ses_f2474aac4ffeNnPg1OMFCtgQF5 of tg:424242 …
 ```
 
 With no pending ask the broker correctly returned `unrelated` and the text was
@@ -309,16 +309,16 @@ The shim was never invoked: no `r2d2_do.py` process, no `xdg-open` child, and
 refusal is in its reasoning: *"I have no such tool — no shell, no GUI control …
 bash is blocked"* — the D9 belief, held by the voice agent about its own bash,
 where it is **true**, and generalised from the single denied
-`ls -la /home/koluchiy/r2d2-workspace` in attempt 1 of scenario 4.
+`ls -la /home/<user>/r2d2-workspace` in attempt 1 of scenario 4.
 
 For the record, the shim itself is fine and remains allowlisted for both
 agents:
 
 ```
-$ /home/koluchiy/.opencode/bin/opencode debug agent r2d2-agent | jq '.permission[-20:]'
+$ /home/<user>/.opencode/bin/opencode debug agent r2d2-agent | jq '.permission[-20:]'
 …
 {"permission":"bash","pattern":"*","action":"ask"}
-{"permission":"bash","pattern":"/home/koluchiy/.r2d2/r2d2_do.py *","action":"allow"}
+{"permission":"bash","pattern":"/home/<user>/.r2d2/r2d2_do.py *","action":"allow"}
 …
 ```
 
@@ -363,7 +363,7 @@ sessions, this one had a poisoned one.
 |---|---|
 | `POST /session` issued by R2D2, whole run | **1** (10:51:20,685) |
 | sessions titled `r2d2:alice:t21-final` | **1** — `ses_f23bb5dbeffePCgTNtG36cby0v` |
-| `GET /session?directory=/home/koluchiy/r2d2-workspace` | 8 → 9, **delta +1** |
+| `GET /session?directory=/home/<user>/r2d2-workspace` | 8 → 9, **delta +1** |
 | sessions with an `r2d2:` title | 16 → 17, **delta +1** |
 | `GET /session?limit=1000` (all projects) | 189 → 185, delta **−4** |
 
@@ -383,7 +383,7 @@ ses_f23f36247ffeYGi5vHY5jgDUaa  'Split core/permissions.py under LOC ceiling (@S
 ses_f23f3a427ffeR6jmCfoWwkhxVg  'Split core/brain.py under LOC ceiling (@Sisyphus-Junior subagent)'
 ```
 
-All five have `directory = /home/koluchiy/Documents/R2_yandex_station`, none is
+All five have `directory = /home/<user>/Documents/R2_yandex_station`, none is
 in `db/sessions.db`, and R2D2 issued no `abort` and no `DELETE /session` at any
 point in the run. They belong to the *other* opencode process running on this
 box, which shares the same session store — the all-projects count is therefore
@@ -397,7 +397,7 @@ not a measure R2D2 can be held to, and the workspace-scoped count is.
 | pre-existing sessions whose **directory** changed (reparented) | **0** |
 | pre-existing sessions whose `updated` timestamp moved | **0** of the 184 that survived |
 | pre-existing sessions read, written or deleted by R2D2 | **0** — the only routes R2D2 used were `GET /session?directory=…` (list), `GET /session/:id/message` for the session it owns, and `GET /event` |
-| the first run's 8 `r2d2:alice:t21-*` / `r2d2:alice:tg:1087136471` sessions | all 8 still present, untouched |
+| the first run's 8 `r2d2:alice:t21-*` / `r2d2:alice:tg:424242` sessions | all 8 still present, untouched |
 | `db/sessions.db` rows from the first run | all 5 still present, untouched, and all 5 reattached at startup |
 
 Baseline for comparison: the first run found **194** all-project sessions; this
@@ -412,7 +412,7 @@ other opencode process has since reaped.
 |---|---|---|---|
 | **D1** | SSE read timeout = the 3.2 s voice deadline, blind ~61 % of the time, 0 of 7 asks caught | **demonstrably fixed (the mechanism)** — and it is not the gating defect | blind rate measured live on the real server, on the real session, with R2D2's own `EventSource`: pre-fix read bound 3.2 s → `blind_s 31.23` of `wall_s 60.21` = **51.9 %**, 8 reconnects climbing 1→2→4→5×5; shipped `event_read_timeout` 30.0 s → `blind_s 0.0`, **0.0 %**, 0 reconnects. R2D2's live reader made **1** `GET /event` in 45 min with **0** `stream … failed` and **0** `stream ended` lines |
 | **D2** | both escalation branches enqueue no collector, so the agent's answer is never delivered | **demonstrably fixed** | 12 `opencode_reply` jobs for `t21-final`, **12 `done`, 0 `error`**, one per escalating turn, including both branches that had none: cold-session/C8 `2d30f87cd51d` (18.7 s) and the sentinel branch `16857a642ffe` (53.1 s); plus the deadline branch `e62330f5f25f` (8.2 s). 13 `sendMessage` 200s in the log, 12 of them job deliveries, each within a fraction of a second of that job's `updated_at`; the 13th is the Telegram reply in 4c |
-| **D3** | `/tg/webhook` derives `tg:<chat_id>`, so `да` cannot answer and a second session is minted | **demonstrably fixed for the identity**; the `once` half was not exercisable | `да` in chat 1087136471 answered in `ses_f23bb5dbeffePCgTNtG36cby0v`, the Alice session; `POST /session` total 1; no `tg:1087136471` session minted. The unbound-chat refusal is unreachable in a one-chat deployment |
+| **D3** | `/tg/webhook` derives `tg:<chat_id>`, so `да` cannot answer and a second session is minted | **demonstrably fixed for the identity**; the `once` half was not exercisable | `да` in chat 424242 answered in `ses_f23bb5dbeffePCgTNtG36cby0v`, the Alice session; `POST /session` total 1; no `tg:424242` session minted. The unbound-chat refusal is unreachable in a one-chat deployment |
 | **D4** | the raw `[[NEEDS_AGENT]]` token reached Telegram 11 times | **demonstrably fixed** | `[[NEEDS_AGENT]]` occurrences: **0** of 13 Telegram messages, **0** of 12 stored job results, **0** of the 19 Alice `text`/`tts` values |
 | **D5** | a voice turn over 3.2 s is acknowledged but never submitted | **the dropped-request half is fixed**; the "voice agent never calls the shim" half is **still broken** | deadline-branch turn 2b produced job `e62330f5f25f`, `done`, delivered. But scenario 5: the voice agent emitted no tool call at all, so the shim is still never invoked |
 | **D6** | one `[[NEEDS_AGENT]]` poisons the shared session for ever | **partially fixed** | the sentinel-branch message **is** deleted before `prompt_async` (`DELETE …/message/msg_0dc45f7fd001ZeqtKCg9fTzm1E` → 200, matching `message.removed` on the wire), and the agent emitted the token **0** times across 12 further agent turns. **But 3 sentinel-bearing assistant messages are still in the transcript**, all from `path=deadline` turns, where the sweep runs while the voice turn is still in flight and finds nothing to delete; no later sentinel-branch turn occurred to sweep them. The harm did not materialise; the precondition is still there |
@@ -434,7 +434,7 @@ are exactly as they were.
 Measured, reproduced five times in one session:
 
 1. `r2d2-voice` calls `bash` with a command outside its own allowlist
-   (`ls -la /home/koluchiy/r2d2-workspace`). opencode denies it and the denial
+   (`ls -la /home/<user>/r2d2-workspace`). opencode denies it and the denial
    text **enumerates the effective rules**, including
    `{"permission":"bash","pattern":"*","action":"deny"}` — which is
    `r2d2-voice`'s own rule, not `r2d2-agent`'s.
@@ -513,7 +513,7 @@ answering the test's fake-server traffic. With both servers stopped:
 ## Reproduction
 
 ```bash
-cd /home/koluchiy/Documents/R2_yandex_station
+cd /home/<user>/Documents/R2_yandex_station
 set -a; . ./.env; . ./.env.oc; set +a
 export R2D2_TG_APPLICATION_ID='<chat_id>=<application_id>'   # declared, never derived
 bash scripts/opencode_serve.sh &                              # 127.0.0.1:4599

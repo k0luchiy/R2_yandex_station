@@ -26,7 +26,7 @@ defect it is, not as a new one.
 ## Environment
 
 Identical to `live-run.md`: `application_id` `t21-v3`, `session_id`
-**`ses_f235aebaeffeTZp7uX1Mp7FNe3`**, `R2D2_TG_APPLICATION_ID='1087136471=t21-v3'`
+**`ses_f235aebaeffeTZp7uX1Mp7FNe3`**, `R2D2_TG_APPLICATION_ID='424242=t21-v3'`
 exported into the R2D2 process only, `.env` and `.env.oc` sourced, `.env` not
 edited. Secrets are quoted as `bot<REDACTED>`; the raw log stays in
 `/tmp/r2d2-qa/t21c/` and is not committed.
@@ -174,7 +174,7 @@ and the counts that prove no new session was minted:
 |---|---|
 | `POST /session` issued by R2D2, whole run including the restart | **3** — one per `application_id`, at 12:36:41, 12:46:11, 12:49:25; **none after 12:49:25** |
 | `opencode session store: … -> new session` lines in the log | **3**, the same three |
-| `GET /session?directory=/home/koluchiy/r2d2-workspace&limit=1000` after the restart | **12** — the 9 that existed before this run, plus one per id used |
+| `GET /session?directory=/home/<user>/r2d2-workspace&limit=1000` after the restart | **12** — the 9 that existed before this run, plus one per id used |
 | sessions titled `r2d2:alice:t21-v3` | **1** — `ses_f235aebaeffeTZp7uX1Mp7FNe3` |
 | the post-restart turn's `route=opencode … agent=r2d2-voice` | the same `ses_f235aebaeffeTZp7uX1Mp7FNe3` |
 | the answer to that turn | job `3e1b1eec4ba5`, `done` 19.2 s later, result `4`, delivered to Telegram (`sendMessage` 200 at 12:54:23.687) |
@@ -195,14 +195,14 @@ rewritten, and the restart did not cost the human their session.
 * `~/.config/opencode/` — never written.
 * `.env`, `.env.oc` — never edited.
 * The 8 stale attempt-1 sessions, attempt 2's `t21-final`, the stale
-  `tg:1087136471` row and all five of their `db/sessions.db` rows — **all still
+  `tg:424242` row and all five of their `db/sessions.db` rows — **all still
   present, untouched**, reattached as event readers at the next startup and not
   written to. Exact state in `live-run.md` §"the user's pre-existing sessions".
 * This run's own three sessions — **left in place**:
   `r2d2:alice:t21-v3` = `ses_f235aebaeffeTZp7uX1Mp7FNe3`,
   `r2d2:alice:t21-v3b` = `ses_f2352390dffe0vWH4DiDYI6xTJ`,
   `r2d2:alice:t21-v3c` = `ses_f234f4446ffeeQin8GAOllNEpT`.
-* The Telegram chat 1087136471 — **22 messages** from this run between 12:36:59
+* The Telegram chat 424242 — **22 messages** from this run between 12:36:59
   and 12:54:23, every one of them a `sendMessage` answered `HTTP/1.1 200 OK`
   (timestamps in `/tmp/r2d2-qa/t21c/uvicorn.log`). They are **10 collector
   deliveries** — one per `opencode_reply` job that closed with a result; the

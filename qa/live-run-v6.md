@@ -48,15 +48,15 @@ verdict — это таблица.
 
 | | |
 |---|---|
-| opencode | `/home/koluchiy/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599`, поднят **свежим** (нет hot reload), перезапущен дважды для сценария отказа и для D12 |
+| opencode | `/home/<user>/.opencode/bin/opencode` v1.18.32, `scripts/opencode_serve.sh`, `127.0.0.1:4599`, поднят **свежим** (нет hot reload), перезапущен дважды для сценария отказа и для D12 |
 | конфиг opencode | `~/.r2d2/opencode/opencode.json` (0600), **побайтово** равен `config/opencode/r2d2.opencode.json` (`cmp` не даёт расхождений) |
 | CLI-шим | `~/.r2d2/r2d2_do.py` (0755), побайтово равен `opencode/r2d2_cli/r2d2_do.py` |
-| R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` в окружении процесса, плюс `R2D2_TG_APPLICATION_ID='1087136471=t21-v4'` **только в процесс** (`.env` не редактировался, это файл владельца) |
-| рабочая папка | `/home/koluchiy/r2d2-workspace` |
+| R2D2 | `.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099`, `.env` + `.env.oc` в окружении процесса, плюс `R2D2_TG_APPLICATION_ID='424242=t21-v4'` **только в процесс** (`.env` не редактировался, это файл владельца) |
+| рабочая папка | `/home/<user>/r2d2-workspace` |
 | строка старта | `R2D2 started, db=…/db/sessions.db, opencode=wired, models=opencode/space-bunny-free, fallback=['openrouter']` |
 | `application_id` | **`t21-v4`** на каждом ходе Алисы и в чате Telegram. Второго id в прогоне **не открывали** — см. §Про «одна сессия на человека» |
 | `session_id` | **`ses_f21385511ffe18cxi1gk0Frsdm`**, заголовок `r2d2:alice:t21-v4` |
-| `db/sessions.db` до | 9 строк `oc_sessions`: `t21-live-proof-d/-e/-f/-g`, `t21-final`, `t21-v3`, `t21-v3b`, `t21-v3c`, `tg:1087136471`; все 9 переподключены при старте как читатели событий, ни одна не переписана |
+| `db/sessions.db` до | 9 строк `oc_sessions`: `t21-live-proof-d/-e/-f/-g`, `t21-final`, `t21-v3`, `t21-v3b`, `t21-v3c`, `tg:424242`; все 9 переподключены при старте как читатели событий, ни одна не переписана |
 | секреты | не печатались. Единственное место, где появляется токен бота (строки httpx INFO с URL Telegram), цитируется как `bot<REDACTED>`; сырые логи лежат в `/tmp/r2d2-qa/t21d/` и **не коммитятся**. `curlrc` с паролем сервера написан 0600 и **уничтожен** в конце |
 | `~/.config/opencode/` | не писался; чужие процессы opencode не сигналились |
 
@@ -176,7 +176,7 @@ http=200 time_total=3.600225
 |---|---|---|---|---|
 | 4a | `echo R2D2_SCENARIO4_OK` | вызвал `bash`, **отказ** | прочитал отказ в истории и отказался: «мой вызов терминала был отклонён правилами доступа, `echo` не входит в разрешённый список» | 3,478830 |
 | 4b | та же | отказался словами | «Доступ прежний: команда `echo …` по-прежнему запрещена» | 3,612493 |
-| 4c | `ls -la /home/koluchiy/r2d2-workspace` | вызвал `bash`, **отказ** | «`ls` тоже запрещён: правило `bash` запрещает всё, кроме `r2d2_do.py` и диагностических команд вроде `df`, `free`, `ps`, `uname`» | 3,551019 |
+| 4c | `ls -la /home/<user>/r2d2-workspace` | вызвал `bash`, **отказ** | «`ls` тоже запрещён: правило `bash` запрещает всё, кроме `r2d2_do.py` и диагностических команд вроде `df`, `free`, `ps`, `uname`» | 3,551019 |
 | 4d | `r2d2_do shell "upower --version"` | вызвал `bash`, **отказ** | «Запрет прежний: `r2d2_do shell` мне по-прежнему не разрешён» | 3,614258 |
 | 4e | прочитать `/etc/os-release` | вызвал `read`, **отказ** | «Прочитать не удалось: доступ к `/etc/os-release` мне запрещён правилами, сам файл я не видел» | 3,561346 |
 
@@ -225,7 +225,7 @@ ack 3,535205 -> агент отработал, job 22:45:53 → 22:46:16
 
 ```
 [39] r2d2-voice tool bash completed
-     input : {"command": "python3 /home/koluchiy/.r2d2/r2d2_do.py status"}
+     input : {"command": "python3 /home/<user>/.r2d2/r2d2_do.py status"}
      output: {"ok": true, "text": "Статус: заряд 98 процентов заряжается,
               процессор 75 процентов, память занята на 79 процентов,
               аптайм 26 часов 58 минут", "needs_confirm": false,
@@ -234,7 +234,7 @@ ack 3,535205 -> агент отработал, job 22:45:53 → 22:46:16
 
 `open-app` не выполнен. Агент в отчёте написал: «Браузер не открылся: команда
 `open-app` отклонена правилами доступа» — при том, что его матрица разрешает
-`python3 /home/koluchiy/.r2d2/r2d2_do.py *` без вопроса (правило 45 в списке
+`python3 /home/<user>/.r2d2/r2d2_do.py *` без вопроса (правило 45 в списке
 выше). Он не проверил и не позвал.
 
 ### Итог по D5, вторая половина
@@ -443,14 +443,14 @@ job 22:53:54 → 22:54:53: «Мадрид»
 POST /session               за весь прогон: 1   (r2d2:alice:t21-v4)
 DELETE /session/…/message/… за весь прогон: 6   (все шесть — остатки, описанные выше)
 сессий с заголовком ровно "r2d2:alice:t21-v4": 1
-  ses_f21385511ffe18cxi1gk0Frsdm  parent=None  dir=/home/koluchiy/r2d2-workspace
+  ses_f21385511ffe18cxi1gk0Frsdm  parent=None  dir=/home/<user>/r2d2-workspace
 строк oc_sessions           9 -> 10
 ```
 
 | счётчик | до | после | дельта |
 |---|---|---|---|
 | все проекты (`?limit=1000`) | 210 | 212 | **+2** |
-| рабочая папка (`?directory=/home/koluchiy/r2d2-workspace`) | 12 | 13 | **+1** |
+| рабочая папка (`?directory=/home/<user>/r2d2-workspace`) | 12 | 13 | **+1** |
 | заголовок `r2d2:` | 20 | 21 | **+1** |
 
 **Дельта по всем проектам равна 2, и вот вторая сессия, названная прямо:**
@@ -458,14 +458,14 @@ DELETE /session/…/message/… за весь прогон: 6   (все шест
 ```
 ses_f2135b470ffeyeH5lEHkQdQKeX
    title    = 'LDraw 3D asset pipeline for 3862 (@librarian subagent)'
-   dir      = /home/koluchiy/Documents/Lego_HarryPotter_Game
+   dir      = /home/<user>/Documents/Lego_HarryPotter_Game
    parentID = ses_f2191d729ffevNkuDqUDX1gamw
 ```
 
 Это рабочая сессия субагента **собственного** opencode владельца (pid 1575201,
 порт 46005) в другом проекте. К R2D2 она отношения не имеет: её `directory` не
 `r2d2-workspace`, её заголовок не начинается с `r2d2:`, R2D2 никогда не ходил в
-`/home/koluchiy/Documents/Lego_HarryPotter_Game`, и все 66 сессий с `parentID` в
+`/home/<user>/Documents/Lego_HarryPotter_Game`, и все 66 сессий с `parentID` в
 этом хранилище — чужие, из них в рабочей папке R2D2 **ноль**. Её родитель
 `ses_f2191d729ffevNkuDqUDX1gamw` сдвинул `time.updated` с `1790443620897` на
 `1790445370652` (22:47:00 → 22:49:30) — то есть владелец в это время работал в
@@ -496,7 +496,7 @@ ses_f246dff9cffeIE03I13nHGSMMd  r2d2:alice:t21-live-proof-g
 ses_f235aebaeffeTZp7uX1Mp7FNe3  r2d2:alice:t21-v3
 ses_f2352390dffe0vWH4DiDYI6xTJ  r2d2:alice:t21-v3b
 ses_f234f4446ffeeQin8GAOllNEpT  r2d2:alice:t21-v3c
-ses_f2474aac4ffeNnPg1OMFCtgQF5  r2d2:alice:tg:1087136471
+ses_f2474aac4ffeNnPg1OMFCtgQF5  r2d2:alice:tg:424242
 ```
 
 Их `db/sessions.db`-строки тоже не тронуты: те же девять `(application_id,
@@ -505,7 +505,7 @@ session_id)` пар, что были до прогона. **Ничего не у
 
 ## Что было в телеграм-чате
 
-`TELEGRAM_CHAT_ID` = `1087136471`, реальные сообщения туда уходили, это задумано.
+`TELEGRAM_CHAT_ID` = `424242`, реальные сообщения туда уходили, это задумано.
 
 | | |
 |---|---|
@@ -545,16 +545,16 @@ session_id)` пар, что были до прогона. **Ничего не у
 
 ```bash
 # сервер и R2D2
-cd /home/koluchiy/Documents/R2_yandex_station
+cd /home/<user>/Documents/R2_yandex_station
 set -a; . ./.env; . ./.env.oc; set +a
 setsid nohup bash scripts/opencode_serve.sh > /tmp/r2d2-qa/t21d/opencode.log 2>&1 &
-R2D2_TG_APPLICATION_ID='1087136471=t21-v4' \
+R2D2_TG_APPLICATION_ID='424242=t21-v4' \
   setsid nohup .venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099 \
   > /tmp/r2d2-qa/t21d/uvicorn.log 2>&1 &
 
 # независимый read-only tap (не обязателен, но он держит все доказательства D9/D1)
 .venv/bin/python /tmp/r2d2-qa/t21d/tap.py --base-url http://127.0.0.1:4599 \
-  --password-env R2D2_OC_PASSWORD --directory /home/koluchiy/r2d2-workspace \
+  --password-env R2D2_OC_PASSWORD --directory /home/<user>/r2d2-workspace \
   --out /tmp/r2d2-qa/t21d/tap.log --stop-file /tmp/r2d2-qa/t21d/TAPSTOP &
 
 # один ход Алисы
