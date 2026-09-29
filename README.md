@@ -123,7 +123,7 @@ Declared in `pyproject.toml` after auditing what `app/`, `core/` and
 
 | distribution | imported by | note |
 |---|---|---|
-| `fastapi` | `app/main.py`, `app/diagnostics.py`, `app/opencode_route.py` | |
+| `fastapi` | `app/main.py`, `app/http.py`, `app/diagnostics.py` | |
 | `httpx` | 16 modules | the opencode client, the SSE reader, the backends, the tools |
 | `aiosqlite` | `core/memory.py` | |
 | `psutil` | `core/tools/laptop_tool.py` | battery/cpu/memory probes for the `laptop` tool |
@@ -264,23 +264,21 @@ Recorded rather than hidden, because a stranger reading a green CI badge should
 know what the badge does not cover. All of these are in files that were owned by
 a concurrent change while the tooling landed, so none of them were fixed here.
 
-**Four real defects the linter reports.** `ruff check .` passes because each is
-named in the known-findings ledger in `pyproject.toml`; delete the line there
-when the file is fixed and the fix is held in place from then on.
+Every finding this list held has been fixed: the `__all__` that raised
+`AttributeError` on a star import, the twice-defined `shell_deny_violations`
+(the duplicate went when the matrix test was rewritten to derive its probe from
+the shipped rules), the `Mapping` that `core/permissions.py` annotated with and
+never imported, and the `if False` branch in `tests/test_brain_hybrid.py`. The
+mypy ledger in `pyproject.toml` is a different thing and is not going away.
 
-| where | what |
-|---|---|
-| `app/opencode_route.py:96` | `__all__` names `route_status`, which the module does not import, so `from app.opencode_route import *` raises `AttributeError`. (`RouteStatus`, in the same list, is imported and fine.) |
-| `tests/test_r2d2_opencode_config.py:497` | `shell_deny_violations` is defined twice; the second definition shadows the first, so one of the two is dead code. |
-| `core/permissions.py:87` | `ASK_SOURCE: Final[Mapping[str, str]]` — `Mapping` is never imported. Harmless only because the module has `from __future__ import annotations`; anything that resolves annotations at runtime (`typing.get_type_hints`, pydantic) will fail. |
-| `tests/test_brain_hybrid.py:1938` | `TASK_AGPLY if False else TASK_AGENT` — a dead branch naming a constant that does not exist. Never evaluated, so it cannot fail today, and it will mislead the next reader. |
+The last of these was the one that mattered most: `core/brain.py` scheduled a
+Telegram notification with `asyncio.create_task` and kept no reference to it,
+which is the documented way to lose work — the loop holds only a weak reference,
+so the task can be collected before it runs. The action happened and the user was
+told nothing, with nothing in the logs to say why. Every other `create_task` in
+the project kept its task; this was the one that did not, and it now does.
 
-`core/brain.py:243` also drops the reference to an `asyncio.create_task`, which
-CPython's own documentation warns can garbage-collect a task that is still
-running. No selected ruff rule covers it, so it is not in the ledger; it is
-real.
-
-**The type checker is advisory, and says so.** `mypy` reports **46** findings
+**The type checker is advisory, and says so.** `mypy` reports **42** findings
 over `app/`, `core/` and `opencode/`: 23 `union-attr` on a `Connection | None`
 in `core/memory.py` that no annotation narrows, 8 `valid-type` on
 dataclass-shaped callables used as types, 6 `arg-type` and 3 `assignment` from

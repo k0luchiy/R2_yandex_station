@@ -1935,7 +1935,7 @@ async def test_a_deadline_turn_that_outlives_its_wait_is_still_handed_over_and_s
     # When the bound elapses
     job = await _armed_job(rig)
     # Then the work still reached the agent, exactly once
-    assert [turn.agent for turn in rig.server.turns if turn.submitted] == [TASK_AGPLY if False else TASK_AGENT]
+    assert [turn.agent for turn in rig.server.turns if turn.submitted] == [TASK_AGENT]
     assert job["session_id"] == session_id
     # ... and the next turn still pays the residue read, because nothing observed the end
     rig.cfg.r2d2_fast_deadline = 5.0

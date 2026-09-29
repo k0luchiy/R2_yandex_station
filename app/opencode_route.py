@@ -36,7 +36,7 @@ as the wiring:
   `SessionWatchingStore.resolve` is the one public method through which a new
   session can appear.
 
-allow: SIZE_OK -- 370 pure LOC, over the 250 ceiling because the C1 gate carries the
+allow: SIZE_OK -- 371 pure LOC, over the 250 ceiling because the C1 gate carries the
 closed vocabulary that names its outcomes, and most of that is docstrings recording
 decisions an operator has to be able to re-derive. The separable half is
 `SessionReaders` + `SessionWatchingStore` (the event fleet), and splitting it out
@@ -94,7 +94,7 @@ from core.permissions import PermissionBroker
 __all__ = [
     "CATALOGUE_UNREADABLE", "MODEL_UNCONFIGURED", "MODEL_UNKNOWN", "NO_BACKEND",
     "NO_WORKSPACE", "REGISTRY_UNREADABLE", "OpencodeRoute", "RouteStatus", "SessionReaders",
-    "SessionWatchingStore", "UNVERIFIED", "decide", "route_status", "wire_opencode",
+    "SessionWatchingStore", "UNVERIFIED", "decide", "wire_opencode",
 ]
 
 log = logging.getLogger("r2d2.opencode")
@@ -325,7 +325,8 @@ async def wire_opencode(
         # C6: the server does not validate `?directory=`, so a workspace that is not
         # there would hand the agent's file tools a root that does not exist, and
         # every session request would fail -- one turn at a time, for ever.
-        return _refused(NO_WORKSPACE, f"the workspace {cfg.resolved_workspace()!r} does not exist")
+        _refused(NO_WORKSPACE, f"the workspace {cfg.resolved_workspace()!r} does not exist")
+        return None
     client = factory(spec, cfg.resolved_workspace())
     broker = PermissionBroker(memory, client, cfg)
     turns = TurnWatch()

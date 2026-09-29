@@ -31,7 +31,7 @@ classifiers = [
 # The 3.11 floor is what docs/01-overview.md and docs/08-deployment.md already
 # state; the venv this was developed in is 3.13, and CI runs 3.11, 3.12 and 3.13.
 dependencies = [
-    # app/main.py, app/diagnostics.py, app/opencode_route.py
+    # app/main.py, app/http.py, app/diagnostics.py
     "fastapi>=0.115",
     # the ASGI server: scripts/run_server.sh execs it, tests/test_e2e_stack.py
     # imports it to bind a real socket, and every document tells the operator to

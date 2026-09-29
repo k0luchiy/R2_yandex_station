@@ -116,6 +116,7 @@ class Brain:
         self.logger = logger or logging.getLogger("r2d2.brain")
         self.registry = build_registry()
         self.opencode = opencode
+        self._notifications: set[asyncio.Task[None]] = set()
         self.session = SessionRoute(cfg, memory, worker, self.logger)
 
     def authorized(self, body: dict) -> bool:
@@ -240,7 +241,7 @@ class Brain:
             result = await self.registry.execute(ctx, tool_call.name, tool_call.arguments)
             await self.memory.append_message(app_id, "assistant", f"[{tool_call.name}]", self.cfg.max_history)
             if result.tg_send:
-                asyncio.create_task(send_message(self.cfg, result.tg_send))
+                self._notify(result.tg_send)
             if result.is_async and result.job:
                 rec.escalated = True
                 await self.worker.enqueue(result.job)
@@ -289,6 +290,22 @@ class Brain:
             for backend in backends:
                 await backend.aclose()
         raise RuntimeError(f"all LLM providers failed: {last_error!r}")
+
+    def _notify(self, text: str) -> None:
+        """Send a Telegram notification without blocking the turn, and keep it alive.
+
+        `asyncio.create_task` with no reference to the result is a documented way to
+        lose work: the event loop only holds a weak reference, so a task nobody keeps
+        can be garbage-collected before it ever runs. Every other `create_task` in
+        this project stores its task -- `SessionReaders._tasks`, `Worker._tasks`,
+        `PermissionSweep._task` -- and this one did not, which meant the confirmation
+        of a synchronous tool action could simply never arrive: the action ran, the
+        user was told nothing, and nothing in the logs said why. The set holds the
+        tasks until they finish and `discard` drops exactly the finished one.
+        """
+        task = asyncio.create_task(send_message(self.cfg, text))
+        self._notifications.add(task)
+        task.add_done_callback(self._notifications.discard)
 
     def _speakable(self, text: str) -> str:
         """The third guard: no reply carrying the escalation sentinel reaches Alice.
