@@ -43,6 +43,7 @@ from typing import Final
 from core.opencode.sse import (
     PERMISSION_ASKED,
     PERMISSION_REPLIED,
+    QUESTION_ASKED,
     TURN_COMPLETE,
     OpencodeEvent,
 )
@@ -87,6 +88,14 @@ class TurnState:
     """
 
     waiting: dict[str, str | None] = field(default_factory=dict)
+    #: The id of a `question.asked` this turn is parked on, or `None`. Separate from
+    #: `waiting` because nobody can answer it: the broker answers a `permission.asked`
+    #: and there is no route to a `question.asked` (its replies are
+    #: `/session/{id}/question/{requestID}/reply`, which R2D2 has no reason to call
+    #: blind). A caller must be able to tell "waiting for a human who can answer" from
+    #: "waiting for a human who cannot", because only the second is a turn to give up
+    #: on now rather than in 300 s.
+    unanswerable: str | None = None
     idle_at: float = 0.0
     #: Every frame of this session, whatever its name. NOT the same as "we know something":
     #: it is the evidence that a reader is attached at all, which is what a collector needs
@@ -96,8 +105,13 @@ class TurnState:
 
     @property
     def blocked(self) -> bool:
-        """Whether an ask of ours is unanswered, so the turn cannot be over."""
-        return bool(self.waiting)
+        """Whether the turn cannot be over: an ask of ours is unanswered, or a question is.
+
+        `unanswerable` counts, and the server will not end a turn parked on one either, so
+        leaving it out would make `session.idle` -- which the contract records arriving
+        *while a tool is blocked* -- read as the end of a turn that has not ended.
+        """
+        return bool(self.waiting) or self.unanswerable is not None
 
     def ended_after(self, moment: float) -> bool:
         """Whether the turn was over at `moment`: idle since, and nothing outstanding.
@@ -106,7 +120,7 @@ class TurnState:
         an `idle` from the PREVIOUS turn does not end this one, which is the failure a plain
         boolean would have on the second collector of a session.
         """
-        return self.idle_at >= moment and not self.waiting
+        return self.idle_at >= moment and not self.waiting and self.unanswerable is None
 
     @property
     def blocked_at(self) -> str | None:
@@ -157,6 +171,14 @@ class TurnWatch:
             answered = event.request_id
             if answered is not None:
                 state.waiting.pop(answered, None)
+        elif event.type == QUESTION_ASKED:
+            # Recorded and NOT answered. The `question` tool is denied in R2D2's matrix
+            # (measured: `deny` removes it from the model), so this frame means the
+            # installed config is stale -- and a stale install is the one case where the
+            # turn parks for ever, because there is no broker question in Telegram for
+            # anybody to answer. `note` sets the flag; `core/answer_gate.py` is what turns
+            # it into a stated loss instead of a 600 s wait.
+            state.unanswerable = event.permission_id or event.request_id or "question.asked"
         elif event.type == TURN_COMPLETE:
             state.idle_at = time.monotonic()
         else:

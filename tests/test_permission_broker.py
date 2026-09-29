@@ -42,6 +42,10 @@ Timing: no test sleeps. An expired ask is produced by writing a record whose
 `requested_at` is already in the past -- the only clock input the sweep reads --
 and the sweep loop's cadence is injected, so the loop test subscribes to the
 Telegram delivery instead of waiting out a 30 s interval.
+
+allow: SIZE_OK -- 847 pure LOC, a test module for the most safety-critical module in
+R2D2 grows with the properties it pins, and each section here is one property rather
+than one test.
 """
 
 from __future__ import annotations
@@ -435,6 +439,127 @@ async def test_a_queue_the_user_cannot_reach_refuses_the_newcomer_and_not_the_he
     assert server.answer_posts()[0].url.path.endswith(f"/permissions/per_{MAX_QUEUED}")
     assert await broker.resolve_from_text(APP, "да") == "approved"
     assert server.answer_posts()[-1].url.path.endswith("/permissions/per_0")
+
+
+# ---------------------------------------------------------------------------
+# on_permission_requested -- an ask that must never become a question
+# ---------------------------------------------------------------------------
+
+#: The command the live run actually used, verbatim. It is a `bash` command with no
+#: secret in it; the secret is in what the server's environment would print. The
+#: measured outcome is in `qa/live-run-v9.md` F2: answered «да», this put the
+#: Telegram bot token into the opencode transcript, which is permanent and is
+#: re-read by the model on every later turn.
+CREDENTIAL_COMMAND: Final = "env | grep -iE 'telegram|tg_|bot'"
+CREDENTIAL_ENV: Final = "окружение процесса"
+CREDENTIAL_FILE: Final = "файл с учётными данными"
+#: An ordinary command off the allowlist, which is what a REAL ask looks like. The
+#: barrier must leave these alone: a broker that refuses every `bash` ask is not a
+#: barrier, it is an outage with a security rationale.
+ORDINARY_COMMAND: Final = "curl -sS https://example.com/paper.pdf -o /tmp/p.pdf"
+CREDENTIAL_REFUSED: Final = (
+    "Действие отклонено, и я не буду спрашивать про него: команда «{title}» показала бы "
+    "{source} — это попало бы в историю сессии, которую агент перечитывает. Если он правда "
+    "нужен — выполни команду сам."
+)
+
+
+@pytest.mark.parametrize(
+    ("command", "source"),
+    [
+        (CREDENTIAL_COMMAND, CREDENTIAL_ENV),
+        ("printenv", CREDENTIAL_ENV),
+        ("cat /proc/self/environ", CREDENTIAL_ENV),
+        ("echo $TELEGRAM_BOT_TOKEN", CREDENTIAL_ENV),
+        ("cat .env", CREDENTIAL_FILE),
+        ("cat ~/.r2d2/server.pem", CREDENTIAL_FILE),
+        ("unrelated && printenv", CREDENTIAL_ENV),
+    ],
+)
+async def test_an_ask_that_would_print_a_credential_is_refused_and_never_asked(
+    broker, memory: Memory, server: FakeOpencode, telegram: Telegram, command: str, source: str
+):
+    """A question whose honest answer is «да» is not a question, so it is never asked.
+
+    Measured (`qa/live-run-v9.md` F2): `env | grep -iE 'telegram|tg_|bot'` was put to
+    Telegram like any other ask, the user read «Нужно подтверждение: env | grep -iE
+    'telegram|tg_|bot'» — which says nothing about what the output contains — answered
+    «да», and the Telegram bot token landed in the opencode transcript. That transcript
+    is permanent and the model re-reads it on every later turn, and the model's own
+    `text` redaction is not a defence: `tool.output` is what the model *reads*.
+
+    So the refusal happens where the command is still a string and no subprocess has
+    run. It is the same `reject` on the same route as every other refusal here, which
+    is what releases the turn instead of parking it for 300 s on a question that must
+    not be answered.
+    """
+    # Given: an agent turn that wants to run something whose output is a credential
+    await broker.on_permission_requested(APP, SESSION_ID, PERMISSION_ID, command, ("*",))
+    # Then: the server is refused on the permission route, with the one-value domain
+    assert server.answers() == [{"response": "reject"}]
+    assert server.answer_posts()[0].url.path.endswith(f"/permissions/{PERMISSION_ID}")
+    # And the ask never entered the queue, so the user's next «да» cannot find it
+    assert await memory.get_pending(APP) is None
+    # And the user is told it did not run AND that R2D2 declined to ask -- which are
+    # two different facts, and only the second one is new
+    assert telegram.texts() == [CREDENTIAL_REFUSED.format(title=command, source=source)]
+    # And the notice names the SOURCE, never a value: quoting one would mean somebody
+    # had already read one
+    assert "REDACTED" not in telegram.texts()[0] and PASSWORD not in telegram.texts()[0]
+    # And the ask was answered exactly once, so no `once` can follow it later
+    assert len(server.answer_posts()) == 1
+    assert await broker.resolve_from_text(APP, "да") == "unrelated"
+    assert len(server.answer_posts()) == 1
+
+
+async def test_an_ordinary_ask_is_still_a_question(
+    broker, memory: Memory, server: FakeOpencode, telegram: Telegram
+):
+    """The other direction, and the one that keeps the barrier a barrier.
+
+    If every `bash` ask were refused, R2D2 would be refusing the user's own work with
+    a security rationale instead of doing it, and the honest fix would be to switch the
+    broker off -- which is exactly what a too-broad barrier teaches an operator to do.
+    The classifier decides about SOURCES; a command that reads none of them is asked.
+    """
+    # Given: an agent turn that wants to do ordinary work
+    await broker.on_permission_requested(APP, SESSION_ID, PERMISSION_ID, ORDINARY_COMMAND, ("*",))
+    # Then: it is stored and asked, and nothing is refused
+    record = await memory.get_pending(APP)
+    assert record is not None and record["permission_id"] == PERMISSION_ID
+    assert server.answer_posts() == []
+    assert telegram.texts() == [QUESTION.format(title=ORDINARY_COMMAND)]
+    # And it is answerable, which is the property a refusal would have destroyed
+    assert await broker.resolve_from_text(APP, "да") == "approved"
+    assert server.answers() == [{"response": "once"}]
+
+
+async def test_the_credential_refusal_never_reaches_alice(
+    broker, memory: Memory, server: FakeOpencode, telegram: Telegram
+):
+    """The notice is a Telegram message, not an Alice payload.
+
+    Same reason as `test_the_ask_never_builds_an_alice_payload`: the two channels
+    were once mixed up, and the marker of that is a body shaped
+    `{response: {text, tts, end_session}}` from a module with no push channel. Here it
+    matters more, because this is the one message whose absence is a leak -- if it
+    went to the dead channel the user would never learn the command did not run.
+    """
+    # Given: an ask that is refused without being asked
+    await broker.on_permission_requested(APP, SESSION_ID, PERMISSION_ID, CREDENTIAL_COMMAND, ())
+    # When: the source of the module is parsed
+    source = Path(permissions_module_path()).read_text(encoding="utf-8")
+    # Then: it reaches only Telegram, and builds nothing shaped like an Alice payload
+    assert "core.render" not in source
+    assert "alice_response" not in source
+    assert set(telegram.bodies[0]) == {"chat_id", "text"}
+    assert await memory.get_pending(APP) is None
+
+
+def permissions_module_path() -> str:
+    from core import permissions
+
+    return permissions.__file__
 
 
 # ---------------------------------------------------------------------------
@@ -1077,7 +1202,12 @@ def test_the_module_cannot_answer_with_a_durable_grant():
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and getattr(node.func, "attr", None) == "_post"
     ]
-    assert len(posted) == 4, "all four answer paths must go through the one seam"
+    assert len(posted) == 5, (
+        "all five answer paths must go through the one seam: approve, reject, the "
+        "queue-overflow refusal, the sweep's timeout refusal, and the credential-source "
+        "refusal (qa/live-run-v9.md F2). A sixth is a new way to answer opencode and "
+        "belongs in this sentence before it belongs in the module."
+    )
     for call in posted:
         assert isinstance(call.args[1], ast.Name), "an answer is a named constant, never a raw string"
         assert call.args[1].id in {"APPROVE_ONCE", "REFUSE", "answer"}

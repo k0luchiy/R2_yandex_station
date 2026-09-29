@@ -44,7 +44,7 @@ is asking what they mean, and escalating their question to the agent would drop
 the turn on the floor. The text still reaches the session verbatim
 (`test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal`).
 
-allow: SIZE_OK -- 1575 pure LOC, a test module grows with the behaviours it pins.
+allow: SIZE_OK -- 1705 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -79,6 +79,7 @@ from core.opencode.sse_frames import TURN_COMPLETE, OpencodeEvent
 from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker
 from core.render import MAX_TEXT
+from core.session_collector import PARKED
 from tests.fake_opencode import (
     completed_tool_message,
     failed_tool_message,
@@ -654,15 +655,22 @@ def no_leaked_application() -> object:
     current_application_id.set(None)
 
 
-@pytest.fixture
-async def rig(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: Net, server: FakeOpencode
+async def build_stack(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: Net, server: FakeOpencode, *, broker: bool
 ):
-    """The whole stack, assembled exactly as todo 18 will assemble it in main.
+    """Assemble the whole stack once, with or without a broker, and return it.
 
     The registry file is the shipped `config/backends.json` shape with the
     opencode session backend FIRST in the chain, so the fallback tests prove the
     brain does not re-try the session backend after the opencode route failed.
+
+    `broker=False` is a real supported deployment (`EVENT_MODE` unknown, or a
+    deployment that wired no broker), not a broken fixture -- and it is the one
+    configuration in which the F1 park gate must NOT fire, because a build that
+    brokered nothing created no park to refuse. That is why the switch is a
+    parameter here rather than a second hand-written fixture: the two would
+    otherwise drift, and the drift would be invisible in exactly the test that
+    exists to catch it.
     """
     monkeypatch.setenv("R2D2_OC_USERNAME", "opencode")
     monkeypatch.setenv("R2D2_OC_PASSWORD", PASSWORD)
@@ -692,19 +700,43 @@ async def rig(
     client = server.client(oc_spec)
     store = OcSessionStore(memory, client, cfg)
     backend = OpencodeSessionBackend(oc_spec, OpencodeWiring(client=client, store=store, cfg=cfg))
-    broker = PermissionBroker(memory, client, cfg)
-    worker = RecordingWorker(cfg, memory)
     wiring = core.brain.HybridWiring(
-        spec=oc_spec, client=client, store=store, backend=backend, broker=broker
+        spec=oc_spec,
+        client=client,
+        store=store,
+        backend=backend,
+        broker=PermissionBroker(memory, client, cfg) if broker else None,
     )
     # This rig wires NO `TurnWatch`, which is the deployment the settled wait degrades in
     # (`EVENT_MODE = "poll"`, or no opencode route): with no reader there is no way to learn
     # that a still-running voice turn ended, so it waits a fixed grace instead. The shipped
     # grace is 5s -- longer than any test may pay -- and this is the only place it is set.
     monkeypatch.setattr(settle_module, "SETTLE_GRACE_S", POLL_S)
+    worker = RecordingWorker(cfg, memory)
     brain = Brain(cfg, memory, worker, logging.getLogger("r2d2.test.brain"), opencode=wiring)
+    return Rig(brain, server, net, memory, cfg, oc_spec, store, backend), memory
+
+
+@pytest.fixture
+async def rig(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: Net, server: FakeOpencode
+):
+    """The whole stack, assembled exactly as todo 18 will assemble it in main."""
+    built, memory = await build_stack(tmp_path, monkeypatch, net, server, broker=True)
     try:
-        yield Rig(brain, server, net, memory, cfg, oc_spec, store, backend)
+        yield built
+    finally:
+        await memory.close()
+
+
+@pytest.fixture
+async def core_brain_no_broker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, net: Net, server: FakeOpencode
+):
+    """The same stack with `broker=None`: the supported deployment that never parks."""
+    built, memory = await build_stack(tmp_path, monkeypatch, net, server, broker=False)
+    try:
+        yield built
     finally:
         await memory.close()
 
@@ -1420,17 +1452,29 @@ async def test_no_refuses_a_pending_opencode_ask(rig: Rig) -> None:
 
 
 async def test_text_that_is_not_an_answer_leaves_the_ask_pending(rig: Rig) -> None:
+    """`unrelated` must change NOTHING -- and with F1 that includes the turn itself.
+
+    The subject here is the reader, not the gate: a message that is not a confirmation
+    word must not resolve a pending ask, and this is the one test that proves the
+    reader says `unrelated` rather than guessing. F1 changed what the TURN does in
+    this state -- a session parked on our own ask now refuses the new question with a
+    stated loss instead of submitting it into a session the server calls `busy` (see
+    section 3a) -- and the old `text == ANSWER` assertion is the visible consequence.
+    The ask is still untouched, which is the property this test is named for.
+    """
     # Given an opencode ask, and a user who asks something else entirely
     record = await store_ask(rig)
     await rig.warm()
     rig.server.reply = ANSWER
     # When
     text = await rig.say(QUESTION)
-    # Then the question is answered, the ask is untouched, and nothing was posted
-    # to the permissions route -- "unrelated" must change nothing
-    assert text == ANSWER
+    # Then nothing was posted to the permissions route -- "unrelated" must change
+    # nothing -- and the ask is still exactly as it was
     assert rig.server.permission_answers == []
     assert await rig.memory.get_pending(APP) == record
+    # And the turn is the F1 stated loss, not a submit into a parked session
+    assert text == PARKED
+    assert rig.server.turns == []
 
 
 async def test_the_shell_confirmation_gate_still_runs_its_own_pending_action(rig: Rig) -> None:
@@ -1445,6 +1489,139 @@ async def test_the_shell_confirmation_gate_still_runs_its_own_pending_action(rig
     # ... and it did not go through the opencode route at all
     assert rig.server.requests == []
     assert rig.server.permission_answers == []
+
+
+# ---------------------------------------------------------------------------
+# 3a. F1: a second question while the session is parked on our own ask
+# ---------------------------------------------------------------------------
+
+
+async def test_a_question_asked_while_the_session_is_parked_is_refused_not_queued(
+    rig: Rig,
+) -> None:
+    """The turn F1 lost, pinned at the place the decision is made.
+
+    Measured on opencode 1.18.33 (`qa/live-run-v9.md` F1): with one ask
+    outstanding the server reports the session `busy`, a question asked then is
+    acknowledged inside Alice's budget, and the turn is accepted with 204 and then
+    **never served** — the transcript keeps the user message and no `assistant`
+    message ever answers it. The live run spent 3.2 s of voice budget, armed a
+    collector, and burned its whole 600 s ceiling on that turn before the job was
+    superseded. Nothing about that is recoverable from the client side, because
+    `GET /session/status` says only `busy` and the queue has no drain route.
+
+    So the invariant is that no task is submitted into a parked session at all, and
+    it is asserted on the wire: zero turns, not "the answer arrived late".
+    """
+    # Given: a WARM session (so the voice path would run and the C8 shortcut is not
+    # what is being tested) with an unanswered ask of ours, which is what parks it
+    await rig.warm()
+    record = await store_ask(rig)
+    rig.server.reply = ANSWER
+    # When: the user asks something else entirely
+    text = await rig.say(QUESTION)
+    # Then: NOTHING reached the message route -- no voice turn, no submitted task
+    assert rig.server.turns == []
+    # And the ask is untouched: the gate refuses THIS turn, it does not answer
+    # the question the user is already being asked
+    assert rig.server.permission_answers == []
+    assert await rig.memory.get_pending(APP) == record
+    # And the user is told the truth, in seconds, naming the cause and the remedy
+    assert text == PARKED
+    assert "не выполнил" in text.lower()
+    assert "«да»" in text or "«нет»" in text
+
+
+async def test_the_park_refusal_does_not_wedge_the_ask_it_refused_over(rig: Rig) -> None:
+    """A gate that also blocks the answer would trade a lost turn for a lost session.
+
+    The refusal is scoped to the turn that arrived while the session was parked. The
+    ask itself stays answerable, which is the only thing that makes the remedy in
+    the refusal text real: the user is told to answer «да»/«нет» and ask again, and
+    that instruction has to work.
+    """
+    # Given: the parked session from the refusal above, still holding its ask
+    await rig.warm()
+    await store_ask(rig)
+    await rig.say(QUESTION)
+    # When: the user answers the ORIGINAL question
+    text = await rig.say("да")
+    # Then: the ask was approved, and the pending row is gone
+    assert [answer[2] for answer in rig.server.permission_answers] == [{"response": "once"}]
+    assert await rig.memory.get_pending(APP) is None
+    assert len(text) <= 60
+
+
+async def test_the_park_gate_closes_once_the_ask_is_answered(rig: Rig) -> None:
+    """The gate reads the ROW, so an answered ask stops refusing turns.
+
+    Without this, a session that had ever parked would refuse every turn for the
+    rest of the process's life — the same wedge, one answer later.
+    """
+    # Given: a parked session whose ask is then answered
+    await rig.warm()
+    record = await store_ask(rig)
+    await rig.say("да")
+    assert await rig.memory.get_pending(APP) is None
+    # When: the user asks a normal question, answered in place
+    rig.server.reply = ANSWER
+    text = await rig.say(QUESTION)
+    # Then: the turn is served again, in place, with no escalation and no re-ask
+    assert text == ANSWER
+    assert [turn.agent for turn in rig.server.turns] == [VOICE_AGENT]
+    assert not [turn for turn in rig.server.turns if turn.submitted]
+    assert [answer[2] for answer in rig.server.permission_answers] == [{"response": "once"}]
+    assert record["permission_id"] == "per_1"
+
+
+async def test_an_ask_in_another_users_session_does_not_park_this_one(rig: Rig) -> None:
+    """`parked` is per (application_id, session_id): the row is keyed by the user.
+
+    The two halves have to match, and matching only the user would make a stranger's
+    ask park this user's session; matching only the session would make the check
+    unreadable, because the row is stored per user. This is the direction that is
+    wrong in silence, so it is pinned: `OTHER_APP` has its own session, and its ask
+    must not reach across.
+    """
+    # Given: a warm session for this user and an ask parked on a DIFFERENT user's session
+    await rig.warm()
+    other_session = await rig.store.resolve(OTHER_APP)
+    assert other_session
+    await rig.memory.set_pending(
+        OTHER_APP,
+        {
+            "kind": "opencode_permission",
+            "session_id": other_session,
+            "permission_id": "per_other",
+            "title": "rm -rf /tmp/other",
+            "always": [],
+            "requested_at": time.time(),
+        },
+    )
+    rig.server.reply = ANSWER
+    # When: THIS user asks a question
+    text = await rig.say(QUESTION)
+    # Then: it is served normally, because the parked session is not this one
+    assert text == ANSWER
+    assert [turn.agent for turn in rig.server.turns] == [VOICE_AGENT]
+
+
+async def test_a_deployment_with_no_broker_still_escalates(core_brain_no_broker) -> None:
+    """A gate that refuses when it cannot tell is an outage with a security rationale.
+
+    `EVENT_MODE` unknown, or a deployment that wired no broker, is a supported
+    configuration. The park is a fact R2D2 itself created, so a build that brokered
+    nothing created none — and the honest reading there is `False`, not a refusal
+    nobody asked for.
+    """
+    rig = core_brain_no_broker
+    # Given: a warm session and NO broker at all
+    await rig.warm()
+    rig.server.reply = SENTINEL
+    # When: the user asks for real work
+    await rig.say(QUESTION)
+    # Then: the turn reached the agent, exactly as it did before the gate existed
+    assert [turn.agent for turn in rig.server.turns if turn.submitted] == [TASK_AGENT]
 
 
 # ---------------------------------------------------------------------------

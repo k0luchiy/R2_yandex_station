@@ -33,6 +33,10 @@ records that the server sends it *even while a tool is blocked on a permission a
 which is why `core/opencode/sse_frames.turn_is_complete` needs a conjunction -- so an idle
 frame cannot answer the question this gate has, which is "is the text in hand the plan or
 the result?". An unanswered ask answers it exactly.
+
+allow: SIZE_OK -- 443 pure LOC, a test module grows with the delivery rules it pins, and
+the two park shapes -- an answerable ask and an unanswerable `question` -- are separate
+sections because they have opposite bounds.
 """
 
 from __future__ import annotations
@@ -49,6 +53,7 @@ import pytest
 import respx
 
 from app.config import Config
+from core import permission_sweep as sweep_module
 from core.answer_gate import NO_REPLY
 from core.async_worker import Worker
 from core.backends.config_loader import BackendSpec
@@ -57,6 +62,7 @@ from core.memory import Memory
 from core.opencode.client import OpencodeClient
 from core.opencode.sse import OpencodeEvent
 from core.opencode.turn_watch import TurnWatch
+from core.permission_sweep import park_bound_s
 
 # ---------------------------------------------------------------------------
 # The vocabulary, read off the shipped config
@@ -80,9 +86,15 @@ USER_QUESTION: Final = "msg_question"
 TASK_MESSAGE: Final = "msg_task"
 
 #: Short enough that the suite pays nothing, and the parked wait ends when the test wants
-#: it to end. The production value is 300 s and the gate adds one poll interval to it.
+#: it to end. The production value is 300 s and the gate adds one SWEEP to it -- not one
+#: poll interval, which is the F1 fix: the poll is how often R2D2 LOOKS, and the sweep
+#: is how often the broker's refusal can actually land.
 PERMISSION_TIMEOUT_S: Final = 0.2
 POLL_S: Final = 0.02
+#: The sweep cadence, shrunk for this file. It is 30 s in production and a test that
+#: waited the real one would pay 30 s to assert a bound, so the tests patch it at the
+#: module it is defined in. `park_bound_s` reads it at CALL time for exactly this.
+SWEEP_S: Final = 0.05
 NOW_S: Final = 5.0
 
 
@@ -110,6 +122,25 @@ def ask_frame(message_id: str = BLOCKED_MESSAGE) -> OpencodeEvent:
 def replied_frame() -> OpencodeEvent:
     """A `permission.replied`, which is what the broker's answer produces on the wire."""
     return frame("permission.replied", {"sessionID": SESSION, "requestID": ASKED, "reply": "once"})
+
+
+def question_frame(request_id: str = "que_1") -> OpencodeEvent:
+    """A `question.asked` -- the frame R2D2's matrix makes unreachable, and names anyway.
+
+    NOT OBSERVED ON THE WIRE. `GET /doc` on 1.18.33 advertises
+    `/session/{sessionID}/question/{requestID}/reply` and `/reject`, so the server has
+    the feature, and this frame is the only shape that could announce it. A live
+    `prompt_async` attempt to provoke one failed -- the model said it had no such
+    tool -- which is recorded in `qa/live-run-v9.md` F4 as a failed attempt rather than
+    as a disproof.
+
+    The shape is inferred from the permission frame's own keys: the server reuses
+    `sessionID` for routing and names the thing a reply must reference. Which key
+    holds the id does not matter to the code under test -- `TurnWatch` falls back
+    through `permission_id`, then `request_id`, then a literal -- and that fallback is
+    itself part of what is being pinned: a frame with neither key must still park.
+    """
+    return frame("question.asked", {"sessionID": SESSION, "requestID": request_id})
 
 
 def idle_frame() -> OpencodeEvent:
@@ -231,7 +262,8 @@ async def memory(tmp_path) -> Iterator[Memory]:
 
 
 @pytest.fixture
-def cfg(workspace: str) -> Config:
+def cfg(workspace: str, monkeypatch: pytest.MonkeyPatch) -> Config:
+    monkeypatch.setattr(sweep_module, "SWEEP_INTERVAL_S", SWEEP_S)
     return Config(
         telegram_bot_token="TESTTOKEN",
         telegram_chat_id="42",
@@ -392,9 +424,97 @@ async def test_a_plan_is_never_delivered_while_the_question_is_still_open(
     # Then
     assert sent == NO_REPLY
     assert NARRATION not in sent
-    # ... and the bound that ended the wait is the broker's own window, on the record
+    # ... and the bound that ended the wait is the broker's own window PLUS ONE SWEEP,
+    # which is the F1 fix. It used to be the window plus one POLL interval, i.e. 2 s
+    # where the sweep is 30: the gate gave up 28 s before the refusal that ends the park
+    # and declared a loss for an answer that was seconds from arriving. The bound is read
+    # off `park_bound_s` rather than recomputed, so a second disagreement is one failure.
     assert "still parked" in caplog.text
-    assert f"at {PERMISSION_TIMEOUT_S + POLL_S:.0f}s" in caplog.text
+    assert f"at {park_bound_s(PERMISSION_TIMEOUT_S):.0f}s" in caplog.text
+
+
+async def test_a_question_nobody_can_answer_is_a_stated_loss_on_the_first_round(
+    cfg: Config, memory: Memory, telegram: Telegram, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F4: a `question.asked` is not the parked case above, and must not be waited on.
+
+    The test above waits out the broker's window, and that is right for a
+    `permission.asked`: the user can answer that one, and the sweep ends it when they
+    do not. A `question.asked` has no such question. R2D2 never put it in Telegram --
+    the `question` tool does not raise `permission.asked`, so the broker never sees it
+    -- and there is nothing in the pending row to answer. Waiting the park bound and
+    then reporting is the same delay the rule exists to remove, and the reaper's 900 s
+    is the next bound after that.
+
+    So the loss is stated on the first round, and the log says WHY, because the cause
+    is a deployment fact and not a code bug: the matrix on disk says `question: deny`
+    and the matrix in the server does not.
+    """
+    # Given: a turn that parked on a question, with a plan written before it
+    worker, watch = build(cfg, memory, Transcript([list(START)]))
+    watch.note(question_frame())
+    # When
+    with caplog.at_level(logging.WARNING, logger="r2d2.test.gate"):
+        sent = await deliver(worker, telegram)
+    # Then: the stated loss, and never the plan
+    assert sent == NO_REPLY
+    assert NARRATION not in sent
+    # And it was stated AT ONCE -- no "still parked" line, which is the line the
+    # bounded wait above ends with, and which would mean this took the park bound
+    assert "still parked" not in caplog.text
+    # And the log names the cause and the repair, so an operator is not left guessing
+    assert "que_1" in caplog.text
+    assert "install_r2d2_opencode_config.sh" in caplog.text
+    # And the park is recorded as UNANSWERABLE, separately from an answerable ask:
+    # a `permission.asked` would leave `waiting` populated and this leaves it empty,
+    # because there is no reply that could ever clear it
+    state = watch.state(SESSION)
+    assert state.unanswerable == "que_1"
+    assert state.waiting == {}
+
+
+async def test_a_question_frame_with_no_id_still_parks(
+    cfg: Config, memory: Memory, telegram: Telegram
+) -> None:
+    """A frame with neither `id` nor `requestID` must park, not fall through.
+
+    The fallback exists because the id is only used for the log line and for telling
+    two questions apart -- neither of which is worth dropping a park over. The shape
+    that would actually be harmful is the opposite one: a `question.asked` that did NOT
+    set `unanswerable` would leave `blocked` false, and the gate would read
+    `session.idle` (which the server sends even while blocked) as the end of the turn
+    and deliver the plan as the answer. That is the D13 defect, re-created through a
+    new frame.
+    """
+    # Given: a question frame carrying no id at all
+    worker, watch = build(cfg, memory, Transcript([list(START)]))
+    watch.note(frame("question.asked", {"sessionID": SESSION}))
+    # Then: the turn is parked, unanswerably, whatever the frame left out
+    state = watch.state(SESSION)
+    assert state.blocked
+    assert state.unanswerable is not None
+    # And the delivery is the stated loss rather than the plan
+    assert await deliver(worker, telegram) == NO_REPLY
+
+
+async def test_a_question_in_one_session_does_not_park_another(
+    cfg: Config, memory: Memory, telegram: Telegram
+) -> None:
+    """The per-session filter is the reader's, and `note` must not undo it.
+
+    `EventSource` drops any frame whose `sessionID` is not the one it was opened for,
+    so a `question.asked` for a stranger's session should never reach `note`. This
+    pins the half that is not the reader's: a frame with NO `sessionID` is a
+    connection-level event (`server.connected`, `server.heartbeat`) and must not be
+    attributed to the session that happens to be in hand. Attributing it would park a
+    turn on another conversation's question.
+    """
+    # Given: a question frame for no session at all
+    watch = TurnWatch()
+    watch.note(frame("question.asked", {"requestID": "que_stranger"}))
+    # Then: nothing was attributed, and the session is not parked
+    assert watch.state(SESSION).unanswerable is None
+    assert not watch.state(SESSION).blocked
 
 
 async def test_a_turn_nobody_parked_on_is_still_delivered_unchanged(

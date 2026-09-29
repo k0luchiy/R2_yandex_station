@@ -22,7 +22,7 @@ assertion:
 
 Nothing here talks to a server, so the suite is deterministic and offline.
 
-allow: SIZE_OK -- 534 pure LOC, 46 tests. Every test file in this repo is 257-991
+allow: SIZE_OK -- 552 pure LOC, 46 tests. Every test file in this repo is 257-991
 pure LOC and a test module grows with the number of behaviours it pins; splitting
 the two permission-matrix checkers from the prompt and install tests would give
 each half a file that cannot say what the other half forbids.
@@ -336,6 +336,29 @@ def test_agent_asks_before_everything_except_its_allowlist():
     assert permission["doom_loop"] == "ask"
     assert isinstance(permission["bash"], dict)
     assert permission["bash"]["*"] == "ask"
+
+
+def test_the_question_tool_is_denied_to_both_agents():
+    """F4: the one tool whose "ask" is not a permission, because it is not R2D2's.
+
+    `question` does not raise `permission.asked`. It asks the user directly and then
+    waits, and R2D2 is not in that conversation: nothing reaches the broker, nothing
+    goes to Telegram, and the session sits in `busy` until the process dies. Measured
+    on opencode 1.18.33 (`qa/live-run-v9.md` F4): `opencode debug agent r2d2-agent`
+    reports `tools.question = true` under `"question": "ask"` and `false` under
+    `"question": "deny"` -- `deny` removes the tool from the model entirely, so there
+    is no call left to strand a turn. The voice agent has always denied it; this test
+    is what keeps the working agent in step, and the set is asserted for both agents
+    so the next edit that adds it back has to change this line.
+    """
+    # Given: the shipped matrix for both agents
+    config = load()
+    # When/Then: neither agent is offered the tool
+    for name in (VOICE, AGENT):
+        assert config["agent"][name]["permission"]["question"] == "deny", (
+            f"{name} may use `question`, which parks a turn on a question nobody is "
+            f"going to answer (qa/live-run-v9.md F4)"
+        )
 
 
 def test_both_agents_decide_every_permission_key_so_nothing_is_inherited():

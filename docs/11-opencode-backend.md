@@ -362,7 +362,7 @@ prose после неё — нет, и это разговор, который �
         "task": "ask",
         "skill": "ask",
         "lsp": "ask",
-        "question": "ask",
+        "question": "deny",
         "webfetch": "allow",
         "websearch": "allow",
         "external_directory": "ask",
@@ -377,10 +377,42 @@ prose после неё — нет, и это разговор, который �
 | `*` | `deny` | `ask` | у агента каждое незнакомое действие проходит через человека, у голосового — не проходит никогда |
 | `bash` | `ask` | `ask` | у обоих вне списка — вопрос пользователю; у голосового `ask` выбран намеренно вместо `deny` (см. 3.2 и [09-security.md](09-security.md) 8.5а), потому что сохранённый отказ печатал в общей сессии чужую матрицу, которую следующий агент читал как свою |
 | `edit` | `deny` | `ask` | редактирование файлов нужно для работы, но не для ответа на вопрос |
-| `task`, `skill`, `lsp`, `question` | `deny` | `ask` | вложенные агенты и LSP — сила, не необходимость; в голосовом пути это лишние секунды |
+| `task`, `skill`, `lsp` | `deny` | `ask` | вложенные агенты и LSP — сила, не необходимость; в голосовом пути это лишние секунды |
+| `question` | `deny` | `deny` | **не `ask` ни у одного** — см. 3.3а |
 | `webfetch`, `websearch` | `deny` | `allow` | ответ на вопрос не требует сети; исследование требует |
 | `external_directory` | `deny` | `ask` | выход за пределы рабочего каталога — всегда решение человека |
 | `doom_loop` | `deny` | `ask` | зацикливание настолько дорого, что в голосовом пути оно запрещено |
+
+### 3.3а Почему `question` запрещён у обоих агентов
+
+Это единственная ячейка в таблице выше, где «спрашивать» было бы не
+разрешением, а **потерей**. Инструмент `question` устроен как
+`permission.asked`, только без права ответить: он задаёт вопрос пользователю и
+ждёт, и в R2D2 ждать некому — Алиса не умеет показывать вопрос после
+подтверждения, а вопрос из этого инструмента не идёт в Telegram.
+
+Живой прогон на **opencode 1.18.33** это измерил (`qa/live-run-v9.md` §F4).
+`opencode debug agent r2d2-agent` на поставленной матрице даёт
+`tools.question = true` и действующее правило `question: ask`; на scratch-конфиге
+с `question: deny` — `tools.question = false`, то есть **инструмент убирается у
+модели целиком**, а не запрещается на вызове. Это и есть нужное свойство: не
+существует вызова, который можно отклонить, потому что не существует вызова.
+Репозиторий и `/question`, и `/reject` у 1.18.33 отдаёт, так что серверная
+возможность есть и выключается матрицей.
+
+`ask` здесь означал бы: сервер держит ход в `busy`, R2D2 отвечает на голос
+«Проверяю, пришлю в телеграм», и вопрос уходит в никуда. Сессия остаётся `busy`,
+а вместе с ней — и все следующие ходы (см. F1 ниже и
+[docs/11-opencode-contract.md](11-opencode-contract.md)).
+
+**Страховка в коде.** Матрица на диске и матрица в сервере — это два разных
+файла, и `OPENCODE_CONFIG_DIR` сливается с глобальным конфигом, а не изолирует
+его. Если кадр `question.asked` всё же пришёл (устаревшая установка, чужой
+конфиг), `core/opencode/turn_watch.py` запоминает его как **неотвечаемую**
+парковку — не в `waiting`, где брокер ждёт ответа 300 с, а отдельным флагом, —
+и `core/answer_gate.py` объявляет потерю на первом же круге, а не через 600 с.
+Пользователю это приходит как «агент не ответил», а в лог уходит WARNING с
+указанием переустановить матрицу.
 
 ### 3.4 Что R2D2 отправляет в этих полях
 
@@ -871,7 +903,49 @@ ASK_SOURCE: Final[Mapping[str, str]] = MappingProxyType(
 старте говорит об этом в INFO и не отвечает ни на что. Отказывать —
 восстановимо, отвечать неправильно — нет.
 
+### 5.5 Паркованная сессия: задача в неё не отправляется
+
+У брокера есть ещё один метод, `PermissionBroker.parked(app_id, session_id)`, и
+он отвечает на вопрос, которого не задавал ни один из предыдущих разделов:
+**«эта сессия сейчас стоит на нашем вопросе?»**
+
+```verbatim core/permissions.py
+    async def parked(self, app_id: str, session_id: str) -> bool:
+```
+
+Ответ читается из **строки** `pending_actions`, а не из памяти процесса. Это
+не оптимизация, а требование: гейт, перезапущенный посреди парковки, держит
+`TurnWatch`, который этого вопроса не видел, — а сервер всё ещё блокирован на
+том же `permission_id`. Единственное место, где такой гейт ошибётся, — это
+ровно то, что ломает рестарт, и оно не гейт.
+
+**Зачем вообще проверка.** Сервер не обслуживает ход, отправленный в паркованную
+сессию (U9 в [11-opencode-contract.md](11-opencode-contract.md)): ход принимается
+с 204, остаётся в транскрипте и не получает ответа никогда. Причём исход зависит
+от судьбы вопроса — при `once` очередь разгребается, при `reject` не разгребается
+никогда, — и отказ является **обычным** исходом, а не редким. Подробности и
+замеры в [`qa/live-run-v9.md`](../qa/live-run-v9.md) §F1 и
+[docs/07-latency-strategy.md](07-latency-strategy.md).
+
+Проверка стоит в двух местах, и оба нужны:
+
+| место | что не даёт |
+|---|---|
+| `core/session_route.py`, **до** голосового хода | потратить 3,2 с бюджета Алисы на заведомо не обслуживаемый ход |
+| `_hand_over` в `core/session_collector.py` | отправить задачу агенту в сессию, которую сервер всё ещё зовёт `busy` |
+
+`_hand_over` в `core/session_collector.py` — единственное место во всём сервере,
+отправляющее задачу агенту, и поэтому инвариант «задача не уходит в паркованную
+сессию» держится в одной точке, а не в трёх ветках маршрута. Обе точки спрашивают
+**одну** функцию (`SessionCollector.parked`), и обеим она отвечает `False` для
+развёртывания без брокера: гейт существует потому, что парковку создаёт сам R2D2,
+а сборка, которая ничего не брокерила, не создала ни одной.
+
+Развёртывание без брокера (`EVENT_MODE` неизвестен, или брокер не подключён) —
+поддерживаемое, и для него поведение остаётся прежним: отправка происходит.
+
 ---
+
 
 ## 6. Цепочка фолбэков
 
@@ -973,6 +1047,10 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 ```verbatim core/session_route.py
         session_id = await self._session_of(wiring, app_id)
         await self.collector.sweep_residue(wiring, app_id, session_id)
+        if await self.collector.parked(wiring, app_id, session_id):
+            rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
+            rec.path = metrics.PATH_PARKED
+            return PARKED, False
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
@@ -1064,11 +1142,21 @@ PATH_VOICE: Final = "voice"
 PATH_ESCALATE: Final = "escalate"
 PATH_ERROR: Final = "error"
 PATH_DEADLINE: Final = "deadline"
+#: The turn was refused before it reached a model, because the session was parked on
+#: an ask the user had not answered. It is its own path and not `error` because nothing
+#: failed: the request was read, understood, and deliberately not submitted, because
+#: opencode does not serve a turn submitted into a session it still calls busy
+#: (`qa/live-run-v9.md` F1). Without it this turn recorded `path=voice` with a model
+#: that answered nothing, which is the one shape the ledger cannot be read for.
+PATH_PARKED: Final = "parked"
 ```
 
 `route=opencode` с `path=voice` — уложился; `path=escalate` — ушёл агенту;
 `path=deadline` — не уложился и ответ заберёт воркер; `path=error` — сработала
-graceful-ветка. Ни в одном поле нет ничего, что пришло из `${...}`, поэтому
+graceful-ветка; `path=parked` — ход прочитан и **намеренно не отправлен**, потому
+что сессия стоит на неотвеченном вопросе (F1, раздел 3). Последнее — единственный
+путь, при котором `model=` пуст: ни одна модель не отвечала, и записать здесь
+`voice` было бы ложью, которую нельзя отличить в сводке. Ни в одном поле нет ничего, что пришло из `${...}`, поэтому
 секрет в такую строку попасть не может.
 
 ---
@@ -1079,9 +1167,18 @@ graceful-ветка. Ни в одном поле нет ничего, что п�
 #: The event names U4 recorded, verbatim (C5). `GET /doc` also advertises V2
 #: spellings (`permission.v2.asked`, `session.next.*`) which this build was never
 #: seen sending, so they are not defined here and must not be used.
+#:
+#: `QUESTION_ASKED` is the exception and is defined without having been seen sent:
+#: `GET /doc` on 1.18.33 advertises `/session/{sessionID}/question/{requestID}/reply`
+#: and `/reject`, so the server has the feature, and a `question.asked` frame is the
+#: only shape that could announce it. R2D2's matrix denies the tool (measured: `deny`
+#: removes it from the model entirely), so the frame is a BACKSTOP for a stale install
+#: and not an expected event -- which is exactly why it must be named here rather than
+#: left to fall through `note`'s `else: return` as an unknown frame.
 CONNECTED: Final = "server.connected"
 PERMISSION_ASKED: Final = "permission.asked"
 PERMISSION_REPLIED: Final = "permission.replied"
+QUESTION_ASKED: Final = "question.asked"
 TURN_COMPLETE: Final = "session.idle"
 TEXT_DELTA: Final = "message.part.delta"
 

@@ -63,7 +63,7 @@ from typing import Final, Literal, TypeAlias
 import httpx
 
 __all__ = [
-    "CONNECTED", "EVENT_MODE", "PERMISSION_ASKED", "PERMISSION_REPLIED",
+    "CONNECTED", "EVENT_MODE", "PERMISSION_ASKED", "PERMISSION_REPLIED", "QUESTION_ASKED",
     "SSE_DEFAULT_EVENT", "TEXT_DELTA", "TITLE_CHARS", "TURN_COMPLETE", "EventMode",
     "OpencodeEvent", "decode_frame", "frames", "turn_is_complete",
 ]
@@ -73,9 +73,18 @@ log = logging.getLogger(__name__)
 #: The event names U4 recorded, verbatim (C5). `GET /doc` also advertises V2
 #: spellings (`permission.v2.asked`, `session.next.*`) which this build was never
 #: seen sending, so they are not defined here and must not be used.
+#:
+#: `QUESTION_ASKED` is the exception and is defined without having been seen sent:
+#: `GET /doc` on 1.18.33 advertises `/session/{sessionID}/question/{requestID}/reply`
+#: and `/reject`, so the server has the feature, and a `question.asked` frame is the
+#: only shape that could announce it. R2D2's matrix denies the tool (measured: `deny`
+#: removes it from the model entirely), so the frame is a BACKSTOP for a stale install
+#: and not an expected event -- which is exactly why it must be named here rather than
+#: left to fall through `note`'s `else: return` as an unknown frame.
 CONNECTED: Final = "server.connected"
 PERMISSION_ASKED: Final = "permission.asked"
 PERMISSION_REPLIED: Final = "permission.replied"
+QUESTION_ASKED: Final = "question.asked"
 TURN_COMPLETE: Final = "session.idle"
 TEXT_DELTA: Final = "message.part.delta"
 

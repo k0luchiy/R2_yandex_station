@@ -50,7 +50,7 @@ from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded
 from core.opencode.session_store import OcSessionStore
 from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker, PermissionVerdict
-from core.session_collector import SessionCollector
+from core.session_collector import PARKED, SessionCollector
 
 #: The backend kind that answers from a persistent opencode session. It is the
 #: opencode ROUTE, never a member of the fallback chain -- `core/brain.py` filters
@@ -130,6 +130,10 @@ class SessionRoute:
         rec.agent = wiring.spec.voice_agent
         session_id = await self._session_of(wiring, app_id)
         await self.collector.sweep_residue(wiring, app_id, session_id)
+        if await self.collector.parked(wiring, app_id, session_id):
+            rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
+            rec.path = metrics.PATH_PARKED
+            return PARKED, False
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.

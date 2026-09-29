@@ -61,6 +61,13 @@ PATH_VOICE: Final = "voice"
 PATH_ESCALATE: Final = "escalate"
 PATH_ERROR: Final = "error"
 PATH_DEADLINE: Final = "deadline"
+#: The turn was refused before it reached a model, because the session was parked on
+#: an ask the user had not answered. It is its own path and not `error` because nothing
+#: failed: the request was read, understood, and deliberately not submitted, because
+#: opencode does not serve a turn submitted into a session it still calls busy
+#: (`qa/live-run-v9.md` F1). Without it this turn recorded `path=voice` with a model
+#: that answered nothing, which is the one shape the ledger cannot be read for.
+PATH_PARKED: Final = "parked"
 
 #: The one record per turn. The first seven fields are the format the plan pins;
 #: `msgs` and `tools` are what the line it replaced carried, kept because they are

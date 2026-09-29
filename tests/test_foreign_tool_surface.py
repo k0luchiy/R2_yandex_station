@@ -111,10 +111,18 @@ SYNTHETIC_MCP_TOOLS: Final = (
 #: another name, and `invalid` is opencode's no-op placeholder -- both are
 #: reachable through the buckets the matrix already declares.
 DECLARED_FOR_VOICE: Final = frozenset({"bash", "read", "glob", "grep"})
+#: `question` is ABSENT on purpose, and its absence is the F4 fix rather than an
+#: omission. It is the one tool that asks the user something and then waits with no
+#: route for an answer: it does not raise `permission.asked`, so the broker never sees
+#: it, nothing goes to Telegram, and the session stays `busy` for the life of the
+#: process (`qa/live-run-v9.md` F4). Measured on 1.18.33, `deny` removes the tool from
+#: the model entirely rather than refusing the call, so "not reachable" is the property
+#: that has to hold. If a future edit puts it back, this set is where the change is
+#: forced to be a decision.
 DECLARED_FOR_AGENT: Final = frozenset(
     {
         "bash", "read", "glob", "grep", "edit", "write", "apply_patch", "invalid",
-        "task", "webfetch", "websearch", "skill", "lsp", "question",
+        "task", "webfetch", "websearch", "skill", "lsp",
     }
 )
 #: The full catalogue each assertion below is run against, so "nothing else is

@@ -39,11 +39,34 @@ from typing import Final
 from core.memory import Memory
 from core.pending_permission import PendingPermission, PermissionQueue
 
-__all__ = ["SWEEP_INTERVAL_S", "PermissionSweep", "SweepFound"]
+__all__ = ["SWEEP_INTERVAL_S", "PermissionSweep", "SweepFound", "park_bound_s"]
 
 #: The loop's own interval: short against a 300 s window, long against a server. A module
 #: constant rather than a config field because nothing about it is a deployment choice.
 SWEEP_INTERVAL_S: Final = 30.0
+
+
+def park_bound_s(window_s: float, sweep_s: float | None = None) -> float:
+    """How long an unanswered ask can keep a session parked: the window plus one sweep.
+
+    The broker closes an ask at `window_s`, but it only LOOKS every `sweep_s`, so the
+    refusal cannot land before the window is up AND a tick has gone by. Anything that
+    waits out a park has to allow for both, or it gives up while the server is still
+    blocked -- which is the difference between a delayed turn and a lost one.
+
+    One function because there are two waiters and they must not disagree: the answer
+    gate (`core/answer_gate.py`) decides when to stop believing a turn is still coming,
+    and the hand-over wait (`core/session_settle.py`) decides how long to keep a task
+    out of a parked session. A wait sized from the window alone would stop 30 s before
+    the refusal that ends the park, and the turn behind it would be handed to a session
+    the server still calls busy.
+
+    `sweep_s` is READ at call time rather than bound as a default argument, so the
+    cadence stays one fact in this module and a test that shrinks the sweep really
+    shrinks it. A default captured at import would leave both waiters pinned to 30 s
+    however the module is patched afterwards.
+    """
+    return window_s + (SWEEP_INTERVAL_S if sweep_s is None else sweep_s)
 
 
 @dataclass(frozen=True, slots=True)

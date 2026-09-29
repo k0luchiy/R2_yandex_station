@@ -35,6 +35,14 @@ not to touch it. So the fix is the **order**, not the sweep, and this module own
   agent parks its turn on a human answer. The conjunction is therefore load-bearing
   rather than theoretical, and hitting the bound below is an ordinary outcome of that
   policy choice, not a pathological server.
+* **A parked turn is waited out on the PARK's clock, not the turn's.** The conjunction
+  above already refuses to release a wait on a parked turn, so the only question left is
+  how long. `SETTLE_TIMEOUT_S` is sized for a turn that is still writing; a park is
+  governed by the broker's window instead, which is bounded and which this module reads
+  rather than guesses -- and the difference is not cosmetic, because opencode does not
+  serve a turn submitted into a session it still calls busy (`qa/live-run-v9.md` F1).
+  Releasing on the wrong bound therefore loses the turn; releasing on the park bound only
+  delays it, and the bound cannot expire without the broker having refused the ask.
 * **The wait is bounded, and the bound is stated.** `SETTLE_TIMEOUT_S` is three times
   the worst measured voice turn (18.6 s for a cold first turn, `docs/11-opencode-contract.md`
   U6) and a twentieth of the collector's own 600 s ceiling, so a turn that outruns it is
@@ -73,6 +81,7 @@ from typing import Final
 
 from app.config import Config
 from core.opencode.turn_watch import TurnWatch
+from core.permission_sweep import park_bound_s
 
 __all__ = ["SETTLE_GRACE_S", "SETTLE_TIMEOUT_S", "TurnSettler"]
 
@@ -110,6 +119,11 @@ class TurnSettler:
 
     def __init__(self, cfg: Config, logger: logging.Logger, forget_debt: ForgetDebt) -> None:
         self._poll_s = cfg.r2d2_event_poll_interval
+        #: How long a PARKED turn is waited out. The broker refuses every ask past
+        #: `r2d2_permission_timeout` and only looks every `SWEEP_INTERVAL_S`, so a park
+        #: is guaranteed to end inside that bound and no longer -- which is what makes
+        #: holding the hand-over over a park a delay rather than a new way to lose a turn.
+        self._park_s = park_bound_s(cfg.r2d2_permission_timeout)
         self._log = logger
         self._forget_debt = forget_debt
         self._waiting: set[asyncio.Task[None]] = set()
@@ -167,10 +181,24 @@ class TurnSettler:
     ) -> bool:
         """Whether the voice turn was SEEN to end inside the bound. `False` is a guess.
 
-        `True` is the only answer that lets the residue debt be written off, because it is
-        the only one backed by the server's own report rather than by a duration. Polling
+        `True` is the only answer that lets the residue debt be written off, because it
+        is the only one backed by the server's own report rather than by a duration. Polling
         `state.changed` is a wake-up and not the test: the predicate is re-read on every
         pass, so a transition that landed between two waits cannot be missed.
+
+        **The bound is a park bound while the turn is parked, and a turn bound otherwise.**
+        `SETTLE_TIMEOUT_S` is three times the worst measured voice turn, and that is what
+        it is sized for. A turn parked on an ask is a different animal: it cannot end
+        until a human answers or `core/permission_sweep.py` refuses the ask, and both of
+        those are governed by `r2d2_permission_timeout` plus one sweep tick. So a park
+        gets `park_bound_s` of patience and a merely-slow turn keeps `SETTLE_TIMEOUT_S`.
+
+        Which is not a nicety, because the two bounds have opposite failure directions. A
+        park released on the turn bound hands the task to a session the server still calls
+        busy -- and a busy session does not serve what it is handed, so the turn is
+        acknowledged and then answered never (`qa/live-run-v9.md` F1). A merely-slow turn
+        released on the park bound is a delay the user cannot tell from any other, and the
+        residue sweep still covers the ordering defect it was always covering.
         """
         if turns is None or not turns.watched(session_id):
             self._log.warning(
@@ -190,13 +218,25 @@ class TurnSettler:
                 return True
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._log.warning(
-                    "opencode: the turn in session %s was still running %.0fs after the voice "
-                    "deadline, so the request is handed to the agent while it may still be writing "
-                    "(the sweep at the entry of this user's next turn catches the rest). The user "
-                    "is acknowledged all the same and the collector is armed off Alice's clock.",
-                    session_id, SETTLE_TIMEOUT_S,
-                )
-                return False
+                if state.blocked:
+                    self._log.info(
+                        "opencode: the turn in session %s is parked on %d unanswered ask(s) and "
+                        "is still parked after the turn bound of %.0fs; the request is held for "
+                        "the broker's own window instead, because handing it to a session the "
+                        "server still calls busy loses the turn rather than delaying it.",
+                        session_id, len(state.waiting), SETTLE_TIMEOUT_S,
+                    )
+                    deadline = time.monotonic() + self._park_s
+                    remaining = deadline - time.monotonic()
+                else:
+                    self._log.warning(
+                        "opencode: the turn in session %s was still running %.0fs after the voice "
+                        "deadline, so the request is handed to the agent while it may still be "
+                        "writing (the sweep at the entry of this user's next turn catches the "
+                        "rest). The user is acknowledged all the same and the collector is armed "
+                        "off Alice's clock.",
+                        session_id, SETTLE_TIMEOUT_S,
+                    )
+                    return False
             with suppress(TimeoutError):
                 await asyncio.wait_for(state.changed.wait(), min(self._poll_s, remaining))

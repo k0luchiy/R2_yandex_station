@@ -28,9 +28,20 @@ ACCEPTED: Final = "Принято, выполняю: {title}."
 REFUSED: Final = "Отклонено: {title}."
 UNANSWERED: Final = "Подтверждение не получено, действие отклонено."
 UNANSWERABLE: Final = "Сервер не принял ответ, действие отклонено: {title}."
-#: An ask that arrived when the user already had as many open as the broker will hold. It
+#: An ask that arrived when the user already has as many open as the broker will hold. It
 #: never became a question, so this is the only sentence that has to explain itself.
 OVERLOADED: Final = "Запросов подтверждения слишком много, действие отклонено: {title}."
+#: An ask that is NEVER a question, because its output would be a credential. Two clauses
+#: because the user has to learn both: that the action did not happen, and that R2D2
+#: declined to ask rather than being told «нет». `{source}` is a place
+#: («окружение процесса», «файл с учётными данными») and never a value -- see
+#: `core/policies.py:credential_source`, whose docstring says why a scrub of the collected
+#: output would not have worked.
+CREDENTIAL_REFUSED: Final = (
+    "Действие отклонено, и я не буду спрашивать про него: команда «{title}» показала бы "
+    "{source} — это попало бы в историю сессии, которую агент перечитывает. Если он правда "
+    "нужен — выполни команду сам."
+)
 UNTITLED: Final = "действие opencode"
 #: A logged ask is truncated as well as escaped: a title can be kilobytes long.
 PREVIEW_CHARS: Final = 120

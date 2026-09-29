@@ -51,6 +51,7 @@ from core.opencode.sse_frames import (
     EVENT_MODE,
     PERMISSION_ASKED,
     PERMISSION_REPLIED,
+    QUESTION_ASKED,
     SSE_DEFAULT_EVENT,
     TEXT_DELTA,
     TITLE_CHARS,
@@ -64,8 +65,9 @@ from core.opencode.wire import OpencodeError, OpencodeStatusError
 
 __all__ = [
     "CONNECTED", "EVENT_MODE", "EventMode", "EventSource", "OpencodeEvent",
-    "PERMISSION_ASKED", "PERMISSION_REPLIED", "RECONNECT_MAX_S", "RECONNECT_MIN_S",
-    "SSE_DEFAULT_EVENT", "TEXT_DELTA", "TITLE_CHARS", "TURN_COMPLETE", "turn_is_complete",
+    "PERMISSION_ASKED", "PERMISSION_REPLIED", "QUESTION_ASKED", "RECONNECT_MAX_S",
+    "RECONNECT_MIN_S", "SSE_DEFAULT_EVENT", "TEXT_DELTA", "TITLE_CHARS", "TURN_COMPLETE",
+    "turn_is_complete",
 ]
 
 log = logging.getLogger(__name__)

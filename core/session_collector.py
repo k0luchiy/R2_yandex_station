@@ -44,6 +44,15 @@ The properties this module exists to hold:
   matrix, and five consecutive turns spent refusing commands that matrix permits
   (`qa/live-run-v6.md` §D9) -- and deleting the record does not undo it, because the
   prose the refusing agent wrote in its place is conversation and is never swept.
+* **A turn is not handed over into a session parked on a human.** `_hand_over` is the
+  one place in the server that submits an agent task, and it refuses to submit into a
+  session with an ask of ours outstanding, because opencode does not serve the queue
+  such a submission lands in: the turn is acknowledged inside Alice's budget and then
+  answered never. Measured on 1.18.33 (`qa/live-run-v9.md` F1), and the user's own
+  second question is the one that is lost. The refusal is a stated loss in the user's
+  chat, in seconds, rather than a silent one after the collector's whole 600 s
+  ceiling -- and it is the direction `docs/07-latency-strategy.md` already takes for
+  every other bounded loss here.
 * **That same turn's residue is therefore swept by its OWN hand-off**, from a
   snapshot taken after it ended, before the submit. `sweep_residue` at the entry of
   the next turn is the backstop for a wait that timed out or ran without an event
@@ -57,6 +66,14 @@ The properties this module exists to hold:
   decides the anchor is bounded by half a second, and when it times out the
   collector is armed anyway, on an anchor resolved off Alice's clock; if even that
   cannot be read, the loss is stated in the user's chat rather than logged.
+
+allow: SIZE_OK -- 305 pure LOC, over the 250 ceiling because `_hand_over` is the ONE
+place in the server that submits an agent task, and the F1 park gate is a property of
+that fact rather than of a branch: three escalation paths converge here so that none
+of them can grow a second submit, and a session parked on a human must be refused at
+this seam and not at each caller. The snapshot, the anchor and the sweep are one read
+for the same reason, and splitting them would let an ordering change slip between two
+files that each look correct.
 """
 
 from __future__ import annotations
@@ -79,7 +96,7 @@ from core.tools.telegram_tool import send_message
 #: message looks like, and the hand-off that writes one cannot spell it twice.
 from core.turn_lease import TASK_PREFIX  # noqa: F401 -- re-exported for `core/brain.py`
 
-if TYPE_CHECKING:  # the route composes this module, so the edge cannot be a runtime one
+if TYPE_CHECKING:  # the collector composes this module, so the edge cannot be a runtime one
     from core.session_route import HybridWiring
 
 #: The job type `core/async_worker.py` does not dispatch yet; todo 16 adds the
@@ -89,6 +106,15 @@ JOB_OPENCODE_REPLY: Final = "opencode_reply"
 #: The collector's ceiling, stated in the job rather than left to the reader. It
 #: is a ceiling and not a wait: `collect_reply` ends on the idle condition first.
 COLLECT_TIMEOUT_S: Final = 600.0
+#: What the user is told when a turn is NOT submitted because the session is parked on
+#: a question they have not answered yet. It has to name the cause and the remedy,
+#: because the promise it replaces was «Проверяю, пришлю в телеграм» and the user is
+#: owed the truth about why there is nothing coming (`docs/07-latency-strategy.md`).
+PARKED: Final = (
+    "Не выполнил: предыдущая команда ждёт вашего подтверждения в телеграме, а сессия не "
+    "берёт новых задач, пока вы не ответите. Ответьте «да» или «нет» на тот вопрос — и "
+    "спросите ещё раз."
+)
 
 
 class SessionCollector:
@@ -156,9 +182,49 @@ class SessionCollector:
     async def _hand_over(
         self, wiring: HybridWiring, app_id: str, session_id: str, task: str
     ) -> None:
-        """The one place in the server that submits an agent task and arms its collector."""
+        """The one place in the server that submits an agent task and arms its collector.
+
+        **A task is not submitted into a session that is parked on an ask of ours.**
+        That is the invariant this function exists to hold, and it is measured
+        (`qa/live-run-v9.md` F1): with one ask outstanding the server reports the
+        session `busy`, a question asked then is acknowledged in Alice's budget, and
+        opencode 1.18.33 puts the turn in a queue it does not serve -- the transcript
+        keeps the two `user` messages and no `assistant` ever answers them, and the
+        collector that was waiting for that answer spends its whole 600 s ceiling to
+        report a loss the user was told would arrive. The queue is not recoverable from
+        here, and the contract document is explicit that it is not to be assumed to
+        grow one.
+
+        So the check is made where the decision is, not where the damage shows: the
+        submit does not happen, and the user is told in their own chat rather than
+        waiting out a ceiling. `PermissionBroker.parked` reads the pending ROW rather
+        than the in-process watch, because a gateway that restarted mid-park has a
+        watch that never saw the ask while the server is still waiting on it.
+
+        A deployment with no broker at all (`EVENT_MODE` unknown, or a deployment that
+        does not wire one) is a supported one, and for it nothing parks that R2D2 knows
+        of: the hand-over proceeds, which is the behaviour it has always had.
+        """
+        if await self.parked(wiring, app_id, session_id):
+            await self._say(PARKED)
+            return
         await self._collect_later(wiring, app_id, session_id, task)
         await self._submit(wiring, app_id, session_id, task)
+
+    async def parked(self, wiring: HybridWiring, app_id: str, session_id: str) -> bool:
+        """Whether `session_id` is waiting on an answer to an ask of ours.
+
+        `False` for a deployment that wired no broker, which is the honest reading
+        there rather than a refusal nobody asked for: the gate exists because a park
+        is a fact R2D2 created, and a build that brokered nothing created none.
+
+        The row is the answer and not this process's memory of the ask. A gateway
+        restarted mid-park holds a watch that never saw the event while the server is
+        still blocked on the same `permission_id`, so the one place that is wrong is
+        the one place a restart makes wrong, and this is not it.
+        """
+        broker = wiring.broker
+        return broker is not None and await broker.parked(app_id, session_id)
 
     async def _submit(
         self, wiring: HybridWiring, app_id: str, session_id: str, task: str

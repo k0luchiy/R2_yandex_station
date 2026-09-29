@@ -6,6 +6,19 @@ until somebody answers, so a wrong answer here is arbitrary code execution.
 * **Two answers, one of them a trap.** The server also offers a durable grant in
   `properties.always` -- a RULE, not a per-turn answer -- so the domain is the two-value
   `Literal` below, the masks are LOGGED and never sent, no third value typechecks.
+* **One class of ask is never asked about at all.** An ask whose command would print a
+  credential -- the process environment, which is the opencode server's, or a file this
+  deployment keeps one in -- is REFUSED here rather than put to the user, and
+  `core/policies.py:credential_source` is the closed list that decides it. The reason is
+  measured (`qa/live-run-v9.md` F2): a user who reads «Нужно подтверждение: env | grep
+  -iE 'telegram|tg_|bot'» and answers «да» has approved writing the Telegram bot token
+  into the opencode transcript, which is permanent and is re-read by the model on every
+  later turn -- and a question whose honest answer is «да» is not a question. The
+  refusal goes out on the same route and the same one-value domain as every other refusal
+  here, so the turn is released instead of parking for 300 s on something that must not
+  be answered, and the model sees opencode's own refusal rather than a silent rewrite of
+  what its tool returned. Why a scrub of the collected output was NOT the fix is
+  `core/policies.py`'s header and `docs/09-security.md` §8.9.
 * **More than one ask at a time, one QUESTION at a time.** Two asks 0.55 s apart used to
   mean the first was refused before the user could answer it (`qa/live-run-v3.md` §D14), so
   the row under `application_id` holds a queue whose head is the ask on screen.
@@ -19,6 +32,15 @@ until somebody answers, so a wrong answer here is arbitrary code execution.
   that raised it, which is why the ingress declares one id per chat.
 
 Alice cannot push, so the question goes to Telegram and the answer returns as text.
+
+allow: SIZE_OK -- 335 pure LOC, over the 250 ceiling because this file is the single
+place an answer can reach opencode, and splitting it would put a second wire call
+somewhere that does not know the whole lifecycle: the queue in `pending_permission`,
+the 300 s fail-safe in `permission_sweep`, the park predicate `parked()` and the
+credential-source refusal are one decision each, and all five answer paths must go
+through one `_post` seam (asserted by count and by AST in
+`tests/test_permission_broker.py`). F2 added the refusal rather than replacing
+anything: the classifier itself is a pure function in `core/policies.py`.
 """
 
 from __future__ import annotations
@@ -38,8 +60,8 @@ from core.opencode.client import OpencodeClient, OpencodeError
 from core.opencode.sse import EVENT_MODE
 from core.pending_permission import KIND, PendingPermission, PermissionQueue
 from core.permission_sweep import SWEEP_INTERVAL_S, PermissionSweep
-from core.permission_words import ACCEPTED, OVERLOADED, PREVIEW_CHARS, QUESTION, REFUSED, UNANSWERABLE, UNANSWERED, UNTITLED, preview
-from core.policies import confirmation_verdict
+from core.permission_words import ACCEPTED, CREDENTIAL_REFUSED, OVERLOADED, PREVIEW_CHARS, QUESTION, REFUSED, UNANSWERABLE, UNANSWERED, UNTITLED, preview
+from core.policies import confirmation_verdict, credential_source
 from core.routing import for_human
 from core.tools.telegram_tool import send_message
 
@@ -134,7 +156,24 @@ class PermissionBroker:
         logged here, which is the only thing done with them. An ask arriving while another
         is open joins the queue behind the one on screen, so only one question is ever on
         screen and no ask becomes unanswerable.
+
+        **One class of ask is never put to the user at all, and that is the
+        `credential_source` branch.** The question R2D2 asks is «Нужно подтверждение:
+        env | grep -iE 'telegram|tg_|bot'», and a human reading it in a chat has no way
+        to know that the «да» does not mean «run this grep» but «write the Telegram bot
+        token into a permanent transcript the model re-reads on every later turn»
+        (`qa/live-run-v9.md` F2, measured). So the ask is refused HERE, where the
+        command is still a string and the value still only exists in a subprocess R2D2
+        does not run: the user is not asked a question whose honest answer is «да», and
+        the turn is released at once instead of parking for 300 s on a question that must
+        not be answered. Refusing is the direction every ambiguous path in this module
+        already takes, and it is a refusal the model sees as opencode's own -- so the
+        agent is told the call was refused rather than being left to re-derive it.
         """
+        source = credential_source(title)
+        if source is not None:
+            await self._refuse_credential(app_id, session_id, permission_id, title, source)
+            return
         ask = PendingPermission(
             session_id=session_id, permission_id=permission_id, title=title,
             masks=tuple(always), requested_at=time.time(),
@@ -224,11 +263,66 @@ class PermissionBroker:
                  source, self._window_s)
         await self._sweep.start(self.sweep_timeouts)
 
+    async def parked(self, app_id: str, session_id: str) -> bool:
+        """Whether an ask of OURS for that session is still unanswered on the server.
+
+        The row, not the event stream, is the authority here, and the difference is a
+        restart. `TurnWatch` is in-process memory: a gateway that restarts while a
+        session is parked comes back with a watch that has never seen the ask, so
+        `blocked` reads False while `GET /session/status` still says `busy`. The row
+        outlives the process, it is written before the question goes out, and it is
+        cleared only when the ask is answered or the sweep refuses it -- which is the
+        same event that releases the park. So a row naming this session means the
+        server is waiting on us, and that is what the hand-over must not submit into.
+
+        Total and cheap: one read, and a row of another `kind` -- the shell
+        confirmation `core/brain.py` writes into the same table -- is not ours, so it
+        parks nothing. A row holding asks for OTHER sessions of the same person does
+        not park this one either; the session id is in the record for exactly this.
+        """
+        queue = PermissionQueue.from_record(await self._memory.get_pending(app_id) or {})
+        if queue is None:
+            return False
+        return any(ask.session_id == session_id for ask in queue.outstanding)
+
     async def stop(self) -> None:
         """Stop the sweep and wait for it, so shutdown leaves no pending task."""
         await self._sweep.stop()
 
     # -- internals ---------------------------------------------------------
+
+    async def _refuse_credential(
+        self, app_id: str, session_id: str, permission_id: str, title: str, source: str
+    ) -> None:
+        """Refuse an ask whose output would be a credential, and say which one.
+
+        Deliberately NOT a question and deliberately NOT a queued row: an ask that must
+        not be answerable has no business in the queue, where the user's next «да» would
+        find it. The refusal goes to the server on the same route and with the same
+        one-value domain as every other refusal here, so the turn is released rather
+        than parked for 300 s, and the notice goes out through the same `for_human`
+        guard as every other body this module produces.
+
+        The notice names the SOURCE, never a value: the whole point is that the value
+        was never read by anything R2D2 controls, and a refusal that quoted one would
+        have to have read one first. The log line carries the same source and the
+        session, because "the agent reached for the environment" is the security signal
+        an operator wants and it is otherwise invisible.
+        """
+        refused = PendingPermission(
+            session_id=session_id, permission_id=permission_id, title=title,
+            masks=(), requested_at=time.time(),
+        )
+        landed = await self._post(refused, REFUSE)
+        log.warning(
+            "opencode permissions: %s asked to run a command that reads %s (session %s); it is "
+            "NOT put to the user, because a «да» to «%s» would write a credential into the "
+            "opencode transcript, which is permanent and is re-read by the model on every later "
+            "turn. The server %s.",
+            app_id, source, session_id, preview(title),
+            "took the refusal" if landed else "did NOT take the refusal",
+        )
+        await self._tell(CREDENTIAL_REFUSED.format(title=preview(title) or UNTITLED, source=source))
 
     async def _store(
         self, app_id: str, ask: PendingPermission

@@ -92,7 +92,7 @@
         "task": "ask",
         "skill": "ask",
         "lsp": "ask",
-        "question": "ask",
+        "question": "deny",
         "webfetch": "allow",
         "websearch": "allow",
         "external_directory": "ask",

@@ -72,6 +72,7 @@ from app.config import Config
 from core import routing
 from core.opencode.wire import MessageRecord
 from core.opencode.turn_watch import TurnState, TurnWatch
+from core.permission_sweep import park_bound_s
 
 __all__ = ["NO_REPLY", "AnswerGate"]
 
@@ -113,9 +114,12 @@ class AnswerGate:
     ) -> None:
         self._sentinel = cfg.r2d2_needs_agent_sentinel
         self._poll_s = cfg.r2d2_event_poll_interval
-        # The broker refuses an unanswered ask at its window, and its sweep runs every
-        # `r2d2_event_poll_interval`; past that the turn is not waiting for anybody.
-        self._parked_s = cfg.r2d2_permission_timeout + cfg.r2d2_event_poll_interval
+        # The broker refuses an unanswered ask at its window, and it only LOOKS every
+        # `SWEEP_INTERVAL_S`; past the window plus one sweep the turn is not waiting for
+        # anybody. The code added the poll interval instead -- 2 s where the sweep is 30 --
+        # which gave up on a turn up to 28 s before the refusal that ends it, and reported
+        # a loss for an answer that was seconds from arriving.
+        self._parked_s = park_bound_s(cfg.r2d2_permission_timeout)
         self._log = logger
         self._collect = collect
         self._turns = turns
@@ -145,6 +149,8 @@ class AnswerGate:
             if state is None or not self._turns.watched(session_id) or state.ended_after(started):
                 return text if self._is_answer(text) else self._refuse(text, session_id, state)
             if state.blocked:
+                if state.unanswerable is not None:
+                    return self._unanswerable(session_id, state)
                 if parked_at is None:
                     parked_at = time.monotonic()
                 anchor = state.blocked_at or anchor
@@ -194,6 +200,35 @@ class AnswerGate:
         """
         record = MessageRecord(id=COLLECTED, role=ASSISTANT_ROLE, text=text)
         return bool(routing.transcript_sweep([record], sentinel=self._sentinel).signal_ids)
+
+    def _unanswerable(self, session_id: str, state: TurnState) -> str:
+        """`NO_REPLY` at once for a turn parked on a question nobody can answer.
+
+        This is the F4 shape and the reason the loop above does not simply wait longer.
+        The broker's window is the right bound for an ask R2D2 put to Telegram, because
+        the user can answer that one and the sweep ends it when they do not. A
+        `question.asked` has no such question: the `question` tool is `deny` in R2D2's
+        matrix, so the frame can only mean the installed config is stale, and the turn
+        will stay blocked for as long as the process lives. Waiting out `self._parked_s`
+        and then reporting a loss would be the same delay the rule exists to remove, and
+        the reaper's 900 s is the next bound after that.
+
+        So it is stated on the first round. The WARNING says to reinstall, because the
+        user's next question will hit exactly the same park and the only repair is
+        `scripts/install_r2d2_opencode_config.sh` -- the matrix on disk and the matrix in
+        the server are two files, and this is what it looks like when they disagree.
+        """
+        self._log.warning(
+            "opencode reply: the turn of session %s is parked on question %s, which R2D2 cannot "
+            "answer: the `question` tool is denied in config/opencode/r2d2.opencode.json, so this "
+            "frame means the INSTALLED matrix is stale (%s). The user is told at once rather than "
+            "after the %.0fs park bound -- no broker question exists to answer, and the turn will "
+            "not end on its own. Re-run scripts/install_r2d2_opencode_config.sh.",
+            session_id, state.unanswerable,
+            "no event stream" if self._turns is None else self._turns.describe(session_id),
+            self._parked_s,
+        )
+        return NO_REPLY
 
     def _refuse(self, text: str, session_id: str, state: TurnState | None) -> str:
         """`NO_REPLY` for a body that is not an answer, with the reason on record.
