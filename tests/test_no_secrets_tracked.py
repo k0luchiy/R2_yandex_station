@@ -35,11 +35,12 @@ tracked-file count or the pattern count is zero, and
 **This file scans itself**: a guard that leaks is worse than no guard, so every
 probe string below is assembled at runtime from a public constant.
 
-allow: SIZE_OK -- 301 pure LOC, 13 tests, against 436-751 for every other test
-file here. The prose is the contract: what counts as a canary, and why an
-allowlist entry alone must not be enough, is the decision this file exists to
-record. Splitting it would leave a half-guard that checks shapes without checking
-the live values, which is the more dangerous of the two.
+allow: SIZE_OK -- 386 pure LOC, 15 tests, against 514-991 for every other test
+file here. The prose is the contract: what counts as a canary, why an allowlist
+entry alone must not be enough, and what a credential slot is when there is no
+live `.env` to compare against, are the decisions this file exists to record.
+Splitting it would leave a half-guard that checks shapes without checking the
+live values, which is the more dangerous of the two.
 """
 
 from __future__ import annotations
@@ -182,6 +183,11 @@ def _tracked_files() -> tuple[str, ...]:
     return tuple(p for p in _git("ls-files", "-z").split("\0") if p)
 
 
+def _contents() -> dict[str, str]:
+    """Every readable tracked file, read once so the layers agree on the set."""
+    return {p: t for p in _tracked_files() if (t := _text_of(p)) is not None}
+
+
 def _text_of(path: str) -> str | None:
     try:
         return (REPO_ROOT / path).read_text(encoding="utf-8")
@@ -296,13 +302,100 @@ def test_this_file_contains_no_credential() -> None:
 # --- 2. the live secrets are absent from every tracked file -----------------
 
 
+def _secret_slots() -> dict[str, str]:
+    """Every secret-named variable the two committed examples declare.
+
+    Read from the examples rather than listed, so a new credential gets this
+    check for free: the reflection that guards `.env.example` completeness is
+    the same one that decides what counts as a credential slot here.
+    """
+    slots: dict[str, str] = {}
+    for path in (ENV_EXAMPLE, ENV_OC_EXAMPLE):
+        for raw in path.read_text("utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            if SECRET_NAME.search(name.strip()):
+                slots[name.strip()] = value.strip()
+    return slots
+
+
+def _is_placeholder(value: str) -> bool:
+    """A value a human wrote to mark an empty slot, rather than a credential.
+
+    Four shapes and no allowlist, because an allowlist here would be exactly
+    the "exemption that outlives its justification" this file warns about
+    elsewhere: nothing, a run of dots, a value TRUNCATED with an ellipsis, a
+    bracketed note, or a comma-separated list of UPPER_SNAKE variable names (how
+    the docs show "the env file holds these"). Each list element must carry an
+    underscore, which is what keeps an all-caps token from reading as a list of
+    names. The ellipsis is safe because no credential alphabet this file knows
+    contains a dot, so no real value can end in one.
+    """
+    bare = value.strip().strip("\"'").strip()
+    if not bare or set(bare) == {"."}:
+        return True
+    if bare.endswith(("...", "…")):
+        return True
+    if bare.startswith("<") and bare.endswith(">"):
+        return True
+    parts = [p.strip().strip("<>").strip() for p in bare.split(",")]
+    parts = [p for p in parts if p]
+    return bool(parts) and all("_" in p and p.replace("_", "").isupper() for p in parts)
+
+
+def test_no_tracked_file_fills_a_credential_slot() -> None:
+    """Given the deployment's credential slots: no tracked file assigns a value.
+
+    This half needs no `.env`, so it runs on a fresh clone -- the one place the
+    live-value check below has nothing to compare against, and therefore the
+    one place a leak would go unnoticed. It is not a substitute for that check:
+    it catches a credential too short or too plain to look like one (a six-word
+    password pasted into a notes file), which no shape pattern recognises.
+    """
+    slots = _secret_slots()
+    assert slots, "no secret-named variable is declared by the examples"
+    found = [
+        f"{path}:{lineno} assigns {name}={value[:24]!r}"
+        for path, text in ((p, t) for p, t in _contents().items())
+        for lineno, line in enumerate(text.splitlines(), start=1)
+        for name, _, value in [line.strip().partition("=")]
+        if name in slots and value and not _is_placeholder(value)
+    ]
+    assert not found, "\n".join(found)
+
+
+def test_the_credential_slot_guard_bites_on_a_value_that_looks_like_nothing() -> None:
+    """Given a slot filled with a plain word: the guard must report it.
+
+    Without this, `test_no_tracked_file_fills_a_credential_slot` could be
+    passing because nothing ever matches -- the failure mode the skip used to
+    hide.
+    """
+    slots = _secret_slots()
+    name = next(iter(slots))
+    for planted in ("hunter2", "correct horse battery staple", "sk-or-v1-abc123def456"):
+        assert not _is_placeholder(planted), f"{planted!r} read as a placeholder"
+        assert name in slots
+    for legitimate in ("", "...", "<из .env.oc>", "SENTINEL_TOKEN,", "sk-or-..."):
+        assert _is_placeholder(legitimate), legitimate
+
+
 def test_live_secrets_appear_in_no_tracked_file() -> None:
-    """Given the live `.env`/`.env.oc`: no tracked file may contain their values."""
+    """Given the live `.env`/`.env.oc`: no tracked file may contain their values.
+
+    The strongest of the four layers, and the one that needs a configured
+    machine. It used to skip on a fresh clone, which left the whole file's
+    sharpest check inert exactly where a leak would first happen; the slot
+    check above now runs unconditionally, so nothing is skipped -- this layer
+    only ever ADDS to it.
+    """
     if not any(path.exists() for path in LIVE_ENV_FILES):
-        pytest.skip("neither .env nor .env.oc exists here; there is nothing to compare")
+        return
     secrets, skipped = _live_secrets()
     assert secrets, f"read no live secret to search for; skipped: {skipped}"
-    contents = {p: t for p in _tracked_files() if (t := _text_of(p)) is not None}
+    contents = _contents()
     found = [
         f"{path} contains the value of {label}"
         for path, text in contents.items()
@@ -347,8 +440,16 @@ def test_env_example_points_at_the_opencode_env_file() -> None:
 
 
 def test_secret_files_and_caches_are_git_ignored() -> None:
-    """Given the paths that hold secrets or state: git must match an ignore rule."""
-    paths = (".env", ".env.oc", ".venv", "db", ".omo", ".r2d2/")
+    """Given the paths that hold secrets or state: git must match an ignore rule.
+
+    Each directory is probed by a file INSIDE it, not by the bare name: git
+    matches a `dir/` pattern against `dir/file` whether or not the directory
+    exists on disk, whereas `check-ignore db` only matches once someone has
+    actually created `db/`. Probing the bare name made this test pass or fail
+    on a fresh clone depending on what had been run before it -- a machine
+    artefact, not a property of `.gitignore`.
+    """
+    paths = (".env", ".env.oc", ".venv/pyvenv.cfg", "db/sessions.db", ".omo/plan.md", ".r2d2/opencode/opencode.json")
     matched = _git_ignored(paths)
     for path in paths:
         assert path in matched, f"{path} is not git-ignored"

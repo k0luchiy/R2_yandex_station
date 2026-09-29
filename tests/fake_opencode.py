@@ -42,10 +42,33 @@ filtered for it would hide exactly the defect the filter exists to prevent. A
 subscriber gets `server.connected` first, then whatever is pushed; the stream ends
 when the test says so (`close_streams`) or after `stream_idle_s`, so a forgotten
 reader cannot hold a test open for ever. Every frame it pushes is shaped like the
-live one: the name in the body's `"type"`, and no `event:` line (D11) -- and writing an
-assistant message brings the `session.idle` that closes the turn, because a fake that
+live one: the name in the body's `"type"`, and no `event:` line (D11) -- and writing
+an assistant message brings the `session.idle` that closes the turn, because a fake that
 never sent it would hide the collector's own end condition.
+
+**Why the permission matrix below is a literal and not read from the shipped
+config.** `REFUSED_TOOL_ERROR` is a byte-for-byte capture of what a real
+`opencode serve` printed, and `test_the_captured_refusal_is_byte_identical_to_the
+_contract_u8_record` compares it, byte for byte, against the copy recorded in
+`docs/11-opencode-contract.md` (U8). That is the whole evidentiary point: the
+capture is a RECORD of a past server behaviour, and its rule list is the voice
+matrix as it stood when the defect was measured -- `bash *` DENIED, which the
+shipped config has since changed to `ask` (C5b). Reading the config instead
+would destroy all three things at once: the byte-identity, the evidence that the
+fixture reproduces reality rather than a transcription of itself, and the only
+thing that makes the fixture a fixture. A fake that reads the artefact under
+test is not a fake; it is a second copy of the source of truth with the
+disagreement tests removed. Drift is therefore a fact of this constant and is
+deliberate: it is FROZEN HISTORY, and the tests that consume it assert
+properties that hold for any spelling of any matrix -- a refusal reads as a
+refusal, and a stored dump is never the reader's own rules. The guard that keeps
+the capture from being quietly retyped is
+`test_the_captured_rule_dump_is_a_well_formed_matrix` and its mutation test.
+The absolute paths inside the capture are inert -- nothing in the suite resolves
+them -- and they cannot be replaced with placeholders while U8's record in a
+document this suite does not own is the reference they are compared against.
 """
+
 
 from __future__ import annotations
 

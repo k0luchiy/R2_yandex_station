@@ -21,6 +21,12 @@ Everything goes through `httpx.MockTransport`; nothing here touches a network
 Timing: exactly one test sleeps for real --
 `test_send_message_deadline_raises_and_never_aborts` waits out a 0.05 s
 deadline against a transport that never answers. No other test sleeps.
+
+allow: SIZE_OK -- 996 pure LOC, 90 tests. Every test file in this repo is
+257-991 pure LOC and a test module grows with the number of behaviours it pins;
+this one is the largest because it covers every route in the measured contract
+and every shape the wire can arrive in. Splitting it would separate a route from
+the malformed body it must reject, which is where the defects were.
 """
 
 from __future__ import annotations
@@ -1179,6 +1185,80 @@ async def test_the_captured_refusal_is_byte_identical_to_the_contract_u8_record(
     # is what killed the agent path
     assert '"permission":"bash","pattern":"*","action":"deny"' in REFUSED_TOOL_ERROR
     assert '"permission":"bash","pattern":"upower *","action":"allow"' in REFUSED_TOOL_ERROR
+
+
+def _rule_dump() -> list[dict[str, str]]:
+    """The rule array the capture embeds, as opencode's own client would read it."""
+    start = REFUSED_TOOL_ERROR.index("[{")
+    body = REFUSED_TOOL_ERROR[start:]
+    end = 1 + max(i for i, ch in enumerate(body) if ch == "]")
+    return json.loads(body[:end])
+
+
+def matrix_violations(rules: object) -> list[str]:
+    """Every way a stored rule dump stops being a matrix opencode could have written.
+
+    Pure, so the mutation test below can feed it broken rules. The three keys and
+    the three actions are opencode's own vocabulary, and a catch-all is what
+    makes "last matching rule wins" decidable at all -- a dump without one is a
+    list of exceptions, not a resolved matrix.
+    """
+    if not isinstance(rules, list) or not rules:
+        return [f"the dump is not a non-empty list of rules: {type(rules).__name__}"]
+    bad: list[str] = []
+    for rule in rules:
+        if not isinstance(rule, dict) or set(rule) != {"permission", "pattern", "action"}:
+            bad.append(f"{rule!r} is not one rule with exactly permission/pattern/action")
+            continue
+        if rule["action"] not in ("allow", "ask", "deny"):
+            bad.append(f"{rule!r} has action {rule['action']!r}, which opencode never emits")
+        if not rule["permission"] or not rule["pattern"]:
+            bad.append(f"{rule!r} has an empty permission or pattern")
+    if not any(r.get("permission") == "*" for r in rules if isinstance(r, dict)):
+        bad.append("the dump has no '*' catch-all, so it is not a resolved matrix")
+    return bad
+
+
+def test_the_captured_rule_dump_is_a_well_formed_matrix() -> None:
+    """Given the frozen capture: the rule list must stay a parseable matrix.
+
+    This is the guard against the capture being quietly retyped. It cannot
+    compare the matrix to the shipped config -- that one is FROZEN HISTORY, a
+    record of what a real server printed (see `tests/fake_opencode.py`), and the
+    shipped config has legitimately moved on. What it can require is that the
+    thing is structurally a matrix: JSON, one rule per entry, three keys, an
+    action opencode actually uses, and the catch-all that decides everything not
+    named. A reformatted or truncated constant fails here instead of quietly
+    feeding every D9 test a rule list with the wrong shape.
+    """
+    assert matrix_violations(_rule_dump()) == []
+    # and the sentence around it is opencode's own, or the client is not parsing
+    # a refusal but a paragraph
+    assert REFUSED_TOOL_ERROR.startswith("The user has specified a rule which prevents")
+    assert REFUSED_TOOL_ERROR.endswith("]")
+
+
+def test_the_rule_dump_guard_bites_on_every_way_a_capture_rots() -> None:
+    """Given a dump that lost a key, gained a fake action or lost its catch-all.
+
+    The mutation test for the check above. Every case is named, so the guard is
+    shown to be specific rather than a blanket -- an assertion that cannot fail
+    is a hole, not a test.
+    """
+    rules = _rule_dump()
+    action = rules[0]["action"]
+    for label, broken, expected in (
+        ("lost its action", [{k: v for k, v in rules[0].items() if k != "action"}], "exactly permission"),
+        ("invented an action", [{**rules[0], "action": "permit"}], "never emits"),
+        ("emptied a pattern", [{**rules[0], "pattern": ""}], "empty permission or pattern"),
+        ("lost the catch-all", [r for r in rules if r["permission"] != "*"], "catch-all"),
+        ("became a string", "not a list", "not a non-empty list"),
+    ):
+        violations = matrix_violations(broken)
+        assert violations, f"{label} passed the guard"
+        assert any(expected in reason for reason in violations), (label, violations)
+    assert matrix_violations(rules) == []
+    assert action in ("allow", "ask", "deny")
 
 
 @pytest.mark.parametrize(

@@ -15,11 +15,17 @@ The measured facts that shape every assertion here:
   explicitly, in both the default and the overridden case.  A launcher that
   relied on the default would be listening on a random port one release and
   4096 the next.
-* **The live binary is v1.18.32 at `~/.opencode/bin/opencode`; two stale copies
-  exist** (1.18.21 in `~/.npm-global/bin`, 1.18.5 in `/usr/bin`).  A bare
-  `opencode` on PATH is whatever sorts first, which is exactly how a 1.18.5
-  server with a different `--help` ends up owning port 4599.  The launcher names
-  the 1.18.32 path and no stale one.
+* **A bare `opencode` on PATH is whatever sorts first**, and stale copies do
+  exist on this box (1.18.21 in `~/.npm-global/bin`, 1.18.5 in `/usr/bin`), so a
+  1.18.5 server with a different `--help` can end up owning port 4599.  The
+  launcher must therefore resolve the binary to an absolute path, never through
+  PATH, and never to a system copy.  *Which* absolute path is the installing
+  machine's business, so nothing here spells one out: every path assertion in
+  this file is either a property of the path (absolute, not a system location,
+  consistent with the other two files that must agree) or an equality between
+  two committed files.  That is what makes the file survive being installed at
+  a different path, and it is also what lets the deployment's own files be
+  rewritten to be path-portable without taking these tests down with them.
 * **`OPENCODE_CONFIG_DIR` merges with the global config (C2); it does not
   isolate.** A missing directory is therefore not "no agents", it is "the
   owner's global `permission` rules apply" -- so the launcher points at the same
@@ -34,8 +40,8 @@ proves the environment is passed without a socket ever being opened; the
 password-gate tests assert that stub was never reached, so a regression that
 starts a server fails the suite instead of binding a port.
 
-allow: SIZE_OK -- 436 pure LOC, 32 tests. Every test file in this repo is 257-751
-pure LOC (test_opencode_client.py 751, test_sse.py 699) and a test module grows
+allow: SIZE_OK -- 529 pure LOC, 36 tests. Every test file in this repo is 257-991
+pure LOC (test_opencode_client.py 991, test_sse.py 699) and a test module grows
 with the number of behaviours it pins, not with the number of concepts it owns.
 The 250 pure-LOC ceiling targets source modules; splitting this would scatter one
 contract -- what the launcher must refuse -- across files that each need the
@@ -60,9 +66,11 @@ EXAMPLE = REPO_ROOT / ".env.oc.example"
 INSTALLER = REPO_ROOT / "scripts" / "install_r2d2_opencode_config.sh"
 MAIN = REPO_ROOT / "app" / "main.py"
 
-#: The binary that owns this deployment, and the two that must never appear.
-LIVE_BIN = "/home/koluchiy/.opencode/bin/opencode"
-STALE_BINS = ("/usr/bin/opencode", "/usr/local/bin/opencode", ".npm-global/bin/opencode")
+#: Which absolute path the deployment's opencode binary lives at is the installing
+#: machine's business, so none is written here. What must not happen is a PATH
+#: lookup or a system copy: both are how a stale server ends up owning the port.
+STALE_SHAPES = ("/usr/bin/opencode", "/usr/local/bin/opencode", ".npm-global/bin/opencode")
+SYSTEM_PREFIXES = ("/usr/bin/", "/usr/local/bin/", "/bin/", "/sbin/", "/opt/")
 
 #: A password nobody has, so a test can prove it travelled without leaking it.
 SENTINEL_PASSWORD = "r2d2-test-only-4f2c9a7b1e"
@@ -159,6 +167,78 @@ def launcher_text() -> str:
     return LAUNCHER.read_text(encoding="utf-8")
 
 
+def unit_text() -> str:
+    return UNIT.read_text(encoding="utf-8")
+
+
+def env_default(text: str, var: str) -> str | None:
+    """The fallback a `"$VAR:-default"` expansion carries, however it is assigned.
+
+    Returned verbatim: `${HOME}/x` stays `${HOME}/x` so a templated rewrite and a
+    literal one can be told apart by `_same_directory` without either being
+    spelled out here.
+    """
+    match = re.search(r"\$\{" + re.escape(var) + r":-((?:[^{}]|\$\{[^{}]*\})*)\}", text)
+    return match.group(1) if match else None
+
+
+def unit_directive(name: str) -> str | None:
+    match = re.search(rf"^{re.escape(name)}(\S*)=(.*)$", unit_text(), re.M)
+    return match.group(2).strip() if match else None
+
+
+def _home_neutral(value: str) -> str:
+    """Fold a home REFERENCE to a token, whichever way one is spelled.
+
+    `$HOME`, `~`, systemd's own `%h` and the running user's real home all become
+    `$HOME`, so a deployment that templates its paths and one that spells them out
+    compare equal -- and so do they when the owner's home is a different string on
+    a different machine. Anything else is left alone: a mismatch there is a real
+    disagreement about which directory the server runs in.
+    """
+    folded = re.sub(r"^(?:\$\{?HOME\}?|~|%h)(?=/|$)", "$HOME", value.rstrip("/"))
+    home = str(Path.home())
+    return re.sub(rf"^{re.escape(home)}(?=/|$)", "$HOME", folded)
+
+
+def same_directory(left: str, right: str) -> bool:
+    """Whether two spellings name one directory.
+
+    A home REFERENCE (`$HOME`, `~`) is folded to a token, so a deployment that
+    spells the owner's home as a template is not a different directory from one
+    that spells it out. Two absolute paths are still compared in full: a
+    mismatch between them is a real disagreement about where the server runs,
+    and it must be visible here rather than in a systemd journal at 3am.
+    """
+    return _home_neutral(left) == _home_neutral(right)
+
+
+def binary_default_violations(text: str) -> list[str]:
+    """Every way the launcher can end up running a binary PATH chose for it.
+
+    Pure: takes the launcher's text, returns the reasons the binary is not pinned.
+    The mutation tests below feed it the three broken spellings, which is the only
+    honest way to show this guard is not vacuous.
+    """
+    default = env_default(text, "R2D2_OC_BIN")
+    if default is None:
+        return ["launcher: R2D2_OC_BIN has no :-default, so a bare $R2D2_OC_BIN leaves BIN empty"]
+    bad: list[str] = []
+    if not default.startswith(("/", "~", "$")):
+        bad.append(f"launcher: the binary default {default!r} is a bare name resolved through PATH")
+    for prefix in SYSTEM_PREFIXES:
+        if default.startswith(prefix):
+            bad.append(f"launcher: the binary default {default!r} is a system copy")
+            break
+    for shape in STALE_SHAPES:
+        if shape in text:
+            bad.append(f"launcher: names the stale copy {shape!r}")
+    for line in _code_lines(text):
+        if re.search(r"\bopencode\s+serve\b", line) and "$BIN" not in line:
+            bad.append(f"launcher: exec line resolves opencode through PATH: {line.strip()!r}")
+    return bad
+
+
 # --------------------------------------------------------------------------
 # 1. the launcher parses
 # --------------------------------------------------------------------------
@@ -221,21 +301,31 @@ def test_launcher_honours_a_port_override(tmp_path):
 
 
 def test_launcher_never_depends_on_which_opencode_is_first_on_path():
-    # Given: the launcher's own text
-    text = launcher_text()
-    # When: the exec target is located
-    # Then: it is the 1.18.32 absolute path -- a bare `opencode` would be
-    # resolved by PATH, and 1.18.21 and 1.18.5 are installed on this box
-    assert re.search(
-        r"^BIN=\"\$\{R2D2_OC_BIN:-" + re.escape(LIVE_BIN) + r"\}\"$", text, re.M
-    ), "the binary default is not the 1.18.32 absolute path"
-    for stale in STALE_BINS:
-        assert stale not in text, f"launcher names the stale copy {stale!r}"
-    for line in _code_lines(text):
-        if re.search(r"\bopencode\s+serve\b", line):
-            assert LIVE_BIN in line or '"$BIN"' in line, (
-                f"exec line resolves opencode through PATH: {line.strip()!r}"
-            )
+    # Given: the shipped launcher's own text
+    # When / Then: the binary is pinned to an absolute path and named nowhere else
+    assert binary_default_violations(launcher_text()) == []
+
+
+@pytest.mark.parametrize(
+    ("label", "replacement", "expected"),
+    [
+        ("a bare name resolved through PATH", "opencode", "through PATH"),
+        ("a system copy", "/usr/bin/opencode", "system copy"),
+        ("a stale npm copy", "${R2D2_OC_BIN:-/home/u/.npm-global/bin/opencode}", "stale copy"),
+    ],
+)
+def test_the_binary_guard_bites_on_every_way_path_wins(label, replacement, expected):
+    # Given: a launcher whose binary default is one of the three broken spellings,
+    # and one whose exec line stops using "$BIN" altogether
+    text = launcher_text().replace(
+        env_default(launcher_text(), "R2D2_OC_BIN"), replacement
+    )
+    # When / Then: each is named, so the guard is specific rather than a blanket
+    violations = binary_default_violations(text)
+    assert any(expected in reason for reason in violations), violations
+
+    through_path = launcher_text().replace('exec "$BIN" serve', "exec opencode serve")
+    assert any("through PATH" in reason for reason in binary_default_violations(through_path))
 
 
 # --------------------------------------------------------------------------
@@ -450,21 +540,24 @@ def test_launcher_reports_a_workspace_that_is_a_file(tmp_path):
 
 
 def test_launcher_defaults_the_workspace_to_the_configured_path():
-    # Given: the launcher's text
-    text = launcher_text()
-    # When: the workspace default is read
-    # Then: it is the one `cfg.r2d2_workspace` names, so the server's cwd and
-    # the sessions R2D2 creates cannot disagree
-    assert "/home/koluchiy/r2d2-workspace" in text
+    # Given: the launcher's default, the template that documents it, and the
+    # `Config` default the app sends to the server as `?directory=`
+    # When / Then: all three name ONE directory, so the server's cwd and the
+    # sessions R2D2 creates cannot disagree. Compared home-neutrally, so the
+    # assertion is about the directory and not about whose home it hangs under.
+    default = env_default(launcher_text(), "R2D2_OC_WORKSPACE")
+    assert default is not None, "the launcher must have a workspace default"
+    documented = example_assignments()["R2D2_OC_WORKSPACE"]
+    from app.config import Config
+
+    configured = Config().r2d2_workspace
+    assert same_directory(documented, default), f"{documented!r} != {default!r}"
+    assert same_directory(configured, default), f"{configured!r} != {default!r}"
 
 
 # --------------------------------------------------------------------------
 # 5. the systemd user unit
 # --------------------------------------------------------------------------
-
-
-def unit_text() -> str:
-    return UNIT.read_text(encoding="utf-8")
 
 
 def test_unit_file_has_the_shape_of_a_user_unit():
@@ -486,8 +579,20 @@ def test_unit_declares_the_directives_the_launcher_needs():
     # brain-server from staying down
     for directive in ("WorkingDirectory=", "EnvironmentFile=", "ExecStart=", "Restart="):
         assert directive in text, f"missing {directive}"
-    assert "WorkingDirectory=/home/koluchiy/r2d2-workspace" in text
-    assert "EnvironmentFile=/home/koluchiy/Documents/R2_yandex_station/.env.oc" in text
+    # Then: WorkingDirectory is the SAME directory the launcher's default names,
+    # because systemd chdirs before ExecStart and the launcher's own `cd` is
+    # then a no-op -- two different directories means the unit silently runs
+    # somewhere R2D2's `?directory=` never points
+    default = env_default(launcher_text(), "R2D2_OC_WORKSPACE")
+    working = unit_directive("WorkingDirectory")
+    assert working is not None and same_directory(working, default), (
+        f"WorkingDirectory={working!r} is not the launcher's workspace {default!r}"
+    )
+    # Then: EnvironmentFile is this deployment's .env.oc, not an example and not
+    # some other checkout's. Only the name is pinned: which home holds the
+    # checkout is the installing machine's business.
+    env_file = unit_directive("EnvironmentFile")
+    assert env_file is not None and env_file.endswith("/.env.oc"), env_file
     assert "Restart=always" in text
     assert "RestartSec=3" in text
     assert "Environment=OPENCODE_LOG_LEVEL=warn" in text
@@ -501,9 +606,12 @@ def test_unit_exec_start_runs_the_launcher_script():
     # Then: there is exactly one, and it runs the script -- not `opencode serve`
     # spelled out a second time, which is how the password export gets lost
     assert len(exec_start) == 1, exec_start
-    assert exec_start[0] == (
-        "ExecStart=/home/koluchiy/Documents/R2_yandex_station/scripts/opencode_serve.sh"
-    )
+    target = exec_start[0].split("=", 1)[1]
+    # Then: the target is the launcher by name and by location. The path may be
+    # any absolute one -- or a `$HOME` template, which systemd expands -- but it
+    # has to be the repo's `scripts/`, or the unit runs a copy nobody edits.
+    assert Path(target).name == LAUNCHER.name, target
+    assert _home_neutral(target).endswith(f"/{LAUNCHER.parent.name}/{LAUNCHER.name}"), target
     assert not re.search(r"opencode serve\b", text), "the server is spelled out twice"
 
 
@@ -548,8 +656,15 @@ def test_env_oc_is_git_ignored():
 
 
 #: Values a template may legitimately show: a documented default that is not a
-#: credential, or an empty slot the owner fills in.
-SAFE_EXAMPLE_VALUES = frozenset({"4599", "opencode", "/home/koluchiy/r2d2-workspace"})
+#: credential, or an empty slot the owner fills in. Derived from the deployment's
+#: OWN knobs rather than written out, so the safe set follows a port or a
+#: workspace wherever the deployment puts it -- and so it cannot quietly widen to
+#: cover whatever the example happens to say.
+SAFE_EXAMPLE_VALUES = frozenset({
+    env_default(launcher_text(), "R2D2_OC_PORT") or "",
+    "opencode",
+    env_default(launcher_text(), "R2D2_OC_WORKSPACE") or "",
+})
 
 
 def example_assignments() -> dict[str, str]:
@@ -558,6 +673,15 @@ def example_assignments() -> dict[str, str]:
         for line in EXAMPLE.read_text(encoding="utf-8").splitlines()
         if line.strip() and not line.lstrip().startswith("#") and "=" in line
     }
+
+
+def test_env_oc_example_ships_the_deployment_port():
+    # Given: the committed template
+    # Then: the port it documents is the port the launcher actually passes, so a
+    # template that ships a working-but-wrong port is caught
+    assert example_assignments()["R2D2_OC_PORT"] == env_default(
+        launcher_text(), "R2D2_OC_PORT"
+    )
 
 
 def test_env_oc_example_carries_no_secret():
@@ -699,6 +823,9 @@ def test_lifespan_runs_the_gate_before_reporting_started(caplog, monkeypatch, tm
     from core.opencode.client import OpencodeHealth
 
     probed: list[str] = []
+    workspace = tmp_path / "the-workspace"
+    workspace.mkdir()
+    configured = Config(db_path=str(tmp_path / "t.db"), r2d2_workspace=str(workspace))
 
     async def fake_probe(cfg):
         probed.append(cfg.r2d2_workspace)
@@ -706,7 +833,7 @@ def test_lifespan_runs_the_gate_before_reporting_started(caplog, monkeypatch, tm
 
     monkeypatch.setattr(main_module, "probe_opencode_server", fake_probe)
     monkeypatch.setattr(
-        main_module.Config, "load", classmethod(lambda cls: Config(db_path=str(tmp_path / "t.db")))
+        main_module.Config, "load", classmethod(lambda cls: configured)
     )
 
     # When: the app starts and stops
@@ -718,9 +845,11 @@ def test_lifespan_runs_the_gate_before_reporting_started(caplog, monkeypatch, tm
     with caplog.at_level(logging.INFO, logger="r2d2"):
         asyncio.run(run())
 
-    # Then: the gate ran with the configured workspace, and R2D2's own
-    # readiness line still followed it
-    assert probed == ["/home/koluchiy/r2d2-workspace"]
+    # Then: the gate ran with the CONFIGURED workspace, not with a constant of
+    # its own -- `?directory=` is how every session the server opens is scoped,
+    # so a gate carrying its own directory would probe a server whose sessions
+    # all point somewhere the owner never asked for
+    assert probed == [str(workspace)]
     assert any("R2D2 started" in r.getMessage() for r in caplog.records)
 
 
@@ -732,7 +861,7 @@ def test_lifespan_runs_the_gate_before_reporting_started(caplog, monkeypatch, tm
 def _cfg():
     from app.config import Config
 
-    return Config(backends_path="config/backends.json")
+    return Config(backends_path=str(REPO_ROOT / "config" / "backends.json"))
 
 
 def _fake_specs(_cfg):

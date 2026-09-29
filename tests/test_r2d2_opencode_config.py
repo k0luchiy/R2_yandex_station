@@ -22,7 +22,7 @@ assertion:
 
 Nothing here talks to a server, so the suite is deterministic and offline.
 
-allow: SIZE_OK -- 466 pure LOC, 44 tests. Every test file in this repo is 257-751
+allow: SIZE_OK -- 514 pure LOC, 44 tests. Every test file in this repo is 257-991
 pure LOC and a test module grows with the number of behaviours it pins; splitting
 the two permission-matrix checkers from the prompt and install tests would give
 each half a file that cannot say what the other half forbids.
@@ -30,6 +30,7 @@ each half a file that cannot say what the other half forbids.
 
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import re
@@ -49,18 +50,16 @@ VOICE = "r2d2-voice"
 AGENT = "r2d2-agent"
 SENTINEL = "[[NEEDS_AGENT]]"
 
-# The CLI shim lives at this path and re-execs itself under the repo venv, so an
-# LLM may plausibly spell the same tool three different ways.  All three forms
-# must be allowlisted or the agent loses the only tool it is supposed to have.
-CLI = "/home/koluchiy/.r2d2/r2d2_do.py"
-VENV_PY = REPO_ROOT / ".venv" / "bin" / "python"
-R2D2_DO_FORMS = (
-    f"{CLI} *",
-    f"python3 {CLI} *",
-    f"{VENV_PY} {CLI} *",
-)
-# Read-only probes that answer a spoken status question without any tool the
-# model has to be trusted with.  Nothing here writes, moves or deletes.
+#: The shim's own file name. Every allowlist entry that grants the tool names it,
+#: so it is the one token a path-portable rewrite cannot remove: whether the
+#: entry spells an absolute path, a `*/` wildcard or a template, it ends here.
+SHIM = "r2d2_do.py"
+#: A command that exercises the one subcommand the voice agent may never reach.
+#: Derived from each allow pattern rather than written out, so the probe is
+#: always an instance of the very rule under test.
+PROBE_SUB = "shell rm -rf /tmp/r2d2-probe"
+#: Read-only probes that answer a spoken status question without any tool the
+#: model has to be trusted with.  Nothing here writes, moves or deletes.
 READ_ONLY_PROBES = frozenset(
     {
         "upower *",
@@ -78,11 +77,6 @@ READ_ONLY_PROBES = frozenset(
 #: open with -- opencode takes the LAST matching rule, so a catch-all that is not
 #: first is not a default but dead text.
 CATCH_ALL = "*"
-#: The one call that can destroy something, in the three spellings the shim may be
-#: addressed by, derived from `R2D2_DO_FORMS` so a moved shim moves these too. The
-#: voice agent's `bash` catch-all is `ask`, so these three `deny`s are the only
-#: thing between a spoken request and `r2d2_do shell`.
-SHELL_PATTERNS = tuple(f"{form[: -len(' *')]} shell *" for form in R2D2_DO_FORMS)
 
 # Every permission key this opencode build exposes (measured in todo 1, listed
 # in the plan's "Critical context facts").  A key the config does not name
@@ -204,6 +198,85 @@ def permission_violations(agent_name: str, permission: object) -> list[str]:
 
 def agent_permissions(config: dict) -> dict[str, object]:
     return {name: spec["permission"] for name, spec in config["agent"].items()}
+
+
+def bash_block(agent: str) -> dict[str, object]:
+    return load()["agent"][agent]["permission"]["bash"]
+
+
+def instance(pattern: str, subcommand: str) -> str | None:
+    """A command the pattern admits, or None when it admits none.
+
+    Built from the pattern itself, so the probe is guaranteed to be an instance
+    of the rule under test whatever the rule spells -- an absolute path, a
+    `*/` wildcard or a template all produce a command they match.
+    """
+    if not pattern.endswith(" *"):
+        return None
+    return pattern[: -len(" *")] + " " + subcommand
+
+
+def effective(bash: dict, command: str) -> tuple[object, str | None]:
+    """opencode's own decision: the LAST rule matching `command`, and its action.
+
+    `fnmatch` models the `*` in a pattern. Both the positive and the negative
+    claim go through this one function, so the test is self-consistent whatever
+    the matcher's real semantics are -- what it checks is that the LAST match
+    is the deny, which is the property `Wildcard.match` ordering exists for.
+    """
+    action: object = None
+    winner: str | None = None
+    for pattern, rule in bash.items():
+        if fnmatch.fnmatchcase(command, str(pattern)):
+            action, winner = rule, pattern
+    return action, winner
+
+
+def shim_allows(bash: dict) -> list[str]:
+    """The patterns that grant the shim, in file order."""
+    return [
+        pattern
+        for pattern, rule in bash.items()
+        if SHIM in pattern and rule == "allow" and instance(pattern, PROBE_SUB) is not None
+    ]
+
+
+def non_shim_allows(bash: dict) -> set[str]:
+    return {
+        pattern for pattern, rule in bash.items() if rule == "allow" and SHIM not in pattern
+    }
+
+
+def shell_deny_violations(bash: object) -> list[str]:
+    """Every way the voice `bash` block can stop refusing `r2d2_do shell`.
+
+    Pure, so the mutation tests below can feed it a reordered copy. The property
+    is the one that matters and the one no spelling can hide: for EVERY way the
+    block grants the shim, a `shell` invocation admitted by that grant must end
+    on a `deny`. That covers all four failure modes at once -- a missing rule
+    (the grant is the last match), a softened rule (`ask` is the last match), a
+    rule placed before the grants (the grant is the last match again) -- and it
+    does not care whether the block spells the shim with an absolute path, a
+    `*/` wildcard or an install-time template, because the probe is derived from
+    the grant rather than written out beside it.
+    """
+    if not isinstance(bash, dict):
+        return [f"voice bash: must be an object of one rule per pattern, got {type(bash).__name__}"]
+    bad: list[str] = []
+    if next(iter(bash), None) != CATCH_ALL:
+        bad.append("voice bash: the catch-all is not the first key, so later rules are not the last match")
+    grants = shim_allows(bash)
+    if not grants:
+        bad.append(f"voice bash: nothing grants {SHIM}, so the agent has no tool at all")
+    for grant in grants:
+        command = instance(grant, PROBE_SUB)
+        action, winner = effective(bash, command)
+        if action != "deny":
+            bad.append(
+                f"voice bash: {grant!r} admits {command!r} and the LAST MATCH is "
+                f"{winner!r} -> {action!r}, so the shell subcommand is not refused"
+            )
+    return bad
 
 
 # ---------------------------------------------------------------------------
@@ -340,51 +413,79 @@ def test_guard_does_not_flag_the_allowlist_the_shipped_config_actually_needs():
 
 
 @pytest.mark.parametrize("agent", [VOICE, AGENT])
-def test_all_three_r2d2_do_forms_are_allowlisted(agent):
-    # Given: the shim re-execs itself, so an LLM may spell it three ways
-    bash = load()["agent"][agent]["permission"]["bash"]
-    # When/Then: every form the model may plausibly emit resolves to allow
-    missing = [form for form in R2D2_DO_FORMS if bash.get(form) != "allow"]
-    assert missing == [], f"{agent} would refuse: {missing}"
+def test_every_spelling_the_config_grants_the_shim_with_resolves_to_allow(agent):
+    # Given: the shim re-execs itself, so an LLM may spell it several ways and
+    # each way the file grants must actually work
+    bash = bash_block(agent)
+    # When / Then: for every grant, a concrete invocation of it lands on `allow`
+    broken = [
+        f"{grant} -> {effective(bash, instance(grant, 'status'))[0]!r}"
+        for grant in shim_allows(bash)
+        if effective(bash, instance(grant, "status"))[0] != "allow"
+    ]
+    assert shim_allows(bash), f"{agent} grants no way to run {SHIM}"
+    assert broken == [], f"{agent} would refuse its own allowlist: {broken}"
+
+
+#: An interpreter in a leading position. A grant that runs the shim under one of
+#: these cannot import `core`, so the tool the agents are supposed to have is a
+#: tool that exits 1 -- the grant reads as permission and delivers nothing.
+SYSTEM_PYTHON = re.compile(r"(?:^|\s)(?:/usr/bin|/usr/local/bin|/bin)/python[\d.]*(?=\s|$)")
+
+
+def installer_destination() -> str:
+    match = re.search(r'install -m \d+ "\$CLI_SRC" "([^"]+)"', INSTALL.read_text(encoding="utf-8"))
+    assert match, "the install script no longer installs the shim where it claims to"
+    return match.group(1)
 
 
 def test_the_allowlisted_shim_matches_the_app_configuration():
     # Given: the rest of R2D2 addresses the same shim through app/config.py
     from app.config import Config
 
-    # When/Then: the allowlist and the app agree on the path, and the third
-    # form names this repo's own venv -- the only interpreter that can import
-    # core.tools
+    # When / Then: the allowlist, the app default and the installer all name the
+    # same FILE in the same DIRECTORY. Only the file and the directory are
+    # pinned: whose home holds them is the installing machine's business, and a
+    # path-portable rewrite may spell the whole prefix as a template or a
+    # wildcard -- which is exactly why no absolute path is written here.
     cfg = Config()
-    assert cfg.r2d2_cli_path == CLI
+    expected = Path(cfg.r2d2_cli_path)
+    granted = {
+        grant[: -len(" *")].rsplit("/", 1)[-1] for grant in shim_allows(bash_block(AGENT))
+    }
+    assert granted == {SHIM}, granted
+    assert (expected.name, expected.parent.name) == (SHIM, ".r2d2")
+    assert expected.is_absolute()
+    assert Path(installer_destination()).name == expected.name
+    assert Path(installer_destination()).parent.name == expected.parent.name
+    # and no spelling runs it under an interpreter that has none of the deps
+    system = [g for g in shim_allows(bash_block(AGENT)) if SYSTEM_PYTHON.search(g)]
+    assert system == [], f"granted under a system python: {system}"
+    # and the app's other two constants are still the ones the config declares
     assert cfg.r2d2_voice_agent == VOICE and cfg.r2d2_task_agent == AGENT
     assert cfg.r2d2_needs_agent_sentinel == SENTINEL
-    assert R2D2_DO_FORMS[2] == f"{REPO_ROOT / '.venv' / 'bin' / 'python'} {CLI} *"
 
 
 def test_voice_cannot_reach_the_shell_subcommand():
-    # Given: `r2d2_do.py *` is allowlisted, which includes its `shell`
+    # Given: `r2d2_do.py *` is granted, which includes its `shell`
     # subcommand -- the one call that can destroy something
-    bash = load()["agent"][VOICE]["permission"]["bash"]
-    # When: the subcommand is looked for behind each spelling
-    denies = [rule for rule, action in bash.items() if "shell" in rule]
-    # Then: defence in depth -- the prompt forbids it and the CLI's own risk
-    # gate refuses it, and here opencode refuses it before either is reached
-    assert denies, "voice has no shell deny rule"
-    assert all(bash[rule] == "deny" for rule in denies)
-    assert {rule.split("r2d2_do.py")[0] for rule in denies} == {
-        form.split("r2d2_do.py")[0] for form in R2D2_DO_FORMS
-    }
+    # When / Then: no grant the voice block makes admits a shell invocation.
+    # Defence in depth: the prompt forbids it and the CLI's own risk gate
+    # refuses it, and here opencode refuses it before either is reached.
+    assert shell_deny_violations(bash_block(VOICE)) == []
 
 
 def test_voice_bash_allowlist_is_the_shim_plus_read_only_probes():
     # Given: the voice agent runs on a 4.5s budget with no human watching, so
     # its bash allowlist is the whole of what a smart speaker can reach
-    bash = load()["agent"][VOICE]["permission"]["bash"]
-    # When/Then: exactly the shim and the read-only probes -- set equality, so
-    # an extra command cannot be added without a test noticing
-    allowed = {rule for rule, action in bash.items() if action == "allow"}
-    assert allowed == set(R2D2_DO_FORMS) | READ_ONLY_PROBES
+    bash = bash_block(VOICE)
+    # When / Then: the commands that are NOT the shim are exactly the read-only
+    # probes -- set equality, so an extra command cannot be added without a test
+    # noticing. The shim's own spellings are the deployment's to choose; what is
+    # pinned is that each of them is granted AND shadowed by a shell deny, which
+    # `test_voice_cannot_reach_the_shell_subcommand` checks rule by rule.
+    assert non_shim_allows(bash) == set(READ_ONLY_PROBES)
+    assert shim_allows(bash)
 
 
 def test_voice_bash_asks_where_it_used_to_refuse():
@@ -405,72 +506,46 @@ def test_voice_bash_asks_where_it_used_to_refuse():
     assert load()["agent"][AGENT]["permission"][CATCH_ALL] == "ask"
 
 
-def shell_deny_violations(bash: object) -> list[str]:
-    """Every way the voice `bash` block can stop refusing `r2d2_do shell`.
-
-    Pure, so the mutation test below can feed it a reordered copy. Both halves are
-    needed and neither is redundant: the rules must EXIST and be `deny` (a narrow
-    `ask` there would put the one destructive call to the user instead of refusing
-    it), and they must come AFTER the `r2d2_do.py *` allows -- opencode keeps the
-    LAST matching rule, so a `deny` placed first is overwritten by the allow of the
-    very shim it was meant to veto.
-    """
-    if not isinstance(bash, dict):
-        return [f"voice bash: must be an object of one rule per pattern, got {type(bash).__name__}"]
-    bad: list[str] = []
-    if next(iter(bash), None) != CATCH_ALL:
-        bad.append("voice bash: the catch-all is not the first key, so later rules are not the last match")
-    keys = list(bash)
-    for pattern in SHELL_PATTERNS:
-        if pattern not in bash:
-            bad.append(f"voice bash: {pattern!r} has no rule at all")
-        elif bash[pattern] != "deny":
-            bad.append(f"voice bash: {pattern!r} is {bash[pattern]!r}, not 'deny'")
-    for pattern in SHELL_PATTERNS:
-        for form in R2D2_DO_FORMS:
-            if pattern in keys and form in keys and keys.index(form) > keys.index(pattern):
-                bad.append(
-                    f"voice bash: {form!r} is allow and comes after {pattern!r}, so the allow is "
-                    "the last match and the shell subcommand is not refused"
-                )
-    return bad
-
-
 def test_the_shell_denies_are_refusals_and_they_come_last():
-    # Given: the shipped block, and the same block with the three shell denies moved
-    # in front of the shim allows -- the inversion "last match wins" makes lethal
-    bash = load()["agent"][VOICE]["permission"]["bash"]
-    ahead = [CATCH_ALL, *SHELL_PATTERNS]
+    # Given: the shipped block, and the same block with its shell denies moved
+    # in front of the shim grants -- the inversion "last match wins" makes lethal
+    bash = bash_block(VOICE)
+    denies = [pattern for pattern in bash if SHIM in pattern and "shell" in pattern]
+    ahead = [CATCH_ALL, *denies]
     reordered = {key: bash[key] for key in [*ahead, *(k for k in bash if k not in ahead)]}
-    # When/Then: the shipped order passes and the inverted one is named for each of
-    # the three spellings, so the ordering is asserted as load-bearing rather than
+    # When/Then: the shipped order passes and the inverted one is named for each
+    # of the grants, so the ordering is asserted as load-bearing rather than
     # left to a comment nobody reads
     assert shell_deny_violations(bash) == []
     violations = shell_deny_violations(reordered)
     assert violations
-    assert all("last match" in reason for reason in violations)
-    assert {p for p in SHELL_PATTERNS if any(repr(p) in reason for reason in violations)} == set(
-        SHELL_PATTERNS
-    )
+    assert all("LAST MATCH" in reason for reason in violations)
+    named = {reason.split("'")[1] for reason in violations}
+    assert named == set(shim_allows(bash)), (named, violations)
 
 
 @pytest.mark.parametrize("action", ["ask", "allow", "delete"])
 def test_the_guard_bites_on_every_way_the_shim_gets_through(action):
     # Given: a block where one shell deny is softened to `action`, and one where it
     # is gone -- what a careless merge leaves behind, and the two ways `shell` opens
-    bash = load()["agent"][VOICE]["permission"]["bash"]
-    pattern = SHELL_PATTERNS[0]
-    mutated = dict(bash)
-    del mutated[pattern]
-    if action != "delete":
-        mutated[pattern] = action
-    # When/Then: each is named, against that pattern, with the value that caused it
-    violations = shell_deny_violations(mutated)
-    named = [reason for reason in violations if repr(pattern) in reason]
-    assert named, violations
-    assert any(action in reason for reason in named) if action != "delete" else any(
-        "no rule at all" in reason for reason in named
+    bash = bash_block(VOICE)
+    pattern = next(p for p in bash if SHIM in p and "shell" in p)
+    grant = next(
+        p for p in shim_allows(bash) if effective(bash, instance(p, PROBE_SUB))[1] == pattern
     )
+    mutated = dict(bash)
+    if action == "delete":
+        del mutated[pattern]
+    else:
+        mutated[pattern] = action
+    # When/Then: the guard fails and names the rule that now wins -- the softened
+    # deny itself, or the grant that took over when the deny was removed
+    violations = shell_deny_violations(mutated)
+    assert violations
+    reported = "\n".join(violations)
+    action_now, winner = effective(mutated, instance(grant, PROBE_SUB))
+    assert repr(winner) in reported, violations
+    assert winner == grant if action == "delete" else (winner, action_now) == (pattern, action)
 
 
 # ---------------------------------------------------------------------------

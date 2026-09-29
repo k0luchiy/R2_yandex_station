@@ -1,9 +1,16 @@
-"""Tests for the config-driven backend registry loader (plan todo 2)."""
+"""Tests for the config-driven backend registry loader (plan todo 2).
+
+allow: SIZE_OK -- 378 pure LOC, 63 tests. Every test file in this repo is
+257-991 pure LOC and a test module grows with the number of behaviours it pins;
+splitting the loader's happy path from its typed-error table would give each
+half a file that cannot say what the other half accepts.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 
 import pytest
@@ -63,11 +70,9 @@ CONFIG_FIELDS = (
     ("r2d2_needs_agent_sentinel", "[[NEEDS_AGENT]]"),
     ("r2d2_voice_agent", "r2d2-voice"),
     ("r2d2_task_agent", "r2d2-agent"),
-    ("r2d2_workspace", "/home/koluchiy/r2d2-workspace"),
     ("r2d2_permission_timeout", 300.0),
     ("r2d2_session_soft_limit", 40),
     ("r2d2_stale_session_seconds", 900.0),
-    ("r2d2_cli_path", "/home/koluchiy/.r2d2/r2d2_do.py"),
     ("r2d2_event_poll_interval", 2.0),
 )
 
@@ -101,6 +106,18 @@ def cfg_for(tmp_path: Path, doc: object) -> Config:
     path = tmp_path / "backends.json"
     path.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
     return Config(backends_path=str(path))
+
+
+def _installed_shim_path() -> str:
+    """Where `install_r2d2_opencode_config.sh` writes the shim, read from it.
+
+    The script spells it against `$HOME`, so the value is machine-relative by
+    construction and this test compares only the file and directory names.
+    """
+    text = (REPO_ROOT / "scripts" / "install_r2d2_opencode_config.sh").read_text(encoding="utf-8")
+    match = re.search(r'install -m \d+ "\$CLI_SRC" "([^"]+)"', text)
+    assert match, "the install script no longer installs the shim where it claims to"
+    return match.group(1)
 
 
 # --------------------------------------------------------------------------
@@ -284,6 +301,25 @@ def test_config_still_maps_uppercase_env_to_new_fields(monkeypatch: pytest.Monke
     assert cfg.r2d2_fast_deadline == 1.5
     assert cfg.r2d2_session_soft_limit == 7
     assert cfg.r2d2_voice_agent == "voice-from-env"
+
+
+def test_the_two_path_defaults_are_absolute_and_named_after_their_targets() -> None:
+    # Given: the two Config fields that are filesystem paths
+    cfg = Config()
+    # When / Then: each is an absolute path whose LAST TWO components name what
+    # it points at. The value is deliberately not spelled out: whose home holds
+    # the workspace is the installing machine's business, and a path-portable
+    # rewrite of `app/config.py` must not be able to break this test. What must
+    # hold is the shape, and the agreement with the installer that writes the
+    # shim -- a default that names a different file than the one installed is a
+    # permission the agent has and a tool it cannot run.
+    workspace = Path(cfg.r2d2_workspace)
+    shim = Path(cfg.r2d2_cli_path)
+    assert (workspace.name, shim.name) == ("r2d2-workspace", "r2d2_do.py")
+    assert workspace.is_absolute() and shim.is_absolute()
+    assert shim.parent.name == ".r2d2"
+    assert Path(_installed_shim_path()).name == shim.name
+    assert Path(_installed_shim_path()).parent.name == shim.parent.name
 
 
 # --------------------------------------------------------------------------

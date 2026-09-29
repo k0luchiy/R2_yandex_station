@@ -26,6 +26,11 @@ not "does `echo hi` work" but:
 * **stdout is a machine contract.** Exactly one line of JSON, always, whatever
   the exit code -- including usage errors.
 
+allow: SIZE_OK -- 541 pure LOC, 36 tests. Every test file in this repo is
+257-991 pure LOC and a test module grows with the number of behaviours it pins;
+splitting the risk gate from the invocation contract would give each half a file
+that cannot say what the other half assumes about the harness.
+
 The CLI is exercised **only** as a subprocess: it is a script, its stdout is a
 contract for an LLM to parse, and an in-process call would test pytest's import
 machinery instead of the file the agent runs. Every test gets a temp SQLite
@@ -49,6 +54,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -594,8 +600,21 @@ def test_repeated_runs_share_one_sqlite_db_without_corruption(tmp_path: Path) ->
 
 def test_shebang_and_venv_constant_name_the_project_interpreter() -> None:
     source = CLI.read_text(encoding="utf-8")
-    assert source.splitlines()[0] == f"#!{VENV_PY}", "the shebang must be the venv interpreter"
-    assert f'VENV_PY = "{VENV_PY}"' in source
+    constant = re.search(r'^VENV_PY = "(.+)"$', source, re.M)
+    assert constant, "the shim must name the interpreter it re-execs into"
+    venv_py = constant.group(1)
+    # Then: the shebang and the constant are the SAME interpreter. A shebang
+    # pointing somewhere else means the two invocations the allowlist grants --
+    # the bare path and `python3 <path>` -- run different pythons, and only the
+    # one the constant names can import `core`.
+    assert source.splitlines()[0] == f"#!{venv_py}", "the shebang must be the venv interpreter"
+    # Then: that interpreter is a PROJECT venv, not a system or stale copy.
+    # Only the tail is pinned: which checkout and which home hold it is the
+    # installing machine's business, so no absolute path is written here.
+    parts = Path(venv_py).parts
+    assert parts[-3:] == (".venv", "bin", "python"), venv_py
+    # and it is the venv THIS checkout runs its tests from, by name
+    assert VENV_PY.parts[-3:] == parts[-3:], (VENV_PY, venv_py)
     assert os.access(CLI, os.X_OK), "the bare-path invocation form needs the executable bit"
 
 
@@ -613,8 +632,13 @@ def test_module_constants_are_the_documented_contract(monkeypatch: pytest.Monkey
 
     assert (module.EXIT_OK, module.EXIT_FAIL, module.EXIT_CONFIRM) == (0, 1, 2)
     assert module.DEFAULT_APPLICATION_ID == "r2d2-cli"
-    assert str(module.REPO_ROOT) == str(REPO)
-    assert str(module.VENV_PY) == str(VENV_PY)
+    # Then: REPO_ROOT is DERIVED from the venv, two levels up. That derivation
+    # is the whole mechanism -- `sys.path` is seeded from it and every
+    # `core.tools` import hangs off it -- so a shim that hard-coded a different
+    # root, or a venv installed outside the checkout, would import someone
+    # else's `core`. Compared structurally, not against this machine's path.
+    assert Path(module.REPO_ROOT) == Path(module.VENV_PY).parent.parent.parent
+    assert Path(module.VENV_PY).name == "python"
 
 
 def test_re_execs_into_the_project_venv_from_a_bare_interpreter(
