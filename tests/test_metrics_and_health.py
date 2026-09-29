@@ -47,7 +47,7 @@ RED phase of todo 17 has to be able to run the route tests against the old
 `/health`, and a module-level import of a module that does not exist yet would
 stop the whole file at collection.
 
-allow: SIZE_OK -- 675 pure LOC, 23 tests. Every test file in this repo is 436-751
+allow: SIZE_OK -- 687 pure LOC, 23 tests. Every test file in this repo is 436-751
 pure LOC (test_opencode_client.py 751, test_sse.py 699) and a test module grows
 with the number of behaviours it pins, not with the number of concepts it owns.
 The 250 pure-LOC ceiling targets source modules; splitting this would scatter one

@@ -36,7 +36,7 @@ as the wiring:
   `SessionWatchingStore.resolve` is the one public method through which a new
   session can appear.
 
-allow: SIZE_OK -- 394 pure LOC, over the 250 ceiling because the C1 gate carries the
+allow: SIZE_OK -- 370 pure LOC, over the 250 ceiling because the C1 gate carries the
 closed vocabulary that names its outcomes, and most of that is docstrings recording
 decisions an operator has to be able to re-derive. The separable half is
 `SessionReaders` + `SessionWatchingStore` (the event fleet), and splitting it out

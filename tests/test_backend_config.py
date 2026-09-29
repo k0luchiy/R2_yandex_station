@@ -1,6 +1,6 @@
 """Tests for the config-driven backend registry loader (plan todo 2).
 
-allow: SIZE_OK -- 378 pure LOC, 63 tests. Every test file in this repo is
+allow: SIZE_OK -- 392 pure LOC, 63 tests. Every test file in this repo is
 257-991 pure LOC and a test module grows with the number of behaviours it pins;
 splitting the loader's happy path from its typed-error table would give each
 half a file that cannot say what the other half accepts.

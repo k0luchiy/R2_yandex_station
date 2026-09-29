@@ -196,6 +196,79 @@ def core_modules() -> set[str]:
     }
 
 
+SIZE_MARKER: Final = re.compile(r"allow: SIZE_OK -- (\d+) pure LOC")
+def size_marker_violations(root: Path | None = None) -> list[str]:
+    """Every `allow: SIZE_OK -- N pure LOC` whose N is not the file's own size.
+
+    The marker is a claim about a number, and a hand-written number drifts: four of
+    the eight in this repository were wrong when this checker was added, by -24 to
+    +19 lines, in both directions. A ceiling that is granted on the strength of a
+    number nobody recomputes is not a ceiling, it is a comment -- so the number is
+    derived here from the file itself, under the same definition the modules quote
+    (non-blank lines, comment-only lines removed, docstrings counted, which is what
+    reproduces `app/main.py = 167`).
+
+    A marker that states a size some other way -- `test_e2e_stack.py` says "pure
+    LOC is over the 250 ceiling" without a figure, and `test_docs.py` counts tests
+    rather than lines -- is not matched here and not counted against anyone. `root`
+    is a parameter so a test can point the checker at a tree it built.
+    """
+    base = root or REPO_ROOT
+    violations: list[str] = []
+    for path in sorted(base.rglob("*.py")):
+        if any(part in {".venv", "__pycache__", "db"} for part in path.parts):
+            continue
+        text = path.read_text(encoding="utf-8")
+        claimed = SIZE_MARKER.search(text)
+        if claimed is None:
+            continue
+        actual = len([
+            line for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ])
+        if int(claimed.group(1)) != actual:
+            violations.append(
+                f"{path.relative_to(base)}: marker says {claimed.group(1)}, "
+                f"the file is {actual}"
+            )
+    return violations
+
+
+def test_every_size_marker_states_the_size_its_file_actually_is():
+    # Given/When: every module that grants itself an exception to the LOC ceiling
+    # Then: the number it excuses itself with is the number it is
+    assert size_marker_violations() == []
+
+
+def test_the_size_checker_names_a_marker_that_drifted(tmp_path):
+    # The marker is assembled rather than written out, so this test's own source
+    # does not contain a claim the checker would then hold this file to.
+    claim = "allow: SIZE_OK -- {n}" + " pure LOC, over the ceiling because.\n"
+    body = '"""\n{claim}stays.\n"""\nx = 1\ny = 2\n'
+
+    def counted(text: str) -> int:
+        return len([
+            line for line in text.splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ])
+
+    # Counted with a real claim in place, not an empty one: the claim occupies a
+    # line of its own, and a blank placeholder would not be counted while the
+    # filled-in line is, which is a difference of exactly one.
+    real = counted(body.format(claim=claim.format(n=0)))
+    (tmp_path / "honest.py").write_text(body.format(claim=claim.format(n=real)), encoding="utf-8")
+    (tmp_path / "stale.py").write_text(
+        body.format(claim=claim.format(n=real + 1)), encoding="utf-8"
+    )
+    # When: the same checker that guards this repository is pointed at it
+    violations = size_marker_violations(tmp_path)
+    # Then: only the drifted one is named, with both numbers in the message
+    assert len(violations) == 1, violations
+    assert violations[0].startswith(f"stale.py: marker says {real + 1}, the file is {real}")
+
+
+
+
 def configured_models(config: dict | None = None) -> set[str]:
     """The model strings `config/backends.json` actually sends."""
     document = backends() if config is None else config
