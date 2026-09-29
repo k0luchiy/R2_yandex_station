@@ -626,15 +626,44 @@ def test_unit_does_not_enable_itself_or_inline_a_secret():
     assert "WantedBy" in text, "unit should be installable"
 
 
-def test_unit_is_accepted_by_systemd_analyze():
+def test_unit_is_accepted_by_systemd_analyze(tmp_path):
     # Given: systemd's own parser, when this box has it
-    # When: the unit is verified
-    # Then: no errors -- a unit that systemd rejects is a unit the owner cannot
-    # start at all, and the regex checks above cannot see that
     if shutil.which("systemd-analyze") is None:
         pytest.skip("systemd-analyze not installed")
+    # When: the installer renders the unit, and systemd is asked about THAT
+    #
+    # The generated unit, not the committed template, and not a re-implementation
+    # of the render either. The committed template spells the checkout-relative
+    # directives the way this repository was laid out, so verifying it verbatim asks
+    # systemd about a directory that exists only on the author's machine -- which is
+    # how this test came to fail on a clean clone at any other path. The installer
+    # rewrites four directives by KEY and copies every other line verbatim, so
+    # running it is the only way to check the unit an owner actually gets; a test
+    # that reproduced the substitution would drift from the installer silently.
+    dest = tmp_path / "prefix"
+    unit_dir = tmp_path / "unitdir"
+    workspace = tmp_path / "workspace"
+    rendered = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "install_r2d2_opencode_config.sh"),
+         "--dest", str(dest), "--unit", "--unit-dir", str(unit_dir),
+         "--workspace", str(workspace)],
+        capture_output=True, text=True, env={**os.environ, "HOME": str(tmp_path)},
+    )
+    assert rendered.returncode == 0, rendered.stdout + rendered.stderr
+    unit = unit_dir / "r2d2-opencode.service"
+    assert unit.is_file(), rendered.stdout + rendered.stderr
+    text = unit.read_text()
+    # the four path directives name the paths this run was given, which is the
+    # whole claim: the same four lines are this machine's on every machine
+    for expected in (f"ExecStart={REPO_ROOT}/scripts/opencode_serve.sh",
+                     f"EnvironmentFile={REPO_ROOT}/.env.oc",
+                     f"WorkingDirectory={workspace}",
+                     f"Documentation=file://{REPO_ROOT}/docs/08-deployment.md"):
+        assert expected in text, expected
+    # and the committed template's own layout did not survive into the unit
+    assert "%h/Documents" not in text
     result = subprocess.run(
-        ["systemd-analyze", "verify", str(UNIT)], capture_output=True, text=True
+        ["systemd-analyze", "verify", str(unit)], capture_output=True, text=True
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert "Error" not in result.stdout + result.stderr
