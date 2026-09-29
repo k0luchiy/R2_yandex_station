@@ -108,9 +108,10 @@ installed. Still yours to do, in this order:
 
   1. a password for the opencode server:
        \$EDITOR $ENV_OC      # R2D2_OC_PASSWORD=  (and the same value in $REPO_ROOT/.env)
-  2. the same workspace in R2D2's own .env, because that is the directory every
-     session is scoped to and app/config.py's default is one machine's path:
-       R2D2_WORKSPACE=$WORKSPACE
+  2. nothing: Config's own default for R2D2_WORKSPACE is the same
+     ~/r2d2-workspace this script creates, and it expands to the directory every
+     session is scoped to. Set R2D2_WORKSPACE in .env only if you passed
+     --workspace somewhere else.
   3. check what this opencode actually offers -- the model ids in
      config/backends.json are a snapshot of one machine (docs/08-deployment.md 2.5)
   4. enable the unit (a deliberate act, not this script's):
