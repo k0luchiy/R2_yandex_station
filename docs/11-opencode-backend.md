@@ -282,8 +282,8 @@ DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
           "uname *": "allow",
           "hostname *": "allow",
           "ps *": "allow",
-          "uptime": "allow",
-          "date": "allow",
+          "uptime *": "allow",
+          "date *": "allow",
           "*/.r2d2/r2d2_do.py shell *": "deny",
           "python3 */.r2d2/r2d2_do.py shell *": "deny",
           "*/.venv/bin/python */.r2d2/r2d2_do.py shell *": "deny"
@@ -305,7 +305,7 @@ DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
   разрешён. Агент читает репозиторий и не читает секреты.
 - `bash` — это не «включён», это список из двенадцати разрешённых команд плюс
   `*` в `ask`. В списке три формы вызова шима (см. [06-tools.md](06-tools.md))
-  и девять read-only проб (`upower *`, `df *`, `uptime`, `date`, …).
+  и девять read-only проб (`upower *`, `df *`, `uptime *`, `date *`, …).
 - Три правила `deny` на `r2d2_do.py shell *` идут **после** allow и перекрывают
   его: allow на `r2d2_do.py *` сам по себе включал бы подкоманду `shell`.
 
@@ -356,8 +356,8 @@ prose после неё — нет, и это разговор, который �
           "uname *": "allow",
           "hostname *": "allow",
           "ps *": "allow",
-          "uptime": "allow",
-          "date": "allow"
+          "uptime *": "allow",
+          "date *": "allow"
         },
         "task": "ask",
         "skill": "ask",
@@ -1425,6 +1425,7 @@ def tg_application_id(cfg: Config, chat_id: int) -> str | None:
 | `core/session_settle.py` | «прекратил ли писать голосовой ход, переживший дедлайн»: ожидание `session.idle` после момента дедлайна, вне часов Алисы, с вырожденной веткой без потока событий |
 | `core/session_sweeps.py` | два свипа вне часов отдачи: остаток хода, пережившего дедлайн, и якорь, который не удалось прочитать вовремя |
 | `core/session_route.py` | ход в сессии opencode: C8, дедлайн, сентинел, `HybridWiring` |
+| `core/turn_lease.py` | три вопроса об окне сборщика: где начинается окно (якорь, которого нет, — это ничего, а не всё), всё ещё ли это мой ход (сообщение пользователя после своей задачи) и не доставлено ли уже (журнал по id сообщений) |
 | `core/tools/arxiv_tool.py` | поиск статей на arxiv и сборка сводки |
 | `core/tools/base.py` | `ToolContext` и `ToolResult` |
 | `core/tools/laptop_tool.py` | заряд, память, аптайм, запуск приложений |

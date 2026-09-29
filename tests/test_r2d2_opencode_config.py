@@ -22,7 +22,7 @@ assertion:
 
 Nothing here talks to a server, so the suite is deterministic and offline.
 
-allow: SIZE_OK -- 514 pure LOC, 44 tests. Every test file in this repo is 257-991
+allow: SIZE_OK -- 534 pure LOC, 46 tests. Every test file in this repo is 257-991
 pure LOC and a test module grows with the number of behaviours it pins; splitting
 the two permission-matrix checkers from the prompt and install tests would give
 each half a file that cannot say what the other half forbids.
@@ -60,6 +60,8 @@ SHIM = "r2d2_do.py"
 PROBE_SUB = "shell rm -rf /tmp/r2d2-probe"
 #: Read-only probes that answer a spoken status question without any tool the
 #: model has to be trusted with.  Nothing here writes, moves or deletes.
+#: Every probe takes arguments -- a trailing ` *`, so `date "+%A, %d %B %Y"`
+#: matches instead of raising a permission question that parks the session.
 READ_ONLY_PROBES = frozenset(
     {
         "upower *",
@@ -69,10 +71,13 @@ READ_ONLY_PROBES = frozenset(
         "uname *",
         "hostname *",
         "ps *",
-        "uptime",
-        "date",
+        "uptime *",
+        "date *",
     }
 )
+#: The live argument list that parked the session: what day is it, asked with a
+#: format the bare `date` probe could not match.
+LIVE_ARG: Final = '"+%A, %d %B %Y"'
 #: The catch-all of a `bash` block, and the only key the blocks are required to
 #: open with -- opencode takes the LAST matching rule, so a catch-all that is not
 #: first is not a default but dead text.
@@ -488,6 +493,42 @@ def test_voice_bash_allowlist_is_the_shim_plus_read_only_probes():
     assert shim_allows(bash)
 
 
+@pytest.mark.parametrize("agent", [VOICE, AGENT])
+def test_every_read_only_probe_takes_arguments(agent):
+    # Given the live shape: `date "+%A, %d %B %Y"` -- a routine question with
+    # arguments, which parked the session on a permission question because `date`
+    # and `uptime` were declared without a trailing ` *`, unlike the other ten
+    bash = bash_block(agent)
+    # When/Then every probe matches a concrete command carrying an argument. The
+    # command is built from the pattern itself, so this fails the moment a probe
+    # is declared bare again -- the failure mode is a parked session, not a deny.
+    for probe in sorted(non_shim_allows(bash)):
+        assert probe.endswith("*"), f"{agent}: {probe!r} cannot take arguments at all"
+        command = f"{probe[:-1]}{LIVE_ARG}"
+        action, _ = effective(bash, command)
+        assert action == "allow", f"{agent}: {command!r} resolves to {action!r}, not allow"
+
+
+def test_the_spellings_the_prompts_teach_resolve_to_allow():
+    # Given the shipped spelling: the prompts tell the model to call the shim by
+    # its installed path, because the bare `r2d2_do` is neither on PATH (the
+    # shell answers `command not found`) nor in the allowlist (bare name matches
+    # no `*/.r2d2/r2d2_do.py *` grant, so opencode asks)
+    voice, agent = bash_block(VOICE), bash_block(AGENT)
+    # When/Then the prompt's invocation is the allowlist's invocation: ordinary
+    # tool calls are allowed on both agents without a question ...
+    assert effective(voice, "~/.r2d2/r2d2_do.py status")[0] == "allow"
+    assert effective(voice, "~/.r2d2/r2d2_do.py tg hello")[0] == "allow"
+    assert effective(agent, "~/.r2d2/r2d2_do.py status")[0] == "allow"
+    # ... and the one subcommand the voice agent may never reach still loses
+    assert effective(voice, "~/.r2d2/r2d2_do.py shell ls")[0] == "deny"
+    assert effective(agent, "~/.r2d2/r2d2_do.py shell ls")[0] == "allow"
+    # ... and no prompt teaches the bare name that fails both ways
+    for name in (VOICE, AGENT):
+        for line in load()["agent"][name]["prompt"].split("\n"):
+            assert " r2d2_do " not in f" {line} ", f"{name}: prompt teaches bare r2d2_do: {line[:80]}"
+
+
 def test_voice_bash_asks_where_it_used_to_refuse():
     # Given: the owner removed the hard deny from the voice catch-all on purpose
     bash = load()["agent"][VOICE]["permission"]["bash"]
@@ -599,7 +640,7 @@ def test_agent_prompt_states_the_confirmation_and_honesty_contract():
     # When/Then: each rule that keeps a spoken request from becoming an
     # unreviewed system change is stated
     assert "телеграм" in prompt and "markdown" in prompt
-    assert "r2d2_do shell" in prompt
+    assert "r2d2_do.py shell" in prompt
     assert "подтверждени" in prompt
     assert re.search(r"не\s+говори|никогда\s+не\s+утверждай|не\s+заявляй", prompt)
     assert "жди" in prompt or "ожидай" in prompt
@@ -708,12 +749,15 @@ def test_the_only_model_in_the_file_is_the_usable_free_one():
     config = load()
     # When: every `provider/model` shaped token inside a string value is
     # collected -- a prompt counts, the absolute paths in the bash patterns
-    # are keys and do not
+    # are keys and do not. A token ending in `.py` is a file path, not a model:
+    # the prompts spell the installed shim as `~/.r2d2/r2d2_do.py`, which is
+    # model-shaped (`r2d2/r2d2_do.py`) without being one.
     found = [
         model
         for value in string_values(config)
         if not URL_LIKE.match(value)
         for model in MODEL_LIKE.findall(value)
+        if not model.endswith(".py")
     ]
     # Then: C1 -- space-bunny-free is the only model opencode serve accepts
     assert found == [MODEL]

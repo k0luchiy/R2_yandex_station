@@ -51,6 +51,7 @@ from core.memory import Memory
 from core.opencode.turn_watch import TurnWatch
 from core.tools import arxiv_tool
 from core.tools.telegram_tool import send_message
+from core.turn_lease import SUPERSEDED, TurnSuperseded
 
 #: The job type `core/brain.py` enqueues when a voice turn outruns the fast
 #: deadline (todo 15). The brain owns the name; this module owns the branch.
@@ -80,11 +81,22 @@ class ReplyCollector(Protocol):
     `OpencodeSessionBackend` satisfies it structurally, which is what lets todo
     18 hand the real adapter in without this module importing it -- and naming
     the method here is what keeps the branch a call rather than a lookup.
+    `turn_text` is the task the collector was armed for, and what makes it a
+    collector FOR A TURN (`core/turn_lease.py`): a session that has moved on to
+    a newer turn raises `TurnSuperseded` instead of answering for it.
     """
 
     async def collect_reply(
-        self, session_id: str, since_message_id: str, timeout_s: float
+        self, session_id: str, since_message_id: str, timeout_s: float, *, turn_text: str = ""
     ) -> str: ...
+
+    def note_delivered(self, session_id: str) -> None:
+        """Claim the last collected window as delivered, so a twin cannot repeat it.
+
+        Called once the job's text is decided and before it is sent; a claim is a
+        delivery, never a collection round.
+        """
+        ...
 
 
 def _text_field(job: Mapping[str, object], key: str, *, allow_empty: bool = False) -> str:
@@ -187,8 +199,18 @@ class Worker:
             await self.memory.set_job_status(job_id, "running")
             try:
                 text = await self._dispatch(job)
+                self._note_delivered(job)
                 await self.memory.set_job_status(job_id, "done", result=text[:2000])
                 await self._deliver(text)
+            except TurnSuperseded as exc:
+                # An orphaned collector: its turn is no longer the session's current
+                # one, so whatever it read belongs to a newer turn whose own collector
+                # delivers it. The job is DONE -- this is the correct outcome, not a
+                # failure -- the row says so, and the user is sent nothing: not the
+                # newer turn's answer, and not a "no answer" either, because the real
+                # answer is on its way from the collector that owns it.
+                self.logger.warning("job %s superseded: %s", job_id, exc)
+                await self.memory.set_job_status(job_id, "done", result=SUPERSEDED)
             except Exception as exc:
                 self.logger.exception("job %s failed", job_id)
                 await self.memory.set_job_status(job_id, "error", error=str(exc)[:500])
@@ -219,6 +241,14 @@ class Worker:
             return await self._opencode_reply(job)
         return "Неизвестная задача."
 
+    def _note_delivered(self, job: dict) -> None:
+        """Claim this job's collected window: claim-then-send, so a twin reading after refuses."""
+        if job.get("type") != JOB_OPENCODE_REPLY or self._backend is None:
+            return
+        session_id = job.get("session_id")
+        if isinstance(session_id, str) and session_id:
+            self._backend.note_delivered(session_id)
+
     async def _opencode_reply(self, job: dict) -> str:
         """The text the opencode agent produced after the marker, or `NO_REPLY`.
 
@@ -228,6 +258,13 @@ class Worker:
         away from being the thing that holds a slot for ten minutes -- and rather than
         left to `core/answer_gate.py`, which is about what an answer IS and not about how
         long this pool may be held.
+
+        `turn_text` rides in the job because the collector is a collector FOR A TURN
+        (`core/turn_lease.py`): a job that does not state one degrades to the old
+        session-wide collection rather than failing, because the absence of a turn is
+        not evidence of a newer one. A collector that finds its turn superseded raises
+        `TurnSuperseded`, which is NOT caught here: `_run_job` records it and sends
+        nothing, so an orphan never answers for a turn that is not it.
         """
         backend = self._backend
         if backend is None:
@@ -239,10 +276,15 @@ class Worker:
         session_id = _text_field(job, "session_id")
         since_message_id = _text_field(job, "since_message_id", allow_empty=True)
         timeout_s = _timeout_field(job)
+        turn_text = job.get("turn_text")
         gate = AnswerGate(self.cfg, self.logger, backend.collect_reply, self._turns)
         try:
             return await asyncio.wait_for(
-                gate.answer(session_id, since_message_id, timeout_s), timeout_s
+                gate.answer(
+                    session_id, since_message_id, timeout_s,
+                    turn_text=turn_text if isinstance(turn_text, str) else "",
+                ),
+                timeout_s,
             )
         except TimeoutError as exc:
             # Indistinguishable from a TimeoutError the collector raised itself, and

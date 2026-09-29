@@ -66,8 +66,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
-from typing import Final
+from typing import Final, Protocol
 
 from app.config import Config
 from core import routing
@@ -87,11 +86,16 @@ COLLECTED: Final = "msg_collected"
 #: The one role that speaks (C7), re-exported rather than re-declared so the record this
 #: gate files cannot drift from the one the sweep reads in a session.
 ASSISTANT_ROLE: Final = routing.ASSISTANT_ROLE
-#: The one method of the opencode backend this module needs. A `Callable` rather than
-#: the `ReplyCollector` protocol so this gate imports no job-pool type and no client:
-#: `core.async_worker` hands `backend.collect_reply` in, and a test can hand in a
-#: function with no server, no session and no pool at all.
-Collect: Final = Callable[[str, str, float], Awaitable[str]]
+#: The one method of the opencode backend this module needs. A `Protocol` rather
+#: than the `ReplyCollector` protocol so this gate imports no job-pool type and no
+#: client: `core.async_worker` hands `backend.collect_reply` in, and a test can hand
+#: in a function with no server, no session and no pool at all. `turn_text` is the
+#: task the collector was armed for -- `core/turn_lease.py` refuses to speak for a
+#: turn that is not it -- and `""` is a collector with no turn to check against.
+class Collect(Protocol):
+    async def __call__(
+        self, session_id: str, since_message_id: str, timeout_s: float, *, turn_text: str = ""
+    ) -> str: ...
 
 
 class AnswerGate:
@@ -116,19 +120,27 @@ class AnswerGate:
         self._collect = collect
         self._turns = turns
 
-    async def answer(self, session_id: str, since_message_id: str, timeout_s: float) -> str:
-        """The agent's answer, or `NO_REPLY`. Raises only `TimeoutError`.
+    async def answer(
+        self, session_id: str, since_message_id: str, timeout_s: float, *, turn_text: str = ""
+    ) -> str:
+        """The agent's answer, or `NO_REPLY`. Raises `TimeoutError` on overrun.
 
         The ceiling belongs to the caller: this returns as soon as it has an answer, and
         a collector that overruns is the caller's `asyncio.wait_for` to bound, which is
         what keeps one stuck session from holding a worker slot.
+
+        `turn_text` is handed to every collection round unchanged: it is what makes the
+        collector a collector FOR A TURN (`core/turn_lease.py`). A round that finds the
+        session has moved on raises `TurnSuperseded`, which is NOT caught here: the
+        right outcome is a delivered nothing, and only the worker owns the delivery,
+        so it propagates to `core/async_worker.py`, which records it and sends nothing.
         """
         started = time.monotonic()
         deadline = started + timeout_s
         parked_at: float | None = None
         anchor = since_message_id
         while True:
-            text = await self._collect(session_id, anchor, timeout_s)
+            text = await self._collect(session_id, anchor, timeout_s, turn_text=turn_text)
             state = self._state(session_id)
             if state is None or not self._turns.watched(session_id) or state.ended_after(started):
                 return text if self._is_answer(text) else self._refuse(text, session_id, state)

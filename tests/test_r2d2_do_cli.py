@@ -75,8 +75,8 @@ CONTRACT_KEYS = {"ok", "text", "needs_confirm", "pending", "error"}
 EXIT_OK, EXIT_FAIL, EXIT_CONFIRM = 0, 1, 2
 
 #: Environment the tests own. Everything the CLI or `Config.load()` can read is
-#: cleared first: a test must never inherit the operator's credentials, and
-#: `load_dotenv()` cannot be relied on not to find a real `.env`.
+#: cleared first: a test must never inherit the operator's credentials from the
+#: ambient environment.
 _STRIPPED_PREFIXES = ("R2D2_", "TELEGRAM_", "OPENROUTER_", "YANDEX_", "SHELL_", "BACKENDS_PATH", "DB_PATH")
 _STRIPPED_EXACT = ("PYTHONPATH", "R2D2_DO_REEXEC", "R2D2_FAKE_LAUNCH_LOG")
 
@@ -547,11 +547,11 @@ def test_bot_token_never_appears_in_output(tmp_path: Path) -> None:
 def _ambient_bot_token() -> str:
     """The operator's real token, if this process has one.
 
-    Importing `app.config` runs its module-level `load_dotenv()`, so the repo
-    `.env` counts as "the environment" -- which is exactly the configuration
-    where a leak would hurt.
+    `app.config` merges no file, so only a token the environment really holds
+    counts as "ambient" -- which is exactly the configuration where a leak
+    would hurt.
     """
-    import app.config  # noqa: F401 -- the import is the point: it populates os.environ
+    import app.config  # noqa: F401 -- the import is the point: it must not populate os.environ
 
     return os.environ.get("TELEGRAM_BOT_TOKEN", "")
 

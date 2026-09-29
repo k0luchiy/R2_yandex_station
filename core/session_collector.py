@@ -17,12 +17,17 @@ one home each and no branch can grow a second of them.
 
 The properties this module exists to hold:
 
-* **Exactly one collector per escalating turn.** `_hand_over` is the only call
-  site in the whole server that submits an agent task or enqueues an
-  `opencode_reply` job, which is what makes "one collector per turn" a property
-  of the code instead of a convention: the three branches that escalate cannot
-  each grow a second, and a branch that escalates cannot forget the collector,
-  because returning the ack at all IS one of the two calls.
+* **Exactly one collector per escalating turn, and it is that turn's.** `_hand_over`
+  is the only call site in the whole server that submits an agent task or enqueues an
+  `opencode_reply` job, which is what makes "one collector per turn" a property of
+  the code instead of a convention: the three branches that escalate cannot each grow
+  a second, and a branch that escalates cannot forget the collector, because
+  returning the ack at all IS one of the two calls. The job carries the turn's own
+  task text as well as its anchor, so the collector can tell that the session has
+  moved on to a newer turn and stop rather than answer for it -- the live run's
+  orphaned collector delivered the next turn's physics overview as the answer to
+  "what day is it today", and the collector that owned that answer sent the same
+  7 836 characters 1.3 s later. `core/turn_lease.py` is that check.
 * **The anchor is read before the submit.** `_collect_later` reads the
   transcript and deletes the routing signal BEFORE the task is queued, so the
   marker is the last message the session held while this turn was still its own
@@ -41,9 +46,8 @@ The properties this module exists to hold:
   prose the refusing agent wrote in its place is conversation and is never swept.
 * **That same turn's residue is therefore swept by its OWN hand-off**, from a
   snapshot taken after it ended, before the submit. `sweep_residue` at the entry of
-  the next turn is no longer the mechanism; it is the backstop for a wait that timed
-  out or ran without an event reader, and it is what keeps such a turn a delay
-  rather than a loss.
+  the next turn is the backstop for a wait that timed out or ran without an event
+  reader, and it is what keeps such a turn a delay rather than a loss.
 * **A stored permission refusal IS this module's business, and is deleted** --
   `signal_ids` means "messages that must not survive", whatever made them a signal,
   so the rule dump opencode writes into a refused agent's matrix (contract U8, and
@@ -71,6 +75,9 @@ from core.opencode.client import OpencodeError
 from core.session_settle import TurnSettler
 from core.session_sweeps import MARKER_TIMEOUT_S, SessionSweeper
 from core.tools.telegram_tool import send_message
+#: `TASK_PREFIX` is imported, not defined: `core/turn_lease.py` owns what a task
+#: message looks like, and the hand-off that writes one cannot spell it twice.
+from core.turn_lease import TASK_PREFIX  # noqa: F401 -- re-exported for `core/brain.py`
 
 if TYPE_CHECKING:  # the route composes this module, so the edge cannot be a runtime one
     from core.session_route import HybridWiring
@@ -82,9 +89,6 @@ JOB_OPENCODE_REPLY: Final = "opencode_reply"
 #: The collector's ceiling, stated in the job rather than left to the reader. It
 #: is a ceiling and not a wait: `collect_reply` ends on the idle condition first.
 COLLECT_TIMEOUT_S: Final = 600.0
-#: The agent task carries the request in the user's own words, so the agent has
-#: it even when the voice model offered no hint.
-TASK_PREFIX: Final = "Пользователь попросил голосом: "
 
 
 class SessionCollector:
@@ -140,8 +144,7 @@ class SessionCollector:
         the budget is still running server-side, and waiting for it here is exactly what
         blows Alice's 4.5 s. The work is still submitted -- D5 -- but inside
         `core/session_settle.py`'s wait, so the snapshot the sweep takes already holds the
-        residue that turn leaves. The deadline branch is the only caller: on the other two
-        the voice turn is absent or finished, and `hand_to_agent` is the whole of it.
+        residue that turn leaves. The deadline branch is the only caller.
         """
         self.worker.arm_watch(wiring.turns)
         task = self._task_text(command, hint)
@@ -186,11 +189,10 @@ class SessionCollector:
         """Record that this session's last turn may still be writing a routing signal.
 
         Called from the deadline branch, where the voice turn is handed to the agent while it
-        is still running: the sweep that runs before the agent's turn therefore cannot see
-        the `[[NEEDS_AGENT]]` that turn is about to write, and the agent, reading it as its
-        own history, writes one itself. The signal is removed at the entry of the NEXT turn
-        for this session -- see `sweep_residue` -- because at this point there is nothing to
-        remove.
+        is still running: the sweep that runs before the agent's turn therefore cannot see the
+        `[[NEEDS_AGENT]]` that turn is about to write, and the agent, reading it as its own
+        history, writes one itself. Nothing can be removed at that point, so the signal is
+        removed at the entry of the NEXT turn -- see `sweep_residue`.
         """
         self.sweeper.note_dead_turn(session_id)
 
@@ -213,14 +215,22 @@ class SessionCollector:
         """
         await send_message(self.cfg, text)
 
-    async def _enqueue(self, app_id: str, session_id: str, anchor: str) -> None:
-        """Write the one `opencode_reply` job this escalating turn gets."""
+    async def _enqueue(self, app_id: str, session_id: str, anchor: str, task: str) -> None:
+        """Write the one `opencode_reply` job this escalating turn gets.
+
+        `task` rides along with the anchor because an anchor says WHERE to start
+        reading and not WHOSE turn that is: "everything newer" spans every turn after
+        this one, which is how an orphaned collector delivered the next turn's answer
+        as this turn's. `core/turn_lease.py` finds this turn's own task in the window
+        and refuses to speak for a turn that is not it.
+        """
         await self.worker.enqueue(
             {
                 "type": JOB_OPENCODE_REPLY,
                 "application_id": app_id,
                 "session_id": session_id,
                 "since_message_id": anchor,
+                "turn_text": task,
                 "timeout_s": COLLECT_TIMEOUT_S,
             }
         )
@@ -234,41 +244,32 @@ class SessionCollector:
         Both halves read the session ONCE, and the order is the whole point. The
         snapshot says which stored messages are routing signals and which is the
         newest message that survives them; the signals are deleted, and only then
-        is the collector armed with the surviving id. Anchoring first and
-        deleting afterwards would leave the collector pointing at a message the
-        server no longer lists, and a marker it cannot position means "everything
-        in the session is newer" -- the entire conversation replayed into Telegram.
+        is the collector armed with the surviving id. Anchoring first and deleting
+        afterwards would aim the collector at a message the server no longer lists,
+        and what a collector does with an anchor it cannot position is
+        `core/turn_lease.py`'s subject, not this module's.
 
-        Deleting is not a repair of the user's transcript. Only ASSISTANT messages are
-        removed, and only when they are opencode's own enforcement state -- carrying the
-        sentinel, or holding a tool-permission refusal -- so every utterance the user made
-        and every real answer survives. What goes is a control signal the protocol never
-        meant to be conversation, and leaving the sentinel is what let one escalation disable
-        the agent path for good. The escalation hint is not lost with the message: it is
-        already part of the task text submitted above.
+        Deleting is not a repair of the user's transcript: only ASSISTANT messages are removed,
+        and only when they are opencode's own enforcement state, so every utterance the user
+        made and every real answer survives. `core/routing.py` owns why, and `qa/live-run-v3.md`
+        §D9 is why the prompt rule that used to stand in for the deletion is gone: the agent
+        read the refusal as a ban on its own tools and stopped working for that user for good.
 
-        A stored refusal is swept on the same pass and is NOT protected, which is the change
-        from the version of this paragraph that argued the opposite. It arrived as
+        A stored refusal is swept on the same pass and is NOT protected. It arrived as
         `MessageRecord.refused` rather than as text, so this sweep can see one; what it
         carries is the refused agent's whole effective matrix spelled out (contract U8), and
-        in the shared session that matrix is not the reader's. The prompt rule that used to
-        stand in for the deletion is measured and ineffective -- the agent read the refusal as
-        a ban on its own tools, reached for `bash` where `webfetch` was allowed and needed no
-        human, and stopped working for that user for good (`qa/live-run-v3.md` §D9). The
-        price is that the record of the refusal goes with it; the user still learns the
-        command did not run, from the request that is never swept and from the prose answer
-        the refused agent wrote next, and both live runs measured that surviving
-        (`qa/live-run-v4.md`).
+        in the shared session that matrix is not the reader's. The price is that the record
+        of the refusal goes with it; the user still learns the command did not run, from the
+        request that is never swept and from the prose answer the refused agent wrote next.
 
         Finding the marker costs one GET on a path that has already spent the whole voice
-        budget, and it is bounded: a server that will not answer here must not cost the
-        user the acknowledgement. It used to cost the ANSWER as well -- the read timed out,
-        the method returned, and no collector was ever armed, so a plain question produced
-        an answer nobody was ever going to receive (`qa/live-run-v3.md` §D15: "Париж."
-        written to the session at 13:36:59 and never delivered). So the read failing is no
-        longer the end of the hand-off: the collector is armed anyway, on an anchor resolved
-        off Alice's clock by `_arm_when_readable`, and only a server that cannot answer THAT
-        either costs the answer -- and then the user is told, in their own chat.
+        budget, and it is bounded: a server that will not answer here must not cost the user
+        the acknowledgement. It used to cost the ANSWER as well -- the read timed out and no
+        collector was ever armed (`qa/live-run-v3.md` §D15: "Париж." written to the session
+        at 13:36:59 and never delivered). So the read failing is no longer the end of the
+        hand-off: the collector is armed anyway, on an anchor resolved off Alice's clock by
+        `_arm_when_readable`, and only a server that cannot answer THAT either costs the
+        answer -- and then the user is told, in their own chat.
         """
         try:
             records = await asyncio.wait_for(
@@ -287,14 +288,13 @@ class SessionCollector:
         for message_id in sweep.signal_ids:
             await self.sweeper.erase(wiring.client, app_id, session_id, message_id)
         if not sweep.since_message_id and records:
-            # The session held messages and the sweep removed every one, so `""` would name
-            # the whole deleted history as newer -- in a collector that lives for its whole
-            # 600 s ceiling, so the next turn's answer arrives as this turn's. The only
-            # boundary left is the task message, which the submit has not written yet.
+            # The session held messages and the sweep removed every one, so `""` would mean
+            # "everything this session ever holds is newer" -- for a collector that lives its
+            # whole 600 s ceiling. The only boundary left is the task message, not yet written.
             self.sweeper.arm_later(wiring.client, app_id, session_id, task)
             return
         # An EMPTY snapshot is the C8 case, and `""` is the truth rather than a default: this
         # session has held nothing, so "everything it ever holds is newer" is exact. There is
         # no boundary to wait for, and waiting would hand the answer to a collector that does
         # not exist yet -- the D15 shape again.
-        await self._enqueue(app_id, session_id, sweep.since_message_id)
+        await self._enqueue(app_id, session_id, sweep.since_message_id, task)

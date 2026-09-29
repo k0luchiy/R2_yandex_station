@@ -39,9 +39,11 @@ value is a programming error and raises rather than guessing a session.
 todo 7) does not need. It stays because the degradation is pre-agreed, typed and
 now tested: the idleness rule is "no new assistant text for one
 `r2d2_event_poll_interval`", not `session.idle`, because a session can sit `busy`
-for a whole agent turn and cutting on that would truncate live work.
+for a whole agent turn and cutting on that would truncate live work. What it reads
+out of that window -- where the window starts, and whether this collector still owns
+the turn -- is `core/turn_lease.py`, which is where the live run's orphaned-collector
+defect is answered.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -60,6 +62,7 @@ from core.opencode.models import verify_models
 from core.opencode.session_store import OcSessionStore
 from core.opencode.sse import EventSource
 from core.opencode.wire import MessageRecord, OpencodeError
+from core.turn_lease import DeliveryLedger, TurnLease
 
 __all__ = [
     "NoCurrentApplicationId",
@@ -77,9 +80,9 @@ log = logging.getLogger(__name__)
 current_application_id: Final[ContextVar[str | None]] = ContextVar(
     "r2d2_current_application_id", default=None
 )
-#: The two roles opencode's `info.role` distinguishes on this route (C7).
+#: The role that ASKS on this route (C7); the one that answers is
+#: `core.turn_lease.ASSISTANT_ROLE`, which the collector's window is read with.
 USER_ROLE: Final = "user"
-ASSISTANT_ROLE: Final = "assistant"
 
 
 # ---------------------------------------------------------------------------
@@ -125,23 +128,6 @@ class OpencodeWiring:
     events: EventSource | None = None
 
 
-def _assistant_text(records: Sequence[MessageRecord], since_message_id: str) -> str:
-    """The assistant text in `records` that is newer than `since_message_id`.
-
-    `GET /session/:id/message` is chronological (C7), so "newer than the marker"
-    means "after the marker's position in the list". A marker the server no longer
-    returns means the window was truncated at the front, and then every message
-    still listed is newer than it: losing a whole reply because an anchor
-    scrolled out of the window is the worse failure. Only the assistant speaks --
-    the user's own text is the request, not the answer.
-    """
-    ids = [record.id for record in records]
-    start = ids.index(since_message_id) + 1 if since_message_id in ids else 0
-    return "\n".join(
-        record.text for record in records[start:] if record.role == ASSISTANT_ROLE and record.text
-    )
-
-
 # ---------------------------------------------------------------------------
 # The adapter
 # ---------------------------------------------------------------------------
@@ -161,6 +147,8 @@ class OpencodeSessionBackend:
         self._wiring = wiring
         self.name: str = spec.name
         self._poll_interval_s = wiring.cfg.r2d2_event_poll_interval
+        self._delivered = DeliveryLedger()
+        self._last_window: dict[str, list[MessageRecord]] = {}
         log.info(
             "opencode session backend: name=%s fast_model=%s task_agent=%s poll_interval=%.1fs",
             self.name, spec.fast_model, spec.task_agent, self._poll_interval_s,
@@ -215,14 +203,26 @@ class OpencodeSessionBackend:
             session_id, text, agent=self._spec.task_agent, model=self._spec.task_model
         )
 
-    async def collect_reply(self, session_id: str, since_message_id: str, timeout_s: float) -> str:
-        """The agent's assistant text produced after `since_message_id`, or `""`.
+    async def collect_reply(
+        self, session_id: str, since_message_id: str, timeout_s: float, *, turn_text: str = ""
+    ) -> str:
+        """This turn's agent text produced after `since_message_id`, or `""`.
 
         The F1 fallback collector. It ends on whichever comes first: no new
         assistant text for one `r2d2_event_poll_interval`, or `timeout_s` elapsed.
         Both bounds are absolute -- each poll is itself given only the time left
         before the deadline, so a server that accepts a request and never answers
         cannot outlive `timeout_s` either.
+
+        `turn_text` is the task this turn submitted, and it is what makes the
+        collector a collector FOR A TURN rather than for a session: a `user`
+        message after it in the window is a newer turn, and this one has nothing
+        left to say about it. It raises `TurnSuperseded` rather than returning,
+        because the right outcome is a delivered nothing and no string can say
+        that. The rule, the anchor rule it reads the window with, and the
+        measured failure it exists for are all `core/turn_lease.py`. Empty means "no turn
+        to check against" -- the degradation for a caller that never submitted one, never
+        a supersession: the absence of a turn is not evidence of a newer one.
 
         Everything runs inline, with no task of its own, so a caller that cancels
         the collector (a worker shutting down) cancels the request with it and
@@ -232,22 +232,36 @@ class OpencodeSessionBackend:
         deadline = time.monotonic() + timeout_s
         changed_at = deadline
         text = ""
+        lease = TurnLease(since_message_id, turn_text, self._delivered)
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return text
+                break
             try:
                 records = await asyncio.wait_for(
                     self._wiring.client.list_messages(session_id), remaining
                 )
             except TimeoutError:
-                return text
-            candidate = _assistant_text(records, since_message_id)
+                break
+            candidate = lease.read(session_id, records)
             if candidate != text:
                 text, changed_at = candidate, time.monotonic()
             if time.monotonic() - changed_at >= self._poll_interval_s:
-                return text
+                break
             await asyncio.sleep(min(self._poll_interval_s, deadline - time.monotonic()))
+        self._last_window[session_id] = lease.window
+        return text
+
+    def note_delivered(self, session_id: str) -> None:
+        """Claim the last collected window as delivered, so a twin cannot repeat it.
+
+        Called by the worker once the job's text is decided and before it is sent:
+        the claim means DELIVERY, which is why it lives here and not in
+        `collect_reply` -- the gate re-collects a parked turn round after round,
+        and none of those rounds may lock out the round that finally delivers.
+        A window that never collected anything claims nothing.
+        """
+        self._delivered.claim(session_id, self._last_window.pop(session_id, []))
 
     async def validate_models(self) -> tuple[str, ...]:
         """Check every model this spec configures against the server; return them.

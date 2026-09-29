@@ -26,6 +26,8 @@
 Nothing here opens a socket: the registry constructs backends, and an
 `OpenAICompatibleBackend` builds its `httpx.AsyncClient` only on first use, so
 construction is inert. The brain cases inject their own backends.
+
+allow: SIZE_OK -- 477 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -57,8 +59,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SHIPPED = str(REPO_ROOT / "config" / "backends.json")
 SHIPPED_DOC = json.loads(Path(SHIPPED).read_text(encoding="utf-8"))
 
-# `app.config` calls load_dotenv() at import, so the ambient environment is not
-# clean and every test must state its own credential state.
+# `app.config` reads the ambient environment and nothing else, so that
+# environment is not clean and every test must state its own credential state.
 TOUCHED = (
     "R2D2_OC_USERNAME",
     "R2D2_OC_PASSWORD",

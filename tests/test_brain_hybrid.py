@@ -43,6 +43,8 @@ the sentinel is the model's own protocol -- a user who says the words out loud
 is asking what they mean, and escalating their question to the agent would drop
 the turn on the floor. The text still reaches the session verbatim
 (`test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal`).
+
+allow: SIZE_OK -- 1575 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -124,10 +126,11 @@ OPENROUTER_KEY: Final = "sk-or-openrouter-test-4b2d"
 TELEGRAM_TOKEN: Final = "TESTTOKEN"
 
 #: The job type todo 16 adds to `Worker._dispatch`, and the exact field set the
-#: brain writes. Todo 16 reads `session_id`, `since_message_id` and `timeout_s`.
+#: brain writes. Todo 16 reads `session_id`, `since_message_id`, `turn_text`
+#: and `timeout_s`.
 JOB_TYPE: Final = "opencode_reply"
 JOB_FIELDS: Final = frozenset(
-    {"type", "application_id", "session_id", "since_message_id", "timeout_s"}
+    {"type", "application_id", "session_id", "since_message_id", "turn_text", "timeout_s"}
 )
 #: The collector ceiling the brain states in the job. It is never reached in a
 #: test (the idle condition ends the poll first), so the value is pinned rather
@@ -516,10 +519,12 @@ class CollectorWorker(Worker):
 
     async def _dispatch(self, job: dict) -> str:
         if job.get("type") == JOB_TYPE:
+            turn = job.get("turn_text")
             text = await self._backend.collect_reply(
                 str(job["session_id"]),
                 str(job["since_message_id"]),
                 float(job.get("timeout_s", COLLECT_TIMEOUT_S)),
+                turn_text=turn if isinstance(turn, str) else "",
             )
             return text or NO_REPLY
         return await super()._dispatch(job)
@@ -1175,8 +1180,8 @@ async def test_the_collector_anchors_at_a_message_the_server_still_lists(rig: Ri
     assert await rig.say() == ACK
     # Then the anchor is a message that survives the sweep. Anchoring at the
     # message about to be deleted would leave the collector holding an id the
-    # server no longer lists, and `collect_reply` reads an unpositionable marker as
-    # "everything is newer" -- the whole conversation, replayed into Telegram.
+    # server no longer lists, and `core/turn_lease.py` reads an anchor the window
+    # cannot position as nothing -- a stated loss, never the whole session.
     job = rig.brain.worker.jobs[0]
     live = {str(entry["info"]["id"]) for entry in rig.server.transcript[session_id]}
     assert job["since_message_id"] == "msg_u1"

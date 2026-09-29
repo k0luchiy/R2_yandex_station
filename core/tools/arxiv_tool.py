@@ -45,9 +45,22 @@ def _within_days(date_str: str, days: int) -> bool:
     return (datetime.now(timezone.utc) - d).days <= days
 
 
+def build_search_query(query: str) -> str:
+    """One `all:` term per word, joined with `AND`.
+
+    arXiv's `search_query` does not split a multi-word `all:retrieval augmented
+    generation` into three fielded terms: only the first word is fielded and the
+    rest narrow nothing, so two different queries returned the same three papers
+    while the unfiltered newest feed came back HTTP 200 -- a silent non-result
+    wearing a result's shape. `all:retrieval AND all:augmented AND all:generation`
+    is the query the caller meant.
+    """
+    return " AND ".join(f"all:{term}" for term in query.split())
+
+
 async def arxiv_fetch(query: str, max_results: int = 5, days: int | None = None) -> list[dict]:
     params = {
-        "search_query": f"all:{query}",
+        "search_query": build_search_query(query),
         "sortBy": "submittedDate",
         "sortOrder": "descending",
         "max_results": max_results,

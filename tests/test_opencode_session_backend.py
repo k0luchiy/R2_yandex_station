@@ -29,6 +29,8 @@ wire. Nothing touches a network (proven by re-running under `-p no_net`).
 Timing: three tests sleep for real, each inside a stated budget -- the 0.05 s
 voice deadline, the 1 s collector ceiling and the 0.05 s collector poll interval.
 No test sleeps to "let something finish".
+
+allow: SIZE_OK -- 626 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -721,15 +723,21 @@ async def test_collect_reply_returns_only_text_newer_than_the_given_message(
     assert text == "новый ответ"
 
 
-async def test_collect_reply_reads_everything_in_a_list_the_marker_is_not_in(
+async def test_collect_reply_delivers_nothing_for_an_anchor_the_window_cannot_position(
     backend: OpencodeSessionBackend, server: FakeOpencode
 ):
-    # Given a marker the server no longer returns -- the window has been truncated
-    # at the front, so every message still listed is newer than the marker
+    # Given an anchor the server no longer lists -- the sweep deleted the routing
+    # signal this collector was anchored at, while the window itself is complete.
+    # This used to read as "the window truncated at the front, deliver everything":
+    # the live run measured why that fallback is wrong. Truncation and deletion
+    # are indistinguishable here, and a window that starts at 0 has no upper bound
+    # either -- so the orphaned collector woke on the NEXT turn's answer and
+    # delivered it as this turn's. `docs/07-latency-strategy.md` already chose the
+    # direction for every bounded loss here: an answer that never arrives and says
+    # so, rather than one that arrives and is wrong.
     server.polls = [[said("первый", "msg_1"), said("второй", "msg_2")]]
-    # When / Then -- losing the whole reply is the worse failure, so the collector
-    # delivers the window it can see rather than nothing
-    assert await backend.collect_reply(SESSION_ID, "msg_pruned", timeout_s=1.0) == "первый\nвторой"
+    # When / Then -- the collector delivers nothing, and the worker states the loss
+    assert await backend.collect_reply(SESSION_ID, "msg_pruned", timeout_s=1.0) == ""
 
 
 async def test_collect_reply_ignores_the_users_own_messages(

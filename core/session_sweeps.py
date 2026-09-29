@@ -86,7 +86,9 @@ ANCHOR_LOST: Final = "Ответ агента потерян: opencode не от
 #: The two actions this module needs from the hand-off that owns it: write the collector's job,
 #: and put one sentence in the user's chat. Both stay in `core/session_collector.py` and
 #: `core/tools/telegram_tool.py`; this module owns the retry and the anchor, and nothing else.
-Enqueue: Final = Callable[[str, str, str], Awaitable[None]]
+#: The job carries the turn's own task text as well as its anchor, because an anchor says WHERE
+#: to start reading and not WHOSE turn that is (`core/turn_lease.py`).
+Enqueue: Final = Callable[[str, str, str, str], Awaitable[None]]
 Tell: Final = Callable[[str], Awaitable[None]]
 
 
@@ -209,7 +211,7 @@ class SessionSweeper:
                 await self.erase(client, app_id, session_id, message_id)
             anchor = self.anchor(records, sweep, task)
             if anchor or time.monotonic() >= deadline:
-                await self._enqueue(app_id, session_id, anchor)
+                await self._enqueue(app_id, session_id, anchor, task)
                 return
             # The read answered and still named no boundary, which is one thing only: the
             # submit that writes the task message has not been stored yet. Retrying is not

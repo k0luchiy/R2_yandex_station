@@ -2,13 +2,6 @@ import os
 from dataclasses import dataclass, fields
 from pathlib import Path
 
-try:
-    from dotenv import load_dotenv
-
-    load_dotenv()
-except Exception:
-    pass
-
 _ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -34,8 +27,18 @@ class Config:
     One dataclass, loaded once from the environment by `Config.load`, is the whole
     configuration surface: there is no second source of truth anywhere in R2D2. A
     field is read through the uppercase of its name, so `r2d2_fast_deadline` is
-    `R2D2_FAST_DEADLINE`; a field with no environment variable is still settable in
-    `.env` and is there for the tests, not for an operator.
+    `R2D2_FAST_DEADLINE`; a field with no environment variable is still settable by
+    constructing `Config` directly and is there for the tests, not for an operator.
+
+    No `.env` file is merged at import: what `Config.load` sees in `os.environ` is
+    the whole configuration, so "configured entirely from the environment" is a
+    state a deployment can actually be in. A process that wants a file sources it
+    explicitly before starting (the opencode server's systemd unit names its
+    `EnvironmentFile`; the gateway's launcher does not source one, so export the
+    variables or source the file in the shell that runs it). An import-time merge
+    of whatever `.env` sits next to the checkout is a silent second source -- and
+    once carried the owner's live tokens into a process that believed it was
+    isolated.
 
     **Two of these fields are the difference between a private skill and a remote
     control for the machine.** `alice_skill_id` and `alice_user_id` are how

@@ -170,7 +170,7 @@ installer substitutes the checkout it ran from, and a copy that was never
 substituted finds its venv from `__file__`. See `docs/08-deployment.md` §2.2.
 
 plus nine read-only status probes: `upower *`, `cat /sys/class/power_supply/*`,
-`df *`, `free *`, `uname *`, `hostname *`, `ps *`, `uptime`, `date`.
+`df *`, `free *`, `uname *`, `hostname *`, `ps *`, `uptime *`, `date *`.
 
 **The trust boundary this creates.** `r2d2_do.py shell <command>` is inside
 that allowlist, so it does not raise an opencode permission prompt. Two things

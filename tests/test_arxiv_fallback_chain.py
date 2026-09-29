@@ -116,9 +116,9 @@ def write_registry(
 ) -> Config:
     """A registry file plus a fully credentialed environment.
 
-    Every credential is set on purpose: `app.config` calls `load_dotenv()` at
-    import, so the ambient environment is whatever the operator's `.env` holds and
-    a test that relied on it would measure their machine, not this fixture.
+    Every credential is set on purpose: `app.config` reads the ambient
+    environment and merges no file, so a test that relied on it would measure
+    the operator's machine, not this fixture.
     """
     for variable, value in ENTRIES.items():
         monkeypatch.setenv(variable, value)

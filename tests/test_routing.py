@@ -36,6 +36,8 @@ Three properties are asserted here rather than the individual happy paths:
 Nothing here touches a network, a clock, or the config singleton -- proven by
 re-running the suite under `-p no_net`, and by the source assertions at the
 bottom that pin the module to stdlib imports and forbid it from logging.
+
+allow: SIZE_OK -- 360 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -464,7 +466,7 @@ def test_the_sweep_refuses_an_empty_sentinel_like_every_other_guard() -> None:
 def test_the_sweep_and_the_collector_agree_on_which_role_speaks() -> None:
     # Given: two modules that each name the role the sweep must not delete
     # When / Then: the copies have not drifted
-    from core.backends.opencode_session import ASSISTANT_ROLE as COLLECTOR_ROLE
+    from core.turn_lease import ASSISTANT_ROLE as COLLECTOR_ROLE
 
     assert ASSISTANT_ROLE == COLLECTOR_ROLE == "assistant"
 

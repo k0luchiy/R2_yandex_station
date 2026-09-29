@@ -37,6 +37,8 @@ exception and the assertion would pass for the wrong reason.
 by a fake that never resolves, bounded by a per-job `timeout_s` of 50 ms, and
 every wait is `asyncio.wait_for` on an `asyncio.Event` the double sets, so a
 missing release is a failure rather than a flake.
+
+allow: SIZE_OK -- 537 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -66,6 +68,7 @@ from core.opencode.client import OpencodeClient
 from core.opencode.session_store import OcSessionStore
 from core.opencode.wire import OpencodeStatusError
 from core.tools import arxiv_tool
+from core.turn_lease import SUPERSEDED, TurnSuperseded
 
 # ---------------------------------------------------------------------------
 # The contract, read off the producer
@@ -78,7 +81,7 @@ JOB_TYPE: Final = "opencode_reply"
 #: `core/session_collector.py:_collect_later`). Anything else this worker
 #: reads is a key nobody writes.
 JOB_KEYS: Final = frozenset(
-    {"type", "application_id", "session_id", "since_message_id", "timeout_s"}
+    {"type", "application_id", "session_id", "since_message_id", "turn_text", "timeout_s"}
 )
 #: The collector ceiling the brain states in the job.
 COLLECT_TIMEOUT_S: Final = 600.0
@@ -94,6 +97,10 @@ FAILURE_PREFIX: Final = "Задача \u04202D2 завершилась ошиб�
 APP: Final = "alice-app-1"
 SESSION: Final = "ses_opencode_1"
 MARKER: Final = "msg_before_the_hung_turn"
+#: The task text the escalating turn submitted: the collector is armed FOR this
+#: turn, so a newer `user` message in the session ends its lease rather than
+#: becoming its answer (`core/turn_lease.py`).
+TURN: Final = "Пользователь попросил голосом: что такое квантовые точки"
 TELEGRAM_PREFIX: Final = "https://api.telegram.org/"
 OC_BASE_URL: Final = "http://127.0.0.1:4599"
 TELEGRAM_TOKEN: Final = "TESTTOKEN"
@@ -146,6 +153,7 @@ class Call:
     session_id: str
     since_message_id: str
     timeout_s: float
+    turn_text: str
 
 
 @dataclass
@@ -168,9 +176,14 @@ class FakeCollector:
     busy: asyncio.Event = field(default_factory=asyncio.Event)
     #: how many calls were cancelled rather than answered
     cancelled: int = 0
+    #: sessions claimed as delivered, in order -- the claim means delivery,
+    #: so a scripted answer with no note is a delivery the ledger never saw
+    noted: list[str] = field(default_factory=list)
 
-    async def collect_reply(self, session_id: str, since_message_id: str, timeout_s: float) -> str:
-        self.calls.append(Call(session_id, since_message_id, timeout_s))
+    async def collect_reply(
+        self, session_id: str, since_message_id: str, timeout_s: float, *, turn_text: str = ""
+    ) -> str:
+        self.calls.append(Call(session_id, since_message_id, timeout_s, turn_text))
         self.inside += 1
         self.started.set()
         if self.inside == 2:
@@ -187,6 +200,9 @@ class FakeCollector:
             raise
         finally:
             self.inside -= 1
+
+    def note_delivered(self, session_id: str) -> None:
+        self.noted.append(session_id)
 
 
 class Net:
@@ -228,6 +244,7 @@ def job(**overrides: object) -> dict[str, object]:
         "application_id": APP,
         "session_id": SESSION,
         "since_message_id": MARKER,
+        "turn_text": TURN,
         "timeout_s": COLLECT_TIMEOUT_S,
     }
     base.update(overrides)
@@ -335,7 +352,7 @@ async def test_a_collected_reply_is_the_job_result_and_reaches_telegram_once(
     assert net.route.call_count == 1
     # ... and the collector was asked for exactly what the job said, with the
     # brain's own ceiling -- the worker neither invented a session nor a marker
-    assert collector.calls == [Call(SESSION, MARKER, COLLECT_TIMEOUT_S)]
+    assert collector.calls == [Call(SESSION, MARKER, COLLECT_TIMEOUT_S, TURN)]
 
 
 async def test_an_empty_reply_is_stated_not_reported_as_an_empty_success(
@@ -637,7 +654,54 @@ async def test_an_unknown_job_type_is_still_answered_with_the_unknown_text(
 
 
 # ---------------------------------------------------------------------------
-# 7. The escalation marker is machine protocol, not a message for a human
+# 7. A collector that outlived its turn delivers nothing, and the turn's own
+#    collector still delivers exactly once
+# ---------------------------------------------------------------------------
+
+
+async def test_a_superseded_collector_sends_nothing_and_the_owner_still_delivers_once(
+    net: Net, cfg: Config, memory: Memory, log: logging.Logger
+) -> None:
+    """The live run's orphan: turn N parked on a human, turn N+1 answered.
+
+    The orphaned collector woke on the NEXT turn's answer and delivered 7 836
+    characters of physics overview as the answer to "what day is it today", and
+    the collector that owned that answer delivered the same text 1.3 s later.
+    The user was told the wrong thing while the right thing arrived too.
+
+    An orphaned collector raises `TurnSuperseded` out of `collect_reply`
+    (`core/turn_lease.py` saw a `user` message after the task it was armed for).
+    The worker must turn that into a DONE row stating the loss and NO Telegram
+    message at all -- not the newer turn's answer, and not a "no answer" either,
+    because the real answer is on its way from the collector that owns it.
+    """
+    # Given an orphaned collector that discovers it no longer owns the session,
+    # followed by the turn's own collector answering
+    collector = FakeCollector(deque([TurnSuperseded("a newer turn owns the session"), AGENT_REPLY]))
+    worker = Worker(cfg, memory, log, opencode_backend=collector)
+    # When the orphan's job runs
+    orphan_id = await memory.create_job(job())
+    await worker._run_job(orphan_id, job())
+    # Then the row states the loss instead of claiming a delivery or a failure,
+    # and the user was sent NOTHING
+    assert job_row(memory.db_path, orphan_id) == (DONE, SUPERSEDED, None)
+    assert net.sent == []
+    assert collector.calls[0].turn_text == TURN
+    # When the turn's own collector runs next
+    await worker.start()
+    try:
+        net.clear()
+        owner_id = await worker.enqueue(job())
+        await asyncio.wait_for(net.delivered.wait(), timeout=NOW_S)
+    finally:
+        await worker.stop()
+    # Then the answer arrives exactly once, from the right collector
+    assert job_row(memory.db_path, owner_id) == (DONE, AGENT_REPLY, None)
+    assert net.sent == [AGENT_REPLY]
+
+
+# ---------------------------------------------------------------------------
+# 8. The escalation marker is machine protocol, not a message for a human
 # ---------------------------------------------------------------------------
 
 
@@ -728,7 +792,7 @@ async def test_a_digest_that_mentions_the_marker_still_arrives(
 
 
 # ---------------------------------------------------------------------------
-# 8. The dispatch itself: explicit, not a dynamic attribute lookup
+# 9. The dispatch itself: explicit, not a dynamic attribute lookup
 # ---------------------------------------------------------------------------
 
 
@@ -758,4 +822,6 @@ def test_the_job_type_the_brain_writes_is_the_branch_the_worker_has() -> None:
     assert async_worker.NO_REPLY == NO_REPLY
     assert async_worker.JOB_OPENCODE_REPLY == JOB_TYPE
     assert core.brain.JOB_OPENCODE_REPLY == JOB_TYPE
-    assert JOB_KEYS == {"type", "application_id", "session_id", "since_message_id", "timeout_s"}
+    assert JOB_KEYS == {
+        "type", "application_id", "session_id", "since_message_id", "turn_text", "timeout_s",
+    }
