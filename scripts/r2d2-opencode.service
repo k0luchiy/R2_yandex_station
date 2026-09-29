@@ -1,6 +1,14 @@
+# TEMPLATE, not the unit you run. `%h` is systemd's spelling of the invoking
+# user's home, and it is the only portable one here: systemd does NOT expand
+# `${HOME}` in a unit file -- `WorkingDirectory=${HOME}/...` fails to start with
+# "path is not absolute", which was measured. The checkout-relative parts below
+# are the layout this repository was written on; `bash scripts/install.sh`
+# generates the same unit with YOUR paths and writes it to
+# ${XDG_CONFIG_HOME:-~/.config}/systemd/user/r2d2-opencode.service, so copying
+# this file by hand only works if your checkout is where it says.
 [Unit]
 Description=R2D2 opencode server (the brain backend for the R2D2 Alice skill)
-Documentation=file:///home/koluchiy/Documents/R2_yandex_station/docs/08-deployment.md
+Documentation=file://%h/Documents/R2_yandex_station/docs/08-deployment.md
 After=network.target
 # The launcher exits 1 when R2D2_OC_PASSWORD is blank. With an unbounded
 # Restart=always that would reprint the refusal every 3 s forever, so the burst
@@ -11,10 +19,10 @@ StartLimitBurst=3
 
 [Service]
 Type=exec
-WorkingDirectory=/home/koluchiy/r2d2-workspace
-EnvironmentFile=/home/koluchiy/Documents/R2_yandex_station/.env.oc
+WorkingDirectory=%h/r2d2-workspace
+EnvironmentFile=%h/Documents/R2_yandex_station/.env.oc
 Environment=OPENCODE_LOG_LEVEL=warn
-ExecStart=/home/koluchiy/Documents/R2_yandex_station/scripts/opencode_serve.sh
+ExecStart=%h/Documents/R2_yandex_station/scripts/opencode_serve.sh
 Restart=always
 RestartSec=3
 
