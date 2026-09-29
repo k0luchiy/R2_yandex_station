@@ -212,7 +212,7 @@ def telegram_binding(cfg: Config) -> dict[str, object]:
     """Whether a Telegram chat has a DECLARED identity, and the exact declaration.
 
     `declared` is deliberately not `bound`: resolving a chat to an `application_id`
-    is `app/main.py:tg_application_id`, and this body has no chat id to resolve.
+    is `app/identity.py:tg_application_id`, and this body has no chat id to resolve.
     What it reports is the deployment-level fact an operator is looking for when
     the broker asks nothing and long results never arrive -- the variable is
     empty, and while it is, `/tg/webhook` drops every message with a warning and

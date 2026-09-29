@@ -1,4 +1,5 @@
-"""The composition root: build the stack, start it, stop it (plan todo 18).
+"""The composition root: build the ASGI object, start the collaborators, stop them
+(plan todo 18).
 
 Everything R2D2 is made of is created here, in the order the objects depend on
 each other, and every task started here is stopped here in the reverse order --
@@ -21,6 +22,26 @@ The order, and why it is this order:
 6. start: the worker, the broker's 30 s sweep, the 60 s reaper, and the session
    readers that are already attached.
 
+**This module's namespace is the project's one injection seam, and it is read per
+request.** `load_backend_specs`, `OpencodeClient` and `send_message` are named
+here and nowhere else; the five routes live in `app/http.py` and receive the three
+of them as parameters, which `app/diagnostics.py` has always done for the same
+two names. They are read inside the handler rather than captured when the process
+was imported, because a deployment swaps them after startup -- a hung opencode
+server, a test double, a Telegram channel that must not be the owner's -- and a
+route holding a name from import time would keep talking to whatever the import
+said. A helper that imported them for itself would be a second, invisible copy:
+a test that replaced this one would watch the real server being called instead,
+which is the worst kind of test failure -- a green one that measured nothing.
+
+**What this module does NOT own.** A request's meaning is `app/http.py`: five
+functions, one per endpoint, that read `app.state` and return a body. Who a
+request belongs to is `app/identity.py`: the declared `chat_id=application_id`
+binding and the startup posture, both re-exported below so the names that were
+importable from here stay importable from here. Both are split out because both
+have readers other than this one, and a fact three readers need is a fact someone
+has to own -- the owner should not also be the module that builds the ASGI object.
+
 **The server is never started, never killed and never waited for.** A systemd user
 unit (`scripts/r2d2-opencode.service`) owns `opencode serve`; this process is its
 client. No process-control API is named anywhere in `app/` -- not even in a
@@ -34,17 +55,21 @@ is the failure mode here, not a crash.
 """
 
 import logging
-import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Final
+from typing import Any
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 
-from app import diagnostics
+from app import diagnostics, http
 from app.config import Config
 from app.diagnostics import TG_APPLICATION_ID_VAR
+# `authorisation_posture` and `tg_application_id` are DEFINED in
+# `app/identity.py` and re-exported here, because this is where both were
+# importable from and two test modules still reach for them by that name. The
+# lifespan below calls the first one; keeping the second next to it costs one
+# import and saves a reader from two ways to spell one function.
+from app.identity import authorisation_posture, tg_application_id
 from app.opencode_route import wire_opencode
 from app.route_status import route_status
 from core.async_worker import Worker
@@ -54,50 +79,13 @@ from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeHealth
 from core.tools.telegram_tool import send_message
 
+__all__ = ["authorisation_posture", "build_app", "probe_opencode_server", "tg_application_id"]
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("r2d2")
 
 #: What the owner runs when the gate below reports the server unreachable.
 LAUNCHER = "scripts/opencode_serve.sh"
-#: What separates the `chat_id=application_id` pairs of that declaration.
-TG_BINDING_SEPARATORS: Final = re.compile(r"[,\s]+")
-
-
-def tg_application_id(cfg: Config, chat_id: int) -> str | None:
-    """The `application_id` this Telegram chat was bound to, or `None` for no binding.
-
-    **The binding is declared, never derived.** One human is one `application_id`,
-    and that id is what owns their single opencode session and their single pending
-    permission question -- so a Telegram turn and an Alice turn of the same person
-    have to arrive under the same one, or the answer to «да» is delivered to a
-    session the question was never asked in. `/tg/webhook` used to build
-    `f"tg:{chat_id}"` for itself, which is the live defect in `qa/live-run.md` §4c.
-
-    `cfg.r2d2_tg_application_id` holds `chat_id=application_id` pairs separated by
-    commas or whitespace; a single-user deployment has exactly one, and a second
-    chat id is bound by declaring a second pair rather than by being invented. An
-    id may not contain a separator -- it is an opaque Alice `application_id`, and a
-    space in one would silently truncate the binding.
-
-    `None` is the honest answer for a chat nobody declared, and the caller must
-    refuse the turn on it rather than fall back to anything. A token this build
-    cannot read is a WARNING naming the variable; it binds nothing, so one typo
-    cannot be mistaken for a declaration.
-    """
-    for token in TG_BINDING_SEPARATORS.split(cfg.r2d2_tg_application_id.strip()):
-        if not token:
-            continue
-        declared_chat, separator, app_id = token.partition("=")
-        if not separator or not declared_chat.isdigit() or not app_id.strip():
-            logger.warning(
-                "telegram: %s carries a token this build cannot read (%r); it expects "
-                "chat_id=application_id, and this token binds nothing",
-                TG_APPLICATION_ID_VAR, token,
-            )
-            continue
-        if int(declared_chat) == chat_id:
-            return app_id.strip()
-    return None
 
 
 async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
@@ -129,41 +117,6 @@ async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
             LAUNCHER,
         )
     return health
-
-
-def authorisation_posture(cfg: Config) -> str | None:
-    """What to tell the operator at startup about who this webhook serves, or `None`.
-
-    `Brain.authorized` fails closed, so an undeclared id is a closed webhook and not
-    an open one -- which is the safe state, and also a state that looks like a broken
-    skill to anyone who has not read the source. Saying it once, at startup, with the
-    variable names in the message, is what turns "my skill stopped answering" into
-    "I have not told it who I am".
-
-    Returns `None` when the deployment is configured, and a message when it is not.
-    The message is an operator instruction, not a diagnostic, so it is phrased as the
-    command to run and never mentions an id value.
-    """
-    if cfg.r2d2_allow_unauthenticated:
-        return (
-            "R2D2_ALLOW_UNAUTHENTICATED is set: /webhook answers ANY caller, and the "
-            "opencode agent and the r2d2_do shim are reachable behind it. Set "
-            "ALICE_SKILL_ID and ALICE_USER_ID and unset this before exposing the port."
-        )
-    missing = [
-        name for name, value in
-        (("ALICE_SKILL_ID", cfg.alice_skill_id), ("ALICE_USER_ID", cfg.alice_user_id))
-        if not value
-    ]
-    if not missing:
-        return None
-    return (
-        f"{' and '.join(missing)} not set: /webhook refuses every request, because an "
-        "undeclared id is nobody in particular. Register the private skill at "
-        "dialogs.yandex.ru, put its skill_id and your user_id in .env, and restart. "
-        "To drive the voice path before registering, set R2D2_ALLOW_UNAUTHENTICATED=1 "
-        "and keep the port on loopback."
-    )
 
 
 def build_app() -> FastAPI:
@@ -236,104 +189,32 @@ def build_app() -> FastAPI:
 
     app = FastAPI(title="R2D2", lifespan=lifespan)
 
+    # The five routes, in the order they have always been registered in: FastAPI
+    # matches in registration order, and `/health` answering before `/` is a fact
+    # about this composition root rather than about the handlers. Each one reads
+    # the collaborators it needs from THIS module's namespace at call time and
+    # hands them to `app/http.py`; the bodies are not here.
     @app.get("/health")
-    async def health(request: Request):
-        """Liveness of THIS process, plus what it can still answer with.
-
-        The status code is 200 whenever the process is serving, degraded or not.
-        An unreachable opencode server is a degraded *dependency*, not a fault
-        here: R2D2 keeps answering from the fallback chain, and a monitor that
-        flaps on a dependency -- or that restarts R2D2, which cannot fix one --
-        is worse than a probe that reports the degradation in a field.
-        """
-        cfg: Config = request.app.state.cfg
-        memory: Memory = request.app.state.memory
-        liveness, chain = await diagnostics.health_view(cfg, load_backend_specs, OpencodeClient)
-        return {
-            "status": "ok",
-            "opencode": liveness,
-            "sessions": len(await memory.all_oc_sessions()),
-            "chain": chain,
-        }
+    async def health(request: Request) -> Any:
+        return await http.health(request, load=load_backend_specs, factory=OpencodeClient)
 
     @app.get("/diagnostics/providers")
-    async def diagnostics_providers(request: Request):
-        """The live provider and agent catalogs; `app/diagnostics.py` has the why."""
-        cfg: Config = request.app.state.cfg
-        return await diagnostics.providers_view(cfg, load_backend_specs, OpencodeClient)
+    async def diagnostics_providers(request: Request) -> Any:
+        return await http.diagnostics_providers(
+            request, load=load_backend_specs, factory=OpencodeClient
+        )
 
     @app.get("/")
-    async def root():
-        return {
-            "service": "R2D2",
-            "health": "/health",
-            "webhook": "/webhook",
-            "tg": "/tg/webhook",
-            "diagnostics": "/diagnostics/providers",
-        }
+    async def root() -> Any:
+        return await http.root()
 
     @app.post("/webhook")
-    async def webhook(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            return JSONResponse({"error": "bad json"}, status_code=400)
-        brain: Brain = request.app.state.brain
-        if not brain.authorized(body):
-            return JSONResponse({"error": "forbidden"}, status_code=403)
-        return await brain.process_alice(body)
+    async def webhook(request: Request) -> Any:
+        return await http.webhook(request)
 
     @app.post("/tg/webhook")
-    async def tg_webhook(request: Request):
-        try:
-            body = await request.json()
-        except Exception:
-            return {"ok": True}
-        message = body.get("message") or {}
-        chat_id = (message.get("chat") or {}).get("id")
-        text = (message.get("text") or "").strip()
-        brain: Brain = request.app.state.brain
-        cfg: Config = request.app.state.cfg
-        if (
-            chat_id
-            and text
-            and cfg.telegram_chat_id_int
-            and chat_id == cfg.telegram_chat_id_int
-        ):
-            app_id = tg_application_id(cfg, int(chat_id))
-            if app_id is None:
-                # No declared identity means no session to share, no pending row to
-                # answer and nobody to answer to. Minting `tg:<chat_id>` here is the
-                # defect this replaced: a second opencode session for one person,
-                # and a «да» that landed in a session the question was never asked
-                # in. Dropping the message keeps the pending ask refusable by the
-                # sweep, which is the direction every ambiguous path must fail in.
-                logger.warning(
-                    "telegram: chat %s is not bound to an application_id, so this message is "
-                    "not answered; set %s='%s=<the application_id your Alice turns use>'. No "
-                    "identity is invented here: a second one would be a second session for one "
-                    "person, and could not answer the permission question that person was asked",
-                    chat_id, TG_APPLICATION_ID_VAR, chat_id,
-                )
-                return {"ok": True}
-            fake = {
-                "meta": {"interfaces": {}},
-                "request": {"type": "SimpleUtterance", "command": text},
-                "session": {
-                    "new": True,
-                    # Both identity fields carry the bound id, not the chat id: the brain
-                    # falls back to `user_id` when `application_id` is absent, so a chat
-                    # id in either one could become an identity again.
-                    "application": {"application_id": app_id},
-                    "user": {"user_id": app_id},
-                },
-                "version": "1.0",
-            }
-            resp = await brain.process_tg(fake)
-            reply = resp["response"]["text"]
-            if reply:
-                await send_message(cfg, reply, chat_id=chat_id)
-        return {"ok": True}
+    async def tg_webhook(request: Request) -> Any:
+        return await http.tg_webhook(request, send=send_message)
 
     return app
 

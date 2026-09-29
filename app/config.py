@@ -112,7 +112,7 @@ class Config:
     r2d2_event_poll_interval: float = 2.0
 
     # Which human a Telegram chat belongs to, as `chat_id=application_id` pairs --
-    # see `app/main.py:tg_application_id`, which is the only reader. It is a
+    # see `app/identity.py:tg_application_id`, which is the only reader. It is a
     # DECLARATION because the two channels have to be the same person: one
     # application id is one opencode session and one pending permission question,
     # and `/tg/webhook` used to mint `tg:<chat_id>` for itself, which gave that

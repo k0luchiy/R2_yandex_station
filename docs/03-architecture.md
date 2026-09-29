@@ -21,6 +21,8 @@ uvicorn (FastAPI, локально на ноутбуке, порт 8099)
 │   │      └─ middleware: валидация (skill_id, user_id)       │
 │   ├─ POST /tg/webhook       → приём апдейтов от Telegram    │
 │   ├─ GET  /diagnostics/providers → живой каталог opencode   │
+│   ├─ app/http.py         — тела всех пяти маршрутов          │
+│   ├─ app/identity.py     — объявленная привязка chat → id    │
 │   └─ app/opencode_route.py — сборка маршрута opencode:      │
 │          клиент → store → бэкенд → брокер → читалки событий │
 │      app/route_status.py  — решение «маршрут поднят? и почему»│
@@ -73,7 +75,7 @@ opencode/space-bunny-free через подписку opencode
 
 ## Компоненты
 
-### 1. Webhook-слой (`app/main.py`, `render.py`)
+### 1. Webhook-слой (`app/http.py`, `render.py`)
 - Принимает `POST /webhook`, проверяет `session.skill_id` и `session.user.user_id`
   против белого списка (см. [09-security.md](09-security.md)).
 - Разбирает запрос по [04-alice-protocol.md](04-alice-protocol.md).
@@ -185,13 +187,13 @@ opencode/space-bunny-free через подписку opencode
 - Ни одно поле не приходит из `${...}`, поэтому секрет в такую строку попасть
   не может.
 
-### 10. Telegram (`app/main.py` POST `/tg/webhook`, `telegram_tool.py`)
+### 10. Telegram (`app/http.py` POST `/tg/webhook`, `app/identity.py`, `telegram_tool.py`)
 - Бот из BotFather. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` (свой чат).
 - `/tg/webhook` — приём команд боту и **ответов на подтверждения opencode**.
 - Отправка длинного контента всегда через Telegram.
 - `application_id` для Telegram-хода **объявлен, а не выведен**: переменная
   `R2D2_TG_APPLICATION_ID` хранит пары `chat_id=application_id` (запятые или
-  пробелы), и `tg_application_id()` в `app/main.py` — единственный её читатель.
+  пробелы), и `tg_application_id()` в `app/identity.py` — единственный её читатель.
   Один человек — один `application_id`, а он владеет и единственной сессией
   opencode, и единственным ожидающим вопросом, поэтому `да` из Telegram отвечает
   на вопрос, заданный голосом Алисы.

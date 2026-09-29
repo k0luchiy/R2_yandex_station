@@ -1346,7 +1346,7 @@ opencode и единственного ожидающего вопроса. По
 выведена**: `R2D2_TG_APPLICATION_ID` в окружении, парами
 `chat_id=application_id`, разделёнными запятой или пробелом.
 
-```verbatim app/main.py
+```verbatim app/identity.py
 def tg_application_id(cfg: Config, chat_id: int) -> str | None:
     """The `application_id` this Telegram chat was bound to, or `None` for no binding.
 

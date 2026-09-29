@@ -40,10 +40,11 @@ allow: SIZE_OK -- 394 pure LOC, over the 250 ceiling because the C1 gate carries
 closed vocabulary that names its outcomes, and most of that is docstrings recording
 decisions an operator has to be able to re-derive. The separable half is
 `SessionReaders` + `SessionWatchingStore` (the event fleet), and splitting it out
-would give `wire_opencode` an import whose only other caller is this module --
-while `app/main.py` has already absorbed the composition root itself. The route is
-one thing: the collaborators, the C1 gate and the lifecycle of the tasks they own,
-and a route split across two modules is a route whose parts can be started apart.
+would give `wire_opencode` an import whose only other caller is this module -- and
+the composition root now owns a lifespan and five registrations instead of a
+route. The route is one thing: the collaborators, the C1 gate and the lifecycle
+of the tasks they own, and a route split across two modules is a route whose
+parts can be started apart.
 """
 
 from __future__ import annotations
