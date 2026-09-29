@@ -129,12 +129,17 @@ jobs:
       - name: Coverage summary
         if: always()
         run: |
-          python -c "import json,pathlib; \
-            d=json.load(open('coverage.json')); \
-            print(f\"### coverage {d['totals']['percent_covered_display']}% "
-                  f\"({d['totals']['covered_lines']}/{d['totals']['num_statements']} statements, "
-                  f\"branch {d['totals'].get('covered_branches')}/{d['totals'].get('num_branches')})\") \
-            >> \"$GITHUB_STEP_SUMMARY\""
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          t = json.load(open("coverage.json"))["totals"]
+          branches = t.get("covered_branches"), t.get("num_branches")
+          print(
+              f"### coverage {t['percent_covered_display']}% "
+              f"({t['covered_lines']}/{t['num_statements']} statements, "
+              f"branch {branches[0]}/{branches[1]})"
+          )
+          PY
+
 
       - name: Secret hygiene, spelled out
         if: always()
