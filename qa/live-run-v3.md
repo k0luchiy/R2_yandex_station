@@ -254,7 +254,7 @@ $ curl -s http://127.0.0.1:8099/tg/webhook -H 'Content-Type: application/json' \
 {"ok":true}
 http=200 time_total=1.190040
 
-12:42:00,516 INFO httpx HTTP Request: POST http://127.0.0.1:4599/session/ses_f235aebaeffeTZp7uX1Mp7FNe3/permissions/per_0dca91dcd0017YE2YM5bRcTJ6X?directory=%2Fhome%2Fkoluchiy%2Fr2d2-workspace "HTTP/1.1 200 OK"
+12:42:00,516 INFO httpx HTTP Request: POST http://127.0.0.1:4599/session/ses_f235aebaeffeTZp7uX1Mp7FNe3/permissions/per_0dca91dcd0017YE2YM5bRcTJ6X?directory=%2Fhome%2F<user>%2Fr2d2-workspace "HTTP/1.1 200 OK"
 ```
 
 The independent tap recorded what the **server** accepted:

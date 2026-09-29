@@ -232,7 +232,7 @@ distinct `permission.asked` events across five different sessions. R2D2's log
 shows why, continuously:
 
 ```
-06:38:08 GET  http://127.0.0.1:4599/event?directory=%2Fhome%2Fkoluchiy%2Fr2d2-workspace  "HTTP/1.1 200 OK"
+06:38:08 GET  http://127.0.0.1:4599/event?directory=%2Fhome%2F<user>%2Fr2d2-workspace  "HTTP/1.1 200 OK"
 06:38:11 opencode sse: stream for session ses_f24a63… failed (ReadTimeout: ), reconnecting in 5.0s
 06:38:16 GET  http://127.0.0.1:4599/event…                                        "HTTP/1.1 200 OK"
 06:38:20 opencode sse: stream for session ses_f24a63… failed (ReadTimeout: ), reconnecting in 5.0s
@@ -271,7 +271,7 @@ PROBE pending_actions row = {"kind": "opencode_permission", "session_id": "ses_f
      "permission_id": "per_0db894626001z8fUwVQbBF9440", "title": "ls -la /tmp; du -sh /tmp; …",
      "always": ["ls *","du *","find *","wc *","head *"], "requested_at": 1790389711.564}
 PROBE ---- resolve_from_text('да') ----
-INFO httpx HTTP Request: POST http://127.0.0.1:4599/session/ses_f2476c80…/permissions/per_0db894626001z8fUwVQbBF9440?directory=%2Fhome%2Fkoluchiy%2Fr2d2-workspace  "HTTP/1.1 200 OK"
+INFO httpx HTTP Request: POST http://127.0.0.1:4599/session/ses_f2476c80…/permissions/per_0db894626001z8fUwVQbBF9440?directory=%2Fhome%2F<user>%2Fr2d2-workspace  "HTTP/1.1 200 OK"
 INFO httpx HTTP Request: POST https://api.telegram.org/bot<REDACTED>/sendMessage "HTTP/1.1 200 OK"
 PROBE verdict='approved' pending_row_after=None
 ```

@@ -67,8 +67,8 @@ r2d2-agent  bash:  ask *  |  allow ×12
 01:28:55            /tg/webhook  «да»   (из ОБЪЯВЛЕННОГО чата 900000017)
 01:28:56,319        r2d2-voice  bash  completed  ← вывод настоящий:
                       total 0
-                      drwxr-xr-x 2 koluchiy koluchiy  40 Sep 27 01:19 .
-                      drwxr-xr-x 6 koluchiy koluchiy 460 Sep 27 01:28 ..
+                      drwxr-xr-x 2 <user> <user>  40 Sep 27 01:19 .
+                      drwxr-xr-x 6 <user> <user> 460 Sep 27 01:28 ..
 01:28:56,15         POST /session/…/permissions/per_0df67bfa4001Lf4Dz6Qyf7e5zf   ← {"response":"once"}
 01:28:56            TELEGRAM «Принято, выполняю: ls -la.»
 ```
