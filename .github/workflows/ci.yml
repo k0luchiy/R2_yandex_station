@@ -174,21 +174,22 @@ jobs:
           python-version: "3.13"
       - run: pip install -e ".[dev]"
       # ADVISORY, deliberately non-blocking, and the number is the point.
-      # mypy reports 46 findings over app/ core/ opencode/ today: 23 are
+      # mypy reports 44 findings over app/ core/ opencode/ today: 23 are
       # `union-attr` on a `Connection | None` in core/memory.py that no
-      # annotation narrows, 8 are `valid-type` on dataclass-shaped callables
+      # annotation narrows, 6 are `valid-type` on dataclass-shaped callables
       # used as types, 6 `arg-type` and 3 `assignment` in the two config
-      # loaders, and the remaining 6 are one `name-defined` (the un-imported
-      # `Mapping` in core/permissions.py) plus 5 smaller ones.
-      # Every one of them is in a file this change was not allowed to edit, so
+      # loaders, 4 `misc`, and the remaining 2 are a `name-defined` (the
+      # un-imported `Mapping` in core/permissions.py) and a `func-returns-value`
+      # where `_refused` -- declared `-> None` -- is written as a return value.
+      # Every one of them is in a file that change was not allowed to edit, so
       # making this step blocking would mean shipping a permanently red build --
       # which is worse than no CI, because a red badge is a badge people learn
       # to ignore. What this step buys instead is a number that is recorded on
-      # every run and printed next to the 46 it had before, so the count
+      # every run and printed next to the 44 it had before, so the count
       # cannot quietly grow. Promote it to blocking when the ledger is empty.
       - name: mypy
         continue-on-error: true
-        run: mypy --no-error-summary 2>&1 | tee mypy.log; echo "--- $(grep -c 'error:' mypy.log || true) findings (baseline 46) ---"
+        run: mypy --no-error-summary 2>&1 | tee mypy.log; echo "--- $(grep -c 'error:' mypy.log || true) findings (baseline 44) ---"
 
   packaging:
     name: pyproject · fresh venv
