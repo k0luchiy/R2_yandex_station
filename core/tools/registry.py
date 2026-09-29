@@ -1,13 +1,22 @@
+from collections.abc import Awaitable, Callable
+
 from core.tools.base import ToolContext, ToolResult
 from core.tools import arxiv_tool, laptop_tool, shell_tool, tg_tool
+
+#: What every registered handler is: given the turn's context and the model's
+#: arguments, produce a `ToolResult`. Spelled with `typing.Callable` because
+#: `callable` is the builtin FUNCTION, and `dict[str, callable]` is not a type at
+#: all -- it type-checks as anything and tells a reader nothing about the
+#: signature it is supposed to be enforcing.
+Handler = Callable[[ToolContext, dict], Awaitable[ToolResult]]
 
 
 class ToolRegistry:
     def __init__(self):
         self._schemas: list[dict] = []
-        self._handlers: dict[str, callable] = {}
+        self._handlers: dict[str, Handler] = {}
 
-    def register(self, schema: dict, handler: callable) -> None:
+    def register(self, schema: dict, handler: Handler) -> None:
         name = schema["function"]["name"]
         self._schemas.append(schema)
         self._handlers[name] = handler
