@@ -509,11 +509,11 @@ prose, который отказавший агент написал вмест�
     r2d2_needs_agent_sentinel: str = "[[NEEDS_AGENT]]"
     r2d2_voice_agent: str = "r2d2-voice"
     r2d2_task_agent: str = "r2d2-agent"
-    r2d2_workspace: str = "/home/koluchiy/r2d2-workspace"
+    r2d2_workspace: str = "~/r2d2-workspace"
     r2d2_permission_timeout: float = 300.0
     r2d2_session_soft_limit: int = 40
     r2d2_stale_session_seconds: float = 900.0
-    r2d2_cli_path: str = "/home/koluchiy/.r2d2/r2d2_do.py"
+    r2d2_cli_path: str = "~/.r2d2/r2d2_do.py"
     r2d2_event_poll_interval: float = 2.0
 ```
 

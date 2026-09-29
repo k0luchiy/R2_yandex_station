@@ -449,7 +449,7 @@ def test_the_allowlisted_shim_matches_the_app_configuration():
     # path-portable rewrite may spell the whole prefix as a template or a
     # wildcard -- which is exactly why no absolute path is written here.
     cfg = Config()
-    expected = Path(cfg.r2d2_cli_path)
+    expected = Path(cfg.resolved_cli_path())
     granted = {
         grant[: -len(" *")].rsplit("/", 1)[-1] for grant in shim_allows(bash_block(AGENT))
     }

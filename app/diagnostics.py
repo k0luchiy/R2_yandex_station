@@ -95,7 +95,7 @@ async def probe_opencode(
     """
     if spec is None:
         return OpencodeHealth(reachable=False)
-    client = factory(spec, cfg.r2d2_workspace)
+    client = factory(spec, cfg.resolved_workspace())
     try:
         return await asyncio.wait_for(client.health(), HEALTH_PROBE_TIMEOUT_S)
     except TimeoutError:
@@ -165,7 +165,7 @@ async def providers_view(
     spec = specs.get("opencode")
     if spec is None:
         return unreachable()
-    client = factory(spec, cfg.r2d2_workspace)
+    client = factory(spec, cfg.resolved_workspace())
     try:
         providers = await client.providers()
         agents = await client.agents()

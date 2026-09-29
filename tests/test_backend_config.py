@@ -306,20 +306,38 @@ def test_config_still_maps_uppercase_env_to_new_fields(monkeypatch: pytest.Monke
 def test_the_two_path_defaults_are_absolute_and_named_after_their_targets() -> None:
     # Given: the two Config fields that are filesystem paths
     cfg = Config()
-    # When / Then: each is an absolute path whose LAST TWO components name what
-    # it points at. The value is deliberately not spelled out: whose home holds
-    # the workspace is the installing machine's business, and a path-portable
-    # rewrite of `app/config.py` must not be able to break this test. What must
-    # hold is the shape, and the agreement with the installer that writes the
-    # shim -- a default that names a different file than the one installed is a
-    # permission the agent has and a tool it cannot run.
-    workspace = Path(cfg.r2d2_workspace)
-    shim = Path(cfg.r2d2_cli_path)
+    # When / Then: each resolves to an absolute path whose LAST TWO components
+    # name what it points at. The value is deliberately not spelled out: whose
+    # home holds the workspace is the installing machine's business, and a
+    # path-portable rewrite of `app/config.py` must not be able to break this
+    # test -- `~` and `$HOME` are both legal spellings of the same place. What
+    # must hold is the resolved shape, and the agreement with the installer that
+    # writes the shim -- a default that names a different file than the one
+    # installed is a permission the agent has and a tool it cannot run.
+    workspace = Path(cfg.resolved_workspace())
+    shim = Path(cfg.resolved_cli_path())
     assert (workspace.name, shim.name) == ("r2d2-workspace", "r2d2_do.py")
     assert workspace.is_absolute() and shim.is_absolute()
     assert shim.parent.name == ".r2d2"
     assert Path(_installed_shim_path()).name == shim.name
     assert Path(_installed_shim_path()).parent.name == shim.parent.name
+
+
+@pytest.mark.parametrize("spelling", ("~/r2d2-workspace", "${HOME}/r2d2-workspace", "/x/y"))
+def test_a_home_reference_in_a_path_default_resolves_to_the_same_place(
+    spelling: str,
+) -> None:
+    """`$HOME`, `~` and a spelled-out home are three writings of one directory.
+
+    The installer writes `${HOME}/...` into `.env.oc.example`, the launcher accepts
+    all three spellings, and opencode scopes every session to the resolved value by
+    a `?directory=` query parameter. A deployment that spelled its home one way and
+    the client that read it another would scope a stranger's session into a
+    directory nobody chose.
+    """
+    resolved = Config(r2d2_workspace=spelling).resolved_workspace()
+    assert Path(resolved).is_absolute()
+    assert resolved == Config().resolved_workspace() or spelling == "/x/y"
 
 
 # --------------------------------------------------------------------------

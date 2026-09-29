@@ -320,15 +320,15 @@ async def wire_opencode(
     spec = _spec(cfg)
     if spec is None:
         return None
-    if not os.path.isdir(cfg.r2d2_workspace):
+    if not os.path.isdir(cfg.resolved_workspace()):
         # C6: the server does not validate `?directory=`, so a workspace that is not
         # there would hand the agent's file tools a root that does not exist, and
         # every session request would fail -- one turn at a time, for ever.
-        return _refused(NO_WORKSPACE, f"the workspace {cfg.r2d2_workspace!r} does not exist")
-    client = factory(spec, cfg.r2d2_workspace)
+        return _refused(NO_WORKSPACE, f"the workspace {cfg.resolved_workspace()!r} does not exist")
+    client = factory(spec, cfg.resolved_workspace())
     broker = PermissionBroker(memory, client, cfg)
     turns = TurnWatch()
-    readers = SessionReaders(spec, cfg.r2d2_workspace, broker, turns)
+    readers = SessionReaders(spec, cfg.resolved_workspace(), broker, turns)
     store = SessionWatchingStore(memory, client, cfg, readers)
     backend = OpencodeSessionBackend(spec, OpencodeWiring(client=client, store=store, cfg=cfg))
     await _reattach(readers, memory)

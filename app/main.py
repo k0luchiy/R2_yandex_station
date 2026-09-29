@@ -118,7 +118,7 @@ async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
         logger.info("opencode: no 'opencode' backend in %s", cfg.backends_path)
         return None
 
-    health = await OpencodeClient(spec, cfg.r2d2_workspace).health()
+    health = await OpencodeClient(spec, cfg.resolved_workspace()).health()
     if health.reachable:
         logger.info("opencode: server reachable at %s, version %s", spec.base_url, health.version)
     else:

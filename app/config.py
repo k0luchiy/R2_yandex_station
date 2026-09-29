@@ -12,6 +12,21 @@ except Exception:
 _ROOT = Path(__file__).resolve().parent.parent
 
 
+def _expand_home(value: str) -> str:
+    """`~` and `$HOME`/`${HOME}` in a configured path, expanded once.
+
+    The installer writes `${HOME}/…` into `.env.oc.example` and `scripts/install.sh`
+    renders the real path into the generated unit, so a path reaches the config in
+    three different spellings depending on who wrote it. Expanding here means the
+    opencode client only ever receives an absolute path, and it is the same
+    normalisation the launcher does in `scripts/opencode_serve.sh`.
+    """
+    for spelling in ("${HOME}", "$HOME"):
+        if spelling in value:
+            return value.replace(spelling, str(Path.home()))
+    return str(Path(value).expanduser())
+
+
 @dataclass
 class Config:
     llm_provider: str = "openrouter"
@@ -58,11 +73,11 @@ class Config:
     r2d2_needs_agent_sentinel: str = "[[NEEDS_AGENT]]"
     r2d2_voice_agent: str = "r2d2-voice"
     r2d2_task_agent: str = "r2d2-agent"
-    r2d2_workspace: str = "/home/koluchiy/r2d2-workspace"
+    r2d2_workspace: str = "~/r2d2-workspace"
     r2d2_permission_timeout: float = 300.0
     r2d2_session_soft_limit: int = 40
     r2d2_stale_session_seconds: float = 900.0
-    r2d2_cli_path: str = "/home/koluchiy/.r2d2/r2d2_do.py"
+    r2d2_cli_path: str = "~/.r2d2/r2d2_do.py"
     r2d2_event_poll_interval: float = 2.0
 
     # Which human a Telegram chat belongs to, as `chat_id=application_id` pairs --
@@ -99,6 +114,22 @@ class Config:
             p = _ROOT / p
         p.parent.mkdir(parents=True, exist_ok=True)
         return str(p)
+
+    def resolved_workspace(self) -> str:
+        """`r2d2_workspace` with `~` and `$HOME` expanded.
+
+        Every session opencode creates is scoped to this directory by a `?directory=`
+        query parameter (finding C6), so a deployment that leaves it pointing at the
+        author's home either refuses to wire or, worse, scopes a stranger's session
+        into a directory they did not choose. The default is a home reference so the
+        committed file names no machine, and it is expanded here so the opencode
+        client never has to know what a tilde is.
+        """
+        return _expand_home(self.r2d2_workspace)
+
+    def resolved_cli_path(self) -> str:
+        """`r2d2_cli_path` with `~` and `$HOME` expanded, for the same reason."""
+        return _expand_home(self.r2d2_cli_path)
 
     @property
     def telegram_chat_id_int(self) -> int | None:
