@@ -60,7 +60,7 @@ class OcSessionStore:
     def __init__(self, memory: Memory, client: OpencodeClient, cfg: Config) -> None:
         self._memory = memory
         self._client = client
-        self._workspace = cfg.r2d2_workspace
+        self._workspace = cfg.resolved_workspace()
         self._stale_after_s = cfg.r2d2_stale_session_seconds
         self._resolving: dict[str, asyncio.Lock] = {}
 

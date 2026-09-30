@@ -30,7 +30,7 @@ Timing: three tests sleep for real, each inside a stated budget -- the 0.05 s
 voice deadline, the 1 s collector ceiling and the 0.05 s collector poll interval.
 No test sleeps to "let something finish".
 
-allow: SIZE_OK -- 626 pure LOC, a test module grows with the behaviours it pins.
+allow: SIZE_OK -- 652 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
@@ -933,3 +934,35 @@ async def test_the_password_never_reaches_a_log_record_or_an_exception(
     assert len(messages) == 6
     assert all(PASSWORD not in message for message in messages)
     assert PASSWORD not in caplog.text
+
+
+def test_store_expands_the_home_reference_in_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The store must not hold the RAW `r2d2_workspace`.
+
+    Every other consumer reads `cfg.resolved_workspace()` -- `app/main.py`,
+    `app/diagnostics.py`, `app/opencode_route.py` all do. The store read the raw
+    field, whose default is the home reference `~/r2d2-workspace`, and then
+    `os.path.isdir()` was asked about a path whose tilde had never been
+    expanded. That check failed, `_require_workspace` raised, NO session was
+    created, and the turn fell back to the chain -- silently, into a bare
+    provider call with no agent and no tools.
+
+    The live cost was not a warning nobody read: every "model-backed turn" measured
+    through the fallback was never the agent at all, so the timings described a
+    plain LLM completion rather than the voice path.
+    """
+    home = tmp_path / "home"
+    real = home / "r2d2-workspace"
+    real.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("R2D2_WORKSPACE", "~/r2d2-workspace")
+
+    cfg = Config()
+    store = OcSessionStore(MagicMock(), MagicMock(), cfg)
+
+    assert "~" not in store._workspace
+    assert store._workspace == str(real)
+    # And the check that actually refused the live turn now passes.
+    store._require_workspace()
