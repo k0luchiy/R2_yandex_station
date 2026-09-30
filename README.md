@@ -8,7 +8,7 @@ send you a message after the fact.
 
 ```
 "Alice, run skill R2D2"
-"R2, what are quantum dots"                     → spoken, ~1.7 s
+"R2, what are quantum dots"                     → spoken, when it fits the 3.2 s budget
 "R2, find papers about RAG and summarise them"   → "Checking, I'll send it to Telegram"
 "R2, send me the arxiv digest to Telegram"      → arrives minutes later, as a message
 ```
@@ -77,7 +77,7 @@ cp .env.oc.example .env.oc && chmod 0600 .env.oc
 Verify the install before you configure anything:
 
 ```bash
-.venv/bin/python -m pytest -q     # 986 passed, 1 skipped
+.venv/bin/python -m pytest -q     # 1068 passed, 3 skipped
 ```
 
 Both `.env` files are git-ignored and both hold live credentials once filled in.
@@ -103,18 +103,18 @@ rather than assumed:
 
 | interpreter | result |
 |---|---|
-| 3.12 | 986 passed, 1 skipped — coverage 92.16% |
-| 3.13 | 986 passed, 1 skipped — coverage 92.16% |
-| 3.11 | 984 passed, **2 failed** — coverage 91.99% |
+| 3.12 | 1069 passed, 2 skipped — measured by CI |
+| 3.13 | 1068 passed, 3 skipped locally; 1069/2 in CI, which seeds the three credential guards that skip without a `.env` |
+| 3.11 | not re-measured since the 986-test revision; the two failures described below still apply |
 
 The two 3.11 failures are `tests/test_backend_base.py:121` and `:131`, which read
 `Backend.__protocol_attrs__` — an attribute CPython only sets on a
 `@runtime_checkable` `Protocol` from 3.12. `core/backends/base.py` itself runs
-fine on 3.11. CI therefore runs 3.12 and 3.13; add 3.11 once those two
-assertions derive the protocol members in a version-independent way. 3.14 is
-absent because uvicorn/psutil wheels for it were not available when this was
-written, and a matrix entry that fails for a packaging reason teaches people to
-ignore red.
+fine on 3.11, so this is a property of the two assertions and not of the runtime.
+CI therefore runs 3.12 and 3.13; add 3.11 once those two assertions derive the
+protocol members in a version-independent way. 3.14 is absent because
+uvicorn/psutil wheels for it were not available when this was written, and a
+matrix entry that fails for a packaging reason teaches people to ignore red.
 
 ### Dependencies
 
@@ -205,8 +205,13 @@ pointed at the port.
 Four ideas, in the order they matter:
 
 **Two paths, not one model.** Alice gives you 4.5 seconds and 1024 characters.
-A tool-less `r2d2-voice` agent answers in ~1.7–3.2 s and is *spoken*. If the
-request is real work, that agent emits a `[[NEEDS_AGENT]]` sentinel instead of an
+A tool-less `r2d2-voice` agent answers inside `R2D2_FAST_DEADLINE` (3.2 s) and is
+*spoken* — and **whether it fits is measured, not promised**: p50 1.667 s on
+opencode 1.18.32, but 9 of 11 voice turns ran past 3.2 s on 1.18.33, so on that
+build an ordinary question is spoken roughly one time in three. See
+[`docs/07-latency-strategy.md`](docs/07-latency-strategy.md) and
+[`qa/live-run-v10.md`](qa/live-run-v10.md) § NEW-1. If the request is real work,
+that agent emits a `[[NEEDS_AGENT]]` sentinel instead of an
 answer, the turn is escalated to a full `r2d2-agent`, and the result is
 delivered to Telegram. The measured cost of the sentinel path is that the ack
 still has to beat the clock, so it ships a fixed "checking, I'll send it to
@@ -423,11 +428,11 @@ for each, is in [`qa/live-run.md`](qa/live-run.md) and its successors.
 
 ## Status
 
-The code is written against opencode and covered by 986 tests, including a
+The code is written against opencode and covered by 1069 tests, including a
 full-stack run against a fake opencode server and a live run against a real one
-([`qa/live-run.md`](qa/live-run.md)). Coverage of `app/` + `core/` is 92.16%
-(2947 statements, 638 branches). The suite runs on every push and every pull
-request, on Python 3.12 and 3.13, with no network access.
+([`qa/live-run.md`](qa/live-run.md)). Coverage of `app/` + `core/` is 93%
+(3174 statements, 704 branches; 73 partial branches). The suite runs on every
+push and every pull request, on Python 3.12 and 3.13, with no network access.
 
 Deployment is described in [08-deployment.md](docs/08-deployment.md); three steps
 remain manual and intentionally so: **enabling the `r2d2-opencode` systemd
@@ -455,7 +460,7 @@ Telegram — потому что Алиса не умеет присылать �
 
 ```
 «Алиса, запусти навык Р2Д2»
-«Р2, что такое квантовые точки»            → голосом, ~1.7 с
+«Р2, что такое квантовые точки»            → голосом, если уложился в 3,2 с
 «Р2, открой браузер»                       → голосом, через r2d2_do
 «Р2, найди статьи про RAG и сделай сводку» → «Проверяю, пришлю в телеграм»
 «Р2, отправь в телеграм сводку статей с arxiv»
@@ -464,8 +469,13 @@ Telegram — потому что Алиса не умеет присылать �
 ## Ключевые идеи
 
 - **Протокол Алисы:** webhook + JSON, таймаут **4,5 с**, ответ ≤ **1024 символа**.
-- **Два пути, а не одна модель.** Голосовой агент без инструментов отвечает за
-  3,2 с и произносит ответ. Если задача настоящая, он выдаёт маркер
+- **Два пути, а не одна модель.** Голосовой агент без инструментов укладывается
+  в `R2D2_FAST_DEADLINE` (3,2 с) и отвечает голосом. **Укладывается ли он — это
+  измерено, а не обещано:** на opencode 1.18.32 p50 1,667 с, а на 1.18.33 девять
+  голосовых ходов из одиннадцати вышли за 3,2 с, то есть на этой сборке обычный
+  вопрос произносится примерно в одном случае из трёх (см.
+  [`qa/live-run-v10.md`](qa/live-run-v10.md) § NEW-1). Если задача настоящая,
+  агент выдаёт маркер
   `[[NEEDS_AGENT]]`, ход уходит полноценному агенту, а результат — в Telegram.
 - **Контекст живёт в сессии opencode.** Один вопрос пользователя — одна сессия,
   созданная один раз и переиспользуемая и Алисой, и Telegram. В SQLite лежит
