@@ -48,7 +48,7 @@ RED phase of todo 17 has to be able to run the route tests against the old
 stop the whole file at collection.
 
 allow: SIZE_OK -- 687 pure LOC, 23 tests. Test modules in this repo run from 44 pure
-LOC to 1863 (`test_brain_hybrid.py`), and a test module grows with the number of
+LOC to 1928 (`test_brain_hybrid.py`), and a test module grows with the number of
 behaviours it pins, not with the number of concepts it owns. The 250 pure-LOC
 ceiling targets source modules; splitting this would scatter one contract -- what an
 unauthenticated body may contain, and what a degraded dependency looks like in a

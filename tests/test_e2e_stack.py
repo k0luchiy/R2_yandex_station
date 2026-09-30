@@ -47,7 +47,7 @@ file pins after the JSON contract.
   event-stream attachment, or to the reaper's own log line.
 
 allow: SIZE_OK -- pure LOC is over the 250 ceiling and the file carries a
-`SIZE_OK` marker for it. Test modules in this repo run from 44 pure LOC to 1863
+`SIZE_OK` marker for it. Test modules in this repo run from 44 pure LOC to 1928
 (`test_brain_hybrid.py`), and a test module grows with the number of behaviours it
 pins, not with the number of concepts it owns. The 250 pure-LOC ceiling targets
 source modules; splitting this would scatter one contract -- what Alice may be told,

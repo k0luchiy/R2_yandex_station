@@ -178,6 +178,8 @@ class Brain:
         pending = await self.memory.get_pending(app_id)
         if pending is not None and PendingPermission.from_record(pending) is None:
             verdict = policies.confirmation_verdict(command)
+            if verdict is not None:
+                metrics.current().path = metrics.PATH_CONFIRM
             if verdict == "yes":
                 await self.memory.clear_pending(app_id)
                 if pending.get("tool") == "run_shell":

@@ -34,13 +34,22 @@ Three properties are load-bearing:
 * `permission` -- the turn WAS the answer to such an ask. No model was asked
   anything and no model answered, and the text acknowledges a decision rather
   than answering a question.
+* `confirm` -- the turn was a human decision about a pending action R2D2 owns
+  itself, the `run_shell` confirmation. Like `permission`, no model was involved;
+  unlike it, nothing was posted to opencode. It is separate from `voice` because
+  the same branch answers on two channels and only one of them speaks the text.
 
-Both of those belong to `core/session_route.py:SessionRoute.turn`, which reports
+`parked` and `permission` belong to `core/session_route.py:SessionRoute.turn`,
+which reports
 them itself since todo 18: it is the only branch that knows which agent spoke and
 whether the voice turn ran out of budget, so a recorder that could not be told
 would be a recorder nobody fills in. `docs/11-opencode-contract.md`'s measured
-p50 of 1.667 s against the 2.5 s budget is the number the record exists to keep
-watching, and it lands on that branch. `permission` belongs to
+p50 of 1.667 s against the `R2D2_FAST_DEADLINE` of 3.2 s is the number the record
+exists to keep
+watching, and it lands on that branch -- and on 1.18.33 it is not the typical
+case, so that is exactly the number worth watching. `confirm` is set one layer up,
+in `core/brain.py`, because the confirmation it describes is R2D2's own and never
+reaches the session route. `permission` belongs to
 `SessionRoute.answer_permission`, whose `да` used to leave every field at its
 default: a Telegram button answer was recorded as `path=voice`, and `voice` is
 the vocabulary for "the user heard this spoken aloud" -- so the one record the
@@ -108,6 +117,18 @@ PATH_PARKED: Final = "parked"
 #: And not `escalate`: nothing moved to the agent, because the work was already
 #: running and this turn is what released it.
 PATH_PERMISSION: Final = "permission"
+#: The turn was a human decision about a pending action R2D2 owns itself, rather
+#: than about an opencode ask: `да`/`нет` to the `run_shell` confirmation in
+#: `core/brain.py`. It is its own path and not `voice` because the same code
+#: answers on two channels, and `voice` means the user HEARD the text spoken --
+#: true when the confirmation arrives through Alice, false when it arrives through
+#: `/tg/webhook`, where the shell's result is sent as a message nobody speaks. A
+#: value that is right on one channel and wrong on the other is the shape this
+#: module exists to prevent, so the member claims only what both channels share:
+#: a person decided, the work ran inline, and no model was involved.
+#: And not `PATH_PERMISSION`, which means specifically that a `{"response":
+#: "once"}` was posted to opencode's server; here nothing was posted to it.
+PATH_CONFIRM: Final = "confirm"
 
 #: The one record per turn. The first seven fields are the format the plan pins;
 #: `msgs` and `tools` are what the line it replaced carried, kept because they are

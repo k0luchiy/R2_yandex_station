@@ -44,7 +44,7 @@ is asking what they mean, and escalating their question to the agent would drop
 the turn on the floor. The text still reaches the session verbatim
 (`test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal`).
 
-allow: SIZE_OK -- 1863 pure LOC, a test module grows with the behaviours it pins.
+allow: SIZE_OK -- 1928 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -1502,6 +1502,84 @@ async def test_the_shell_confirmation_gate_still_runs_its_own_pending_action(rig
     # ... and it did not go through the opencode route at all
     assert rig.server.requests == []
     assert rig.server.permission_answers == []
+
+
+async def test_a_shell_confirmation_is_not_recorded_as_a_spoken_voice_answer(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`voice` means the user HEARD the text, and this branch cannot know that.
+
+    `core/brain.py`'s confirmation gate is reached from two channels: Alice, which
+    speaks the shell's output, and `/tg/webhook`, which sends it as a message
+    nobody speaks. `voice` is true on the first and false on the second, and a
+    value that is right on one channel and wrong on the other is the shape the
+    ledger cannot be read for -- the same defect NEW-4 fixed for opencode asks.
+    `confirm` claims only what both channels share.
+    """
+    await rig.memory.set_pending(
+        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+    )
+    caplog.set_level(logging.INFO)
+    text = await rig.say("да")
+    assert "r2d2-hybrid-gate-ok" in text
+    fields = turn_record(caplog)
+    assert fields["path"] == "confirm"
+    # ... and no model is named, because none was asked anything: R2D2 ran its own
+    # pending action inline, and nothing was posted to opencode's server
+    assert fields["model"] == ""
+    assert int(fields["llm_ms"]) == 0
+    assert rig.server.permission_answers == []
+
+
+async def test_a_refused_shell_confirmation_is_recorded_as_a_confirmation_too(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`нет` takes the same branch as `да`, so it must take the same record.
+
+    Without this, a `confirm` reachable only from the approval arm would say
+    confirmations were rare exactly when the user refused one.
+    """
+    await rig.memory.set_pending(
+        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+    )
+    caplog.set_level(logging.INFO)
+    await rig.say("нет")
+    fields = turn_record(caplog)
+    assert fields["path"] == "confirm"
+    assert fields["model"] == ""
+
+
+async def test_an_unrelated_reply_is_not_recorded_as_a_confirmation(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The opposite false claim, and the one this change nearly shipped.
+
+    `policies.confirmation_verdict` returns `"yes"`, `"no"`, or `None` -- and
+    `None` is a real answer meaning "decides nothing", which leaves the pending
+    ask exactly where it was. Guarding the new assignment with anything other
+    than `is not None` marks every ordinary message that happens to arrive while
+    a confirmation is pending as a decision the user never made.
+
+    `помощь` is the witness and not an arbitrary choice. A `None` verdict falls
+    *through* the gate, and every path after it overwrites `path` on its way to a
+    model -- so an ordinary question would record correctly even with the guard
+    broken, and a test built on one cannot fail. The help and greeting branches
+    return without setting `path`, so the stale value survives to the record and
+    the difference is observable. The first version of this test used a normal
+    question and passed against a deliberately broken guard; that is why the
+    witness is named here.
+    """
+    await rig.memory.set_pending(
+        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+    )
+    caplog.set_level(logging.INFO)
+    await rig.say("помощь")
+    fields = turn_record(caplog)
+    assert fields["path"] == "voice"
+    # ... and the pending action is untouched, because nothing was decided
+    pending = await rig.memory.get_pending(APP)
+    assert pending is not None
+    assert pending["tool"] == "run_shell"
 
 
 # ---------------------------------------------------------------------------
