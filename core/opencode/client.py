@@ -88,6 +88,19 @@ HEALTH_TIMEOUT_S: Final = 1.5
 #: simply wrong. Generous, because a cold catalogue is the slow case, and still
 #: bounded, so a wedged server fails loudly instead of hanging startup.
 CATALOGUE_TIMEOUT_S: Final = 20.0
+#: Reading the transcript is also not a voice turn, and for the same reason it
+#: must not borrow the voice deadline either. It was borrowing `spec.timeout` --
+#: 3.3 s now, which is still the answer to "how long may I wait to speak" -- and
+#: a server working through an agent turn does not answer a transcript read that
+#: fast. Measured twice in one live run (`qa/live-run-v12.md` finding 2):
+#: `GET /session/:id/message` inside the collector did not answer inside the
+#: voice bound, so the whole job failed with `did not answer within ...s` and a
+#: body saying so. Nothing about that read is on Alice's clock -- the collector
+#: runs in the background with a 600 s ceiling of its own -- so the 4.5 s budget
+#: has no bearing on it either. Generous, because a busy server is the slow case,
+#: and still bounded, so a wedged server fails loudly instead of holding a worker
+#: slot for the whole ceiling.
+TRANSCRIPT_TIMEOUT_S: Final = 20.0
 #: The request timeout for a deadline-bounded call is the deadline plus this, so
 #: `asyncio.wait_for` is always what fires first and the caller always sees
 #: `OpencodeDeadlineExceeded` rather than a bare `httpx.TimeoutException`.
@@ -260,8 +273,14 @@ class OpencodeClient(OpencodeTransport):
         opencode REFUSED a tool call in this message. A refusal has no text part
         at all and a successful tool call has none either, so the second fact
         cannot be recovered from the first -- see `core.opencode.wire`.
+
+        Bound by `TRANSCRIPT_TIMEOUT_S`, not by the voice deadline: every caller
+        of this method reads on the collector's clock, never on Alice's.
         """
-        response = await self._request("GET", f"/session/{session_id}/message", params=self._scoped_params())
+        response = await self._request(
+            "GET", f"/session/{session_id}/message",
+            timeout=TRANSCRIPT_TIMEOUT_S, params=self._scoped_params(),
+        )
         out: list[MessageRecord] = []
         for entry in records(response, "the message list"):
             info = entry.get("info")

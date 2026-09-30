@@ -31,6 +31,10 @@ Three properties are load-bearing:
   collector, and `route=opencode` for the branch that answers from a session.
 * `parked` -- read, understood and deliberately NOT submitted, because the
   session is standing on an ask of ours that the user has not answered.
+* `busy` -- read, understood and deliberately NOT submitted, because the SERVER
+  reports this session `busy` and does not serve a turn submitted into one. Not
+  the same fact as `parked` and not visible in this process: nothing of ours is
+  waiting on a human here, and `GET /session/status` names no cause at all.
 * `permission` -- the turn WAS the answer to such an ask. No model was asked
   anything and no model answered, and the text acknowledges a decision rather
   than answering a question.
@@ -39,7 +43,7 @@ Three properties are load-bearing:
   unlike it, nothing was posted to opencode. It is separate from `voice` because
   the same branch answers on two channels and only one of them speaks the text.
 
-`parked` and `permission` belong to `core/session_route.py:SessionRoute.turn`,
+`parked`, `busy` and `permission` belong to `core/session_route.py:SessionRoute.turn`,
 which reports
 them itself since todo 18: it is the only branch that knows which agent spoke and
 whether the voice turn ran out of budget, so a recorder that could not be told
@@ -109,6 +113,16 @@ PATH_DEADLINE: Final = "deadline"
 #: (`qa/live-run-v9.md` F1). Without it this turn recorded `path=voice` with a model
 #: that answered nothing, which is the one shape the ledger cannot be read for.
 PATH_PARKED: Final = "parked"
+#: The turn was refused before it reached a model, because the SERVER reports this session
+#: `busy` -- and not because anything of ours is waiting on a human, which is the whole of
+#: what `PATH_PARKED` claims. opencode accepts a turn submitted into a session it calls busy
+#: and does not serve it (contract U9, measured on 1.18.33), so such a turn is acknowledged
+#: inside Alice's budget and then answered never. Its own path because the cause is not
+#: visible in this process at all: `GET /session/status` says `busy` and nothing about why,
+#: so a record reading `parked` here would name a pending ask that the very next field
+#: (`permission_asked=False`) contradicts -- the one shape of wrong this module exists to
+#: prevent, which is a record that describes a different event than the one that happened.
+PATH_BUSY: Final = "busy"
 #: The turn WAS the answer to a brokered permission ask: `да` or `нет`, posted to the
 #: server as `{"response": "once"}` or `{"response": "reject"}`. It is its own path
 #: and not `voice` because `voice` means the user HEARD this spoken aloud, and a

@@ -44,7 +44,7 @@ is asking what they mean, and escalating their question to the agent would drop
 the turn on the floor. The text still reaches the session verbatim
 (`test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal`).
 
-allow: SIZE_OK -- 1928 pure LOC, a test module grows with the behaviours it pins.
+allow: SIZE_OK -- 2020 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ from core.opencode.sse_frames import TURN_COMPLETE, OpencodeEvent
 from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker
 from core.render import MAX_TEXT
-from core.session_collector import PARKED
+from core.session_collector import BUSY_REFUSED, PARKED
 from tests.fake_opencode import (
     completed_tool_message,
     failed_tool_message,
@@ -276,6 +276,14 @@ class FakeOpencode:
         self.stall_polls: int = 0
         self.stall_reason: object = httpx.ReadTimeout("")
         self.delete_status: int = 200
+        #: Sessions `GET /session/status` reports as `busy` -- the only status value
+        #: the server reports, and the one that means a turn submitted right now
+        #: will not be served (NEW-2, `qa/live-run-v12.md`). Empty is the common
+        #: case: an idle session, and every session this double creates.
+        self.busy: set[str] = set()
+        #: When True, `GET /session/status` answers 500 instead of a mapping: the
+        #: unreadable-answer case, which must NOT read as a refusal.
+        self.status_broken: bool = False
         self._hung: dict[str, tuple[str, str]] = {}
         self._answered: set[str] = set()
         self._delivered: set[str] = set()
@@ -321,7 +329,9 @@ class FakeOpencode:
             self.aborted.append(session_id)
             return httpx.Response(200, json=True)
         if method == "GET" and path == "/session/status":
-            return httpx.Response(200, json={})
+            if self.status_broken:
+                return httpx.Response(500, json={"name": "UnknownError"})
+            return httpx.Response(200, json={sid: {"type": "busy"} for sid in self.busy})
         return httpx.Response(404, json={"name": "NotFoundError", "data": {"message": path}})
 
     # -- what the tests read off the wire ----------------------------------
@@ -1621,6 +1631,146 @@ async def test_a_question_asked_while_the_session_is_parked_is_refused_not_queue
     assert text == PARKED
     assert "не выполнил" in text.lower()
     assert "«да»" in text or "«нет»" in text
+
+
+# ---------------------------------------------------------------------------
+# 3a-bis. NEW-2: a second question while the server calls the session busy
+# ---------------------------------------------------------------------------
+#
+# The sibling F1 refuses a session parked on an ask of OURS, read from our own
+# database. This one refuses a session the SERVER reports `busy`, read from
+# `GET /session/status` -- the only status value the server reports, and "busy"
+# does not mean "queued" (`qa/live-run-v9.md` F1). Measured fifteen times out of
+# fifteen on 1.18.33 (`qa/live-run-v12.md`): question A outstanding, question B
+# asked, «Проверяю, пришлю в телеграм.» and then nothing at all, because when
+# B's submission makes the session busy A's task is never served -- so no answer
+# is on its way from anywhere, and the `TurnSuperseded` that ended the turn was
+# a correct lease decision resting on a false premise.
+
+
+async def test_a_question_asked_while_the_server_calls_the_session_busy_is_refused_not_queued(
+    rig: Rig,
+) -> None:
+    """The turn NEW-2 lost, pinned at the place the decision is made.
+
+    Same shape as the F1 test above, for a cause nothing in this process can
+    see: the server says `busy` and names no reason, so the refusal cannot name
+    one either -- but it still states the loss in seconds instead of promising
+    an answer nothing will send. `permission_asked` is False here, and that is
+    the load-bearing half: `parked` names a pending ask and this field agrees
+    with it, while a `busy` record claiming one would describe an event that
+    never happened.
+    """
+    # Given: a WARM session (so the voice path would run and the C8 shortcut is
+    # not what is being tested) that the server reports busy, with NO ask of
+    # ours outstanding -- nothing is parked, the server alone says no
+    session_id = await rig.warm()
+    rig.server.busy.add(session_id)
+    rig.server.reply = ANSWER
+    # When: the user asks something else entirely
+    text = await rig.say(QUESTION)
+    # Then: NOTHING reached the message route -- no voice turn, no submitted task
+    assert rig.server.turns == []
+    # And the user is told the truth, in seconds: a stated loss, not the ack
+    assert text == BUSY_REFUSED
+    assert "не выполнил" in text.lower()
+
+
+async def test_a_busy_refusal_is_recorded_as_busy_without_claiming_an_ask(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`path=busy` exists so the ledger never reads this turn as `parked`.
+
+    A record reading `parked` here would name a pending ask that the very next
+    field (`permission_asked=False`) contradicts -- the one shape of wrong
+    `core/metrics.py` exists to prevent.
+    """
+    # Given: a warm session the server reports busy, and no ask of ours
+    session_id = await rig.warm()
+    rig.server.busy.add(session_id)
+    rig.server.reply = ANSWER
+    caplog.set_level(logging.INFO)
+    # When
+    text = await rig.say(QUESTION)
+    # Then: the turn is the NEW-2 refusal ...
+    assert text == BUSY_REFUSED
+    # ... and the record says busy without claiming an ask, and no model
+    fields = turn_record(caplog)
+    assert fields["path"] == "busy"
+    assert fields["permission_asked"] == "False"
+    assert fields["model"] == ""
+    assert fields["escalated"] == "False"
+
+
+async def test_a_first_cold_turn_is_not_caught_by_the_busy_gate(rig: Rig) -> None:
+    """The refusal must not widen to a turn that is not a second question.
+
+    A session created seconds ago has nothing running in it, so the server has
+    nothing to call busy: the C8 branch still submits the work and acknowledges.
+    A `busy` set naming some OTHER session proves the check is per-session
+    rather than a global mute -- the cold turn proceeds while that one is busy.
+    """
+    # Given: a session that is busy, belonging to nobody in this test ...
+    rig.server.busy.add("ses_someone_elses")
+    rig.server.reply = ANSWER
+    # ... and a user whose session does not exist yet (C8: count zero)
+    # When: their first turn
+    text = await rig.say(QUESTION)
+    # Then: the work was submitted to the agent and acknowledged, not refused
+    assert text == ACK
+    assert [turn for turn in rig.server.turns if turn.submitted] != []
+
+
+async def test_an_unreadable_session_status_is_not_a_refusal(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Not being able to ask is not the same as being told no.
+
+    Refusing on an unreadable answer would state a loss the evidence does not
+    support and would turn one slow route into a refusal of every turn,
+    including the first cold one. So the turn proceeds as if the session were
+    idle -- and the silence is logged, because a slow status route is still
+    worth knowing about.
+    """
+    # Given: a warm session whose status the server will not answer readably
+    await rig.warm()
+    rig.server.status_broken = True
+    rig.server.reply = ANSWER
+    caplog.set_level(logging.INFO)
+    # When: the user asks
+    text = await rig.say(QUESTION)
+    # Then: the voice turn ran and its answer was spoken -- no refusal anywhere
+    assert text == ANSWER
+    assert len(rig.server.turns) == 1
+    assert "could not read /session/status" in caplog.text
+
+
+async def test_a_hand_over_into_a_session_that_turned_busy_states_the_loss_in_telegram(
+    rig: Rig,
+) -> None:
+    """The `_hand_over` gate: F1's shape for a park discovered after the entry check.
+
+    The entry gate already refused sessions that were busy on arrival; this one
+    fires when the session turned busy between that check and the submit -- the
+    same second gate the parked case has. The voice channel keeps the ack it
+    already promised (returning anything else here would rewrite history), and
+    the stated loss goes to the user's own chat through `_say`.
+    """
+    # Given: a warm session that turns busy after the route's own entry check
+    session_id = await rig.warm()
+    rig.server.busy.add(session_id)
+    rig.net.telegram.clear()
+    # When: the hand-off runs against that session
+    assert rig.brain.opencode is not None
+    text, escalated = await rig.brain.session.collector.hand_to_agent(
+        rig.brain.opencode, APP, session_id, QUESTION
+    )
+    # Then: nothing was submitted into the busy session ...
+    assert [turn for turn in rig.server.turns if turn.submitted] == []
+    # ... the voice channel keeps the ack ...
+    assert (text, escalated) == (ACK, False)
+    # ... and the stated loss reached the user's own chat
+    assert rig.net.telegram == [BUSY_REFUSED]
 
 
 # ---------------------------------------------------------------------------

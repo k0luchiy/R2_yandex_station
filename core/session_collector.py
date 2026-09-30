@@ -53,6 +53,16 @@ The properties this module exists to hold:
   chat, in seconds, rather than a silent one after the collector's whole 600 s
   ceiling -- and it is the direction `docs/07-latency-strategy.md` already takes for
   every other bounded loss here.
+* **And it is not handed over into a session the server calls `busy`.** The park above
+  is a fact R2D2 created and can therefore see; a busy session is not, and it is the
+  far more common of the two. Measured fifteen times out of fifteen on 1.18.33
+  (`qa/live-run-v12.md`): question A outstanding, question B asked,
+  «Проверяю, пришлю в телеграм», and then nothing at all -- the refusal WAS raised
+  correctly, as `TurnSuperseded`, and its premise was false, because when B's
+  submission makes the session busy A's task is never served, so no answer was on its
+  way from anywhere. `busy()` puts the one question the server can answer and refuses
+  when it says no. A first, cold turn is never caught by it: a session with nothing
+  running is not `busy`.
 * **That same turn's residue is therefore swept by its OWN hand-off**, from a
   snapshot taken after it ended, before the submit. `sweep_residue` at the entry of
   the next turn is the backstop for a wait that timed out or ran without an event
@@ -67,7 +77,7 @@ The properties this module exists to hold:
   collector is armed anyway, on an anchor resolved off Alice's clock; if even that
   cannot be read, the loss is stated in the user's chat rather than logged.
 
-allow: SIZE_OK -- 305 pure LOC, over the 250 ceiling because `_hand_over` is the ONE
+allow: SIZE_OK -- 366 pure LOC, over the 250 ceiling because `_hand_over` is the ONE
 place in the server that submits an agent task, and the F1 park gate is a property of
 that fact rather than of a branch: three escalation paths converge here so that none
 of them can grow a second submit, and a session parked on a human must be refused at
@@ -89,6 +99,7 @@ from app.config import Config
 from core import routing
 from core.async_worker import Worker
 from core.opencode.client import OpencodeError
+from core.opencode.session_store import BUSY
 from core.session_settle import TurnSettler
 from core.session_sweeps import MARKER_TIMEOUT_S, SessionSweeper
 from core.tools.telegram_tool import send_message
@@ -114,6 +125,16 @@ PARKED: Final = (
     "Не выполнил: предыдущая команда ждёт вашего подтверждения в телеграме, а сессия не "
     "берёт новых задач, пока вы не ответите. Ответьте «да» или «нет» на тот вопрос — и "
     "спросите ещё раз."
+)
+#: What the user is told when a turn is NOT submitted because the SERVER reports this
+#: session `busy` -- which is a different fact from the park above, and not one this
+#: process can name a cause for. It has to say so anyway, for the same reason: the
+#: promise it replaces is «Проверяю, пришлю в телеграм», and nothing is going to be sent.
+#: Measured at 15 refusals out of 15 (`qa/live-run-v12.md`).
+BUSY_REFUSED: Final = (
+    "Не выполнил: сессия сейчас занята — opencode не обслуживает ход, отправленный в "
+    "занятую сессию, а чем она занята, сервер не говорит. Ничего не отправлено и ждать "
+    "нечего. Спросите ещё раз через минуту."
 )
 
 
@@ -204,9 +225,21 @@ class SessionCollector:
         A deployment with no broker at all (`EVENT_MODE` unknown, or a deployment that
         does not wire one) is a supported one, and for it nothing parks that R2D2 knows
         of: the hand-over proceeds, which is the behaviour it has always had.
+
+        **The second gate asks the SERVER, and `busy` is not read as "queued".** The
+        park above is a fact R2D2 created and can therefore see; a session the server
+        calls `busy` for a reason R2D2 cannot observe is not. The contract forbids
+        reading that signal as "there is work waiting" -- the queue has no drain route
+        -- so `busy` is asked the only question it can answer: will a turn submitted
+        right now be served. `qa/live-run-v12.md` is what refusing on the answer costs
+        nothing and gains: fifteen of fifteen user-visible outcomes went from
+        «Проверяю, пришлю в телеграм.» and then silence to a stated loss.
         """
         if await self.parked(wiring, app_id, session_id):
             await self._say(PARKED)
+            return
+        if await self.busy(wiring, app_id, session_id):
+            await self._say(BUSY_REFUSED)
             return
         await self._collect_later(wiring, app_id, session_id, task)
         await self._submit(wiring, app_id, session_id, task)
@@ -225,6 +258,44 @@ class SessionCollector:
         """
         broker = wiring.broker
         return broker is not None and await broker.parked(app_id, session_id)
+
+    async def busy(self, wiring: HybridWiring, app_id: str, session_id: str) -> bool:
+        """Whether the server says it will not serve a turn submitted to this session now.
+
+        **Asked, not inferred.** `GET /session/status` is the only route that answers
+        it, and `busy` is the only value on it that means no; the reaper already reads
+        that one value (`core.opencode.session_store.BUSY`). The question it is put
+        to is "will a turn submitted right now be served", deliberately NOT "is there
+        work waiting": the contract refuses the second reading outright (U9, «признак
+        "занята" нельзя читать как "в очереди"»), the queue has no drain route, and the
+        measured outcome of submitting into a busy session is 204 and then nothing --
+        the turn stays in the transcript with no `assistant` message ever answering it.
+
+        So `busy` here means refusal, and the refusal is the safe direction of an
+        asymmetry the owner chose on purpose: overstating a success is what costs a
+        user their question, so where the server cannot promise service, R2D2 says so
+        in seconds rather than acknowledging a turn nothing will answer
+        (`qa/live-run-v12.md`, 15 refusals out of 15, and one of them discarded an
+        answer that was sitting in the transcript undelivered).
+
+        **An unreadable answer is `False`, and that is the deliberate end of it.** Not
+        being able to ask is not the same as being told no: refusing on it would state
+        a loss the evidence does not support and would turn one slow route into a
+        refusal of every turn, including the first cold one that is not a second
+        question on anything. The same shape as `parked` returning `False` for a
+        deployment that wired no broker -- we did not learn, and silence is not a fact.
+        """
+        try:
+            statuses = await wiring.client.session_status()
+        except (OpencodeError, httpx.HTTPError) as exc:
+            self.logger.warning(
+                "opencode %r: could not read /session/status for session %s of %s (%s: %s), so "
+                "this turn is handed over as if the session were idle; if it is in fact busy, the "
+                "task is accepted and never served, which is what the check above exists to stop",
+                wiring.spec.name, session_id, app_id, type(exc).__name__, exc,
+            )
+            return False
+        return statuses.get(session_id) == BUSY
 
     async def _submit(
         self, wiring: HybridWiring, app_id: str, session_id: str, task: str

@@ -31,6 +31,16 @@ itself -- the submit, the transcript sweep and the `opencode_reply` job -- is
   here; `Brain._handle` then answers from the provider chain. A refusal text that
   reaches a speaker is worse than no answer, because the user cannot tell it from
   one.
+* **A session the server calls `busy` is refused before the voice turn, not after.**
+  The park gate above this one costs Alice nothing because a park is a fact in our
+  own database; `busy` is not, and it is the far more common case. Measured fifteen
+  times out of fifteen on 1.18.33 (`qa/live-run-v12.md`): question A outstanding,
+  question B asked, «Проверяю, пришлю в телеграм», and then nothing at all, because
+  when B's submission makes the session busy A's task is never served -- so the
+  `TurnSuperseded` that ended it was a correct lease decision resting on a false
+  premise, and no answer was on its way from anywhere. The check therefore sits
+  HERE, next to the park gate and not inside the collector: by the time a hand-over
+  runs, Alice has already spent the voice budget and the user already has a promise.
 """
 
 from __future__ import annotations
@@ -50,7 +60,7 @@ from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded
 from core.opencode.session_store import OcSessionStore
 from core.opencode.turn_watch import TurnWatch
 from core.permissions import PermissionBroker, PermissionVerdict
-from core.session_collector import PARKED, SessionCollector
+from core.session_collector import BUSY_REFUSED, PARKED, SessionCollector
 
 #: The backend kind that answers from a persistent opencode session. It is the
 #: opencode ROUTE, never a member of the fallback chain -- `core/brain.py` filters
@@ -138,7 +148,9 @@ class SessionRoute:
         so no turn of ours is running in that session for opencode to interrupt; the
         sentinel branch is reached only after the voice turn ANSWERED with the
         marker, and a turn that raised an ask never returns text; and the entry
-        check has already refused any session that was parked. What the agent turn
+        check has already refused any session that was parked, or that the server
+        calls busy -- and a C8 session is neither, because a session created
+        seconds ago has nothing running in it. What the agent turn
         submitted here will ask is not this turn's to claim -- the next turn records
         `path=parked permission_asked=True`.
         """
@@ -154,6 +166,18 @@ class SessionRoute:
             # not have to race for it.
             rec.permission_asked = True
             return PARKED, False
+        if await self.collector.busy(wiring, app_id, session_id):
+            # The same refusal for a cause R2D2 cannot see: the server reports this
+            # session `busy` and does not serve a turn submitted into one. `parked`
+            # names a pending ask and `permission_asked` agrees with it; neither can
+            # be claimed here, because `GET /session/status` says `busy` and nothing
+            # else -- so this is its own path rather than `parked` wearing a claim
+            # nothing here supports. `SessionCollector.busy` is where the question is
+            # asked, and where the silence of an unreadable answer is resolved into
+            # `False` rather than into a refusal.
+            rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
+            rec.path = metrics.PATH_BUSY
+            return BUSY_REFUSED, False
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.

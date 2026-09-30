@@ -126,6 +126,12 @@ HEALTH_TIMEOUT_S: Final = 1.5
 CATALOGUE_TIMEOUT_S: Final = 20.0
 ```
 
+Та же граница — у чтения транскрипта (`TRANSCRIPT_TIMEOUT_S = 20.0` в том же
+файле): `GET /session/:id/message` внутри сборщика дважды в одном живом прогоне
+не ответил в голосовую границу, и вся задача упала с `did not answer within …s`
+(`qa/live-run-v12.md`, находка 2). Чтение сборщика идёт не на часах Алисы — у
+сборщика свой потолок 600 с, — поэтому занимать голосовой дедлайн ему нечего.
+
 **Поток событий не читается голосовым дедлайном.** `GET /event` — не запрос: это
 соединение, которое живёт столько, сколько живёт сессия, и opencode отправляет
 в него `server.heartbeat` раз в **10,0 с** (измерено на этой машине, U4).
@@ -962,6 +968,56 @@ ASK_SOURCE: Final[Mapping[str, str]] = MappingProxyType(
 Развёртывание без брокера (`EVENT_MODE` неизвестен, или брокер не подключён) —
 поддерживаемое, и для него поведение остаётся прежним: отправка происходит.
 
+### 5.6 Занятая сессия: тот же отказ, но спросить нельзя кого
+
+Парковка выше — факт, который создал сам R2D2 и который поэтому видно в своей
+базе. Занятость сессии — **не** такой факт, и она встречается заметно чаще. Отказ
+тот же по форме и по цене, а отличается тем, что **причины здесь не видно никому
+в этом процессе**: `GET /session/status` отвечает `busy` и не говорит ни о чём
+больше (U9, раздел «Паркованная сессия отвечает `busy`, и это честно»).
+
+Вопрос задаётся серверу, а не выводится из нашего состояния:
+
+```verbatim core/session_collector.py
+    async def busy(self, wiring: HybridWiring, app_id: str, session_id: str) -> bool:
+        """Whether the server says it will not serve a turn submitted to this session now.
+
+        **Asked, not inferred.** `GET /session/status` is the only route that answers
+        it, and `busy` is the only value on it that means no; the reaper already reads
+        that one value (`core.opencode.session_store.BUSY`). The question it is put
+        to is "will a turn submitted right now be served", deliberately NOT "is there
+        work waiting": the contract refuses the second reading outright (U9, «признак
+        "занята" нельзя читать как "в очереди"»), the queue has no drain route, and the
+        measured outcome of submitting into a busy session is 204 and then nothing --
+        the turn stays in the transcript with no `assistant` message ever answering it.
+```
+
+**Читается это как «обслужит ли сервер ход, отправленный прямо сейчас», а не как
+«есть ли очередь».** Второе прочтение контракт запрещает прямо, и очередь
+вычерпать нечем (U9 § 4). Отсюда и отказ: ход, отправленный в занятую сессию,
+принимается с 204 и не обслуживается никогда.
+
+**Направление асимметрии выбрано намеренно.** Измеренная потеря, которую отказ
+убирает ([`qa/live-run-v12.md`](../qa/live-run-v12.md)): вопрос A висит, вопрос B,
+пользователь получает «Проверяю, пришлю в телеграм.» — и **больше ничего, без
+сообщения об отказе; 15 раз из 15**. Отказ при этом поднимался правильно, как
+`TurnSuperseded`, и вот его посылка была ложной: когда отправка B делает сессию
+занятой, задача A не обслуживается **никогда**, а значит никакого ответа ниоткуда
+не в пути — не от того сборщика, который якобы им владеет. В одном случае ответ A
+лежал в транскрипте невыданным и был выброшен. Названная потеря лучше обещания,
+которое нельзя сдержать; завышать успех — небезопасное направление, поэтому там,
+где сервер не может пообещать обслуживание, R2D2 говорит об этом за секунды.
+
+**Непрочитанный ответ — это `False`, и это конец решения.** «Не смогли спросить» и
+«спросили, ответили нет» — разные вещи: отказать по первому значило бы заявить о
+потере, которой нет, и превратить один медленный маршрут в отказ **каждого** хода.
+Форма та же, что у `parked` для развёртывания без брокера: мы не узнали, а молчание
+— не факт.
+
+**Первый ход в холодной сессии эта проверка не ловит**, и это не «случилось», а
+свойство вопроса: у сессии, созданной секунду назад, нечего быть занятой. Холодная
+ветка C8 по-прежнему уходит агенту и подтверждается.
+
 ---
 
 
@@ -1073,6 +1129,18 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             # not have to race for it.
             rec.permission_asked = True
             return PARKED, False
+        if await self.collector.busy(wiring, app_id, session_id):
+            # The same refusal for a cause R2D2 cannot see: the server reports this
+            # session `busy` and does not serve a turn submitted into one. `parked`
+            # names a pending ask and `permission_asked` agrees with it; neither can
+            # be claimed here, because `GET /session/status` says `busy` and nothing
+            # else -- so this is its own path rather than `parked` wearing a claim
+            # nothing here supports. `SessionCollector.busy` is where the question is
+            # asked, and where the silence of an unreadable answer is resolved into
+            # `False` rather than into a refusal.
+            rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
+            rec.path = metrics.PATH_BUSY
+            return BUSY_REFUSED, False
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
@@ -1171,6 +1239,16 @@ PATH_DEADLINE: Final = "deadline"
 #: (`qa/live-run-v9.md` F1). Without it this turn recorded `path=voice` with a model
 #: that answered nothing, which is the one shape the ledger cannot be read for.
 PATH_PARKED: Final = "parked"
+#: The turn was refused before it reached a model, because the SERVER reports this session
+#: `busy` -- and not because anything of ours is waiting on a human, which is the whole of
+#: what `PATH_PARKED` claims. opencode accepts a turn submitted into a session it calls busy
+#: and does not serve it (contract U9, measured on 1.18.33), so such a turn is acknowledged
+#: inside Alice's budget and then answered never. Its own path because the cause is not
+#: visible in this process at all: `GET /session/status` says `busy` and nothing about why,
+#: so a record reading `parked` here would name a pending ask that the very next field
+#: (`permission_asked=False`) contradicts -- the one shape of wrong this module exists to
+#: prevent, which is a record that describes a different event than the one that happened.
+PATH_BUSY: Final = "busy"
 #: The turn WAS the answer to a brokered permission ask: `да` or `нет`, posted to the
 #: server as `{"response": "once"}` or `{"response": "reject"}`. It is its own path
 #: and not `voice` because `voice` means the user HEARD this spoken aloud, and a
@@ -1184,7 +1262,11 @@ PATH_PERMISSION: Final = "permission"
 `route=opencode` с `path=voice` — уложился; `path=escalate` — ушёл агенту;
 `path=deadline` — не уложился и ответ заберёт воркер; `path=error` — сработала
 graceful-ветка; `path=parked` — ход прочитан и **намеренно не отправлен**, потому
-что сессия стоит на неотвеченном вопросе (F1, раздел 3); `path=permission` — ход
+что сессия стоит на неотвеченном вопросе (F1, раздел 3); `path=busy` — ход прочитан
+и **намеренно не отправлен**, потому что сервер сам зовёт эту сессию `busy` и ход в
+неё не обслуживает (NEW-2, `qa/live-run-v12.md`) — отличить от `parked` не по
+причине (её здесь не видно), а по тому, что наш вопрос в этом ходе не стоял;
+`path=permission` — ход
 **сам был** ответом на такой вопрос: `да` или `нет`, отправленные на сервер как
 `{"response": "once"}` / `{"response": "reject"}`; `path=confirm` — ход был решением
 человека по собственному действию R2D2 (подтверждение `run_shell`): модель не
