@@ -29,13 +29,45 @@ Three properties are load-bearing:
 * `error` -- the turn failed and the graceful text was spoken instead.
 * `deadline` -- the voice turn outran `r2d2_fast_deadline` and was handed to the
   collector, and `route=opencode` for the branch that answers from a session.
+* `parked` -- read, understood and deliberately NOT submitted, because the
+  session is standing on an ask of ours that the user has not answered.
+* `permission` -- the turn WAS the answer to such an ask. No model was asked
+  anything and no model answered, and the text acknowledges a decision rather
+  than answering a question.
 
 Both of those belong to `core/session_route.py:SessionRoute.turn`, which reports
 them itself since todo 18: it is the only branch that knows which agent spoke and
 whether the voice turn ran out of budget, so a recorder that could not be told
 would be a recorder nobody fills in. `docs/11-opencode-contract.md`'s measured
 p50 of 1.667 s against the 2.5 s budget is the number the record exists to keep
-watching, and it lands on that branch.
+watching, and it lands on that branch. `permission` belongs to
+`SessionRoute.answer_permission`, whose `да` used to leave every field at its
+default: a Telegram button answer was recorded as `path=voice`, and `voice` is
+the vocabulary for "the user heard this spoken aloud" -- so the one record the
+ledger could not be read for was the one it wrote most confidently.
+
+**What `permission_asked` claims, and when it can honestly be known.** It says an
+opencode permission ask is *involved in this turn*: the turn is standing on one,
+it is the answer to one, or one was raised while the turn was waiting on the
+model. It is deliberately NOT "an ask was raised somewhere inside this turn's
+window", and it is NOT set when `turn()` opens -- because it cannot be. The frame
+arrives on the opencode event stream, in ANOTHER task, at a moment no caller can
+predict: `permission.asked` for a still-running voice turn usually reaches the
+user's chat *after* the request has already been acknowledged. A flag set on entry
+is a guess, and a flag the ledger cannot make true is worse than a missing field,
+because it looks like a measurement. So each terminal path of
+`core/session_route.py` decides for itself and says why in the comment there, the
+paths that provably cannot see an ask leave it `False`, and the ONE place an ask
+can appear while a turn is in flight -- the still-running voice turn of the
+`deadline` branch -- re-reads the broker's own row for it.
+
+**The ask's own turn usually is not this one.** The agent turn that raises an ask
+is submitted *after* the acknowledgement, so the turn that submitted it records
+`False` and the NEXT turn records `path=parked permission_asked=True`. One ask,
+one `True`, and no record ever claiming a question nobody was asked. What the
+field cannot do is date-stamp the ask to the request that caused it: that would
+mean writing the record after the collector's ceiling, and a turn whose cost is
+known minutes late is the turn the whole of this module exists to prevent.
 """
 
 from __future__ import annotations
@@ -68,6 +100,14 @@ PATH_DEADLINE: Final = "deadline"
 #: (`qa/live-run-v9.md` F1). Without it this turn recorded `path=voice` with a model
 #: that answered nothing, which is the one shape the ledger cannot be read for.
 PATH_PARKED: Final = "parked"
+#: The turn WAS the answer to a brokered permission ask: `да` or `нет`, posted to the
+#: server as `{"response": "once"}` or `{"response": "reject"}`. It is its own path
+#: and not `voice` because `voice` means the user HEARD this spoken aloud, and a
+#: permission answer arrives as a Telegram message that nobody speaks -- so the live
+#: run recorded every `да` as `path=voice` and the field could not be read for it.
+#: And not `escalate`: nothing moved to the agent, because the work was already
+#: running and this turn is what released it.
+PATH_PERMISSION: Final = "permission"
 
 #: The one record per turn. The first seven fields are the format the plan pins;
 #: `msgs` and `tools` are what the line it replaced carried, kept because they are
@@ -125,6 +165,11 @@ class Turn:
     code that knows a turn's facts is several frames below the code that opens the
     turn, and threading a parameter down to it is the kind of change that makes
     instrumentation optional.
+
+    `permission_asked` is the one field with no default reading. It is not set here
+    and cannot be: the ask arrives on another task, at an unpredictable moment. The
+    terminal path that CAN see it sets it, and the module docstring says what it
+    claims and which path that is.
     """
 
     __slots__ = (

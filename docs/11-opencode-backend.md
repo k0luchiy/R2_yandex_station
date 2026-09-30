@@ -1050,6 +1050,10 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
         if await self.collector.parked(wiring, app_id, session_id):
             rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
             rec.path = metrics.PATH_PARKED
+            # An ask of ours is outstanding for this session and it is WHY this turn
+            # was refused, so the fact is already in hand -- the one branch that does
+            # not have to race for it.
+            rec.permission_asked = True
             return PARKED, False
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
@@ -1149,18 +1153,42 @@ PATH_DEADLINE: Final = "deadline"
 #: (`qa/live-run-v9.md` F1). Without it this turn recorded `path=voice` with a model
 #: that answered nothing, which is the one shape the ledger cannot be read for.
 PATH_PARKED: Final = "parked"
+#: The turn WAS the answer to a brokered permission ask: `да` or `нет`, posted to the
+#: server as `{"response": "once"}` or `{"response": "reject"}`. It is its own path
+#: and not `voice` because `voice` means the user HEARD this spoken aloud, and a
+#: permission answer arrives as a Telegram message that nobody speaks -- so the live
+#: run recorded every `да` as `path=voice` and the field could not be read for it.
+#: And not `escalate`: nothing moved to the agent, because the work was already
+#: running and this turn is what released it.
+PATH_PERMISSION: Final = "permission"
 ```
 
 `route=opencode` с `path=voice` — уложился; `path=escalate` — ушёл агенту;
 `path=deadline` — не уложился и ответ заберёт воркер; `path=error` — сработала
 graceful-ветка; `path=parked` — ход прочитан и **намеренно не отправлен**, потому
-что сессия стоит на неотвеченном вопросе (F1, раздел 3). Последнее — единственный
-путь, при котором `model=` пуст: ни одна модель не отвечала, и записать здесь
-`voice` было бы ложью, которую нельзя отличить в сводке. Ни в одном поле нет ничего, что пришло из `${...}`, поэтому
+что сессия стоит на неотвеченном вопросе (F1, раздел 3); `path=permission` — ход
+**сам был** ответом на такой вопрос: `да` или `нет`, отправленные на сервер как
+`{"response": "once"}` / `{"response": "reject"}`. Последние два — единственные пути,
+при которых `model=` пуст: ни одна модель не отвечала, и записать здесь `voice`
+было бы ложью, которую нельзя отличить в сводке. Для `path=permission` это была не
+теория: живой прогон писал `turn route= path=voice model= agent= llm_ms=0
+total_ms=35` на каждый `да`, а `voice` — это ровно «пользователь услышал это вслух».
+Ни в одном поле нет ничего, что пришло из `${...}`, поэтому
 секрет в такую строку попасть не может.
 
----
+Поле `permission_asked` означает, что **в ходе задет вопрос о разрешении**: ход на
+нём стоит, ход им и является, либо вопрос поднялся, пока ход ждал модель. Оно **не
+ставится на входе** и не может ставиться: кадр `permission.asked` приходит в
+**другой задаче** из потока событий opencode в момент, который никто не предсказывает
+(для ещё идущего голосового хода вопрос обычно доходит до чата уже **после**
+подтверждения). Единственное место, где вопрос может появиться при живом ходе, —
+ветка `deadline`, и она перечитывает строку брокера после своего последнего `await`;
+остальные ветки доказано его не видят и не угадывают. Цена этого честного чтения:
+ход, **отправивший** задачу агенту, пишет `False`, а следующий ход пишет
+`path=parked permission_asked=True` — один вопрос, одно `True`, и ни одна запись не
+утверждает, что вопрос был задан, когда его не задавали.
 
+---
 ## 8. `EVENT_MODE`: три режима
 
 ```verbatim core/opencode/sse_frames.py

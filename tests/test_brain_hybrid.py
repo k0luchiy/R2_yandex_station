@@ -44,7 +44,7 @@ is asking what they mean, and escalating their question to the agent would drop
 the turn on the floor. The text still reaches the session verbatim
 (`test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal`).
 
-allow: SIZE_OK -- 1705 pure LOC, a test module grows with the behaviours it pins.
+allow: SIZE_OK -- 1863 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -52,7 +52,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Final
@@ -252,6 +254,11 @@ class FakeOpencode:
         self.down: bool = False
         self.hang_turn: bool = False
         self.empty_turn: bool = False
+        #: Called synchronously the moment a hung voice turn is ACCEPTED, so a test can
+        #: release something from OUTSIDE the request -- the broker storing an ask while
+        #: this turn is still waiting is the only way to reproduce the shape where an
+        #: ask and the deadline belong to the same turn.
+        self.on_hung_turn: Callable[[], None] | None = None
         #: A bounded wait before the turn answers, so a test can put the deadline
         #: on either side of the answer and prove which one decided the outcome.
         self.delay_s: float = 0.0
@@ -377,6 +384,12 @@ class FakeOpencode:
             message_id = f"msg_hung_{len(self.hung_ids) + 1}"
             self.hung_ids.append(message_id)
             self._hung[session_id] = (turn.text, message_id)
+            if self.on_hung_turn is not None:
+                # The seam that makes "an ask arrives WHILE this turn waits" a
+                # reproducible test rather than a race: the handler is synchronous,
+                # so it cannot await, and all it has to do is release whatever the
+                # test parked outside the request.
+                self.on_hung_turn()
             return httpx.Response(200, stream=_EndlessStream())
         if self.turn_error is not None:
             return httpx.Response(
@@ -1530,6 +1543,218 @@ async def test_a_question_asked_while_the_session_is_parked_is_refused_not_queue
     assert text == PARKED
     assert "не выполнил" in text.lower()
     assert "«да»" in text or "«нет»" in text
+
+
+# ---------------------------------------------------------------------------
+# 3b. The record of a turn a permission ask touched (NEW-3, NEW-4)
+# ---------------------------------------------------------------------------
+#
+# `core/metrics.py` shipped `permission_asked` in `TURN_FORMAT` and NOTHING ever
+# set it, and every `да` typed in Telegram was recorded as `path=voice` -- the
+# vocabulary for "the user heard this spoken aloud", for an answer that is
+# delivered as a message nobody speaks. Both were found by a live run and both are
+# the same defect: a record that does not describe what happened.
+#
+# The field CANNOT be set when the turn opens. The frame arrives on the opencode
+# event stream in another task at a moment no caller can predict, so the tests
+# below pin it at the three places a turn can honestly know, and pin `False` at the
+# places that provably cannot see one -- a flag that reads True because nobody
+# thought about it is the same false claim with the opposite sign.
+
+
+def turn_record(caplog: pytest.LogCaptureFixture) -> dict[str, str]:
+    """The `field=value` pairs of the LAST turn record the capture holds.
+
+    The value class is `\\S*` and not `\\S+`: `model=` is EMPTY on the two paths where
+    no model was asked anything (`parked` and `permission`), and a parser that cannot
+    see an empty value drops the key entirely -- which would hide precisely the
+    claims these tests are about.
+    """
+    records = [
+        dict(re.findall(r"(\w+)=(\S*)", record.getMessage()))
+        for record in caplog.records
+        if record.getMessage().startswith("turn route=")
+    ]
+    assert records, [r.getMessage() for r in caplog.records]
+    return records[-1]
+
+
+async def test_a_turn_refused_because_the_session_is_parked_records_the_ask(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`permission_asked=False` on a turn that WAS refused for an ask is the defect.
+
+    This is the one branch where the fact is already in hand -- `parked()` is what
+    refused the turn -- so a flag that reads False here cannot be excused as a race:
+    the record contradicts the branch two lines above it. A `False` here means the
+    ledger cannot be read for "how often does a park refuse a turn", which is the
+    only number the field exists for.
+    """
+    # Given: a warm session with an ask of ours still unanswered
+    await rig.warm()
+    await store_ask(rig)
+    caplog.set_level(logging.INFO)
+    # When: the user asks something else while the session is parked
+    text = await rig.say(QUESTION)
+    # Then: the turn is the F1 refusal ...
+    assert text == PARKED
+    # ... and the record says the ask touched it, rather than nothing having happened
+    fields = turn_record(caplog)
+    assert fields["path"] == "parked"
+    assert fields["permission_asked"] == "True"
+    # ... with no model claimed, because none was asked anything
+    assert fields["model"] == ""
+    assert int(fields["llm_ms"]) == 0
+
+
+async def test_a_permission_answer_is_not_recorded_as_a_spoken_voice_answer(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A `да` delivered as a Telegram message is not something the user heard.
+
+    Measured: every such turn logged `turn route= path=voice model= agent=
+    llm_ms=0 total_ms=35`. `voice` claims aloud a text nobody spoke, and the whole
+    ledger is read through that field -- so `permission` is its own value, and the
+    record must also stop claiming a route and a model that were never involved.
+    """
+    # Given: an opencode ask waiting for this user, and the user answering it
+    await store_ask(rig)
+    caplog.set_level(logging.INFO)
+    text = await rig.say("да")
+    # Then: the turn is the ANSWER, which `voice` denies and `escalate` also denies
+    assert text and text != ACK
+    fields = turn_record(caplog)
+    assert fields["path"] == "permission"
+    assert fields["permission_asked"] == "True"
+    # ... the route is the opencode session route that answered it ...
+    assert fields["route"] == "opencode"
+    # ... and nothing was sent to a model, so no model is named and the turn is
+    # not an escalation: nothing moved to the agent, this turn is what released it
+    assert fields["model"] == ""
+    assert fields["escalated"] == "False"
+    assert int(fields["llm_ms"]) == 0
+    assert int(fields["msgs"]) == 0
+    assert fields["tools"] == "()"
+
+
+async def test_a_refusal_is_recorded_the_same_way_an_approval_is(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`нет` takes the same branch as `да`, so it must take the same record.
+
+    Without this, a `path=permission` reachable only from the approval arm is a
+    second "the field the ledger cannot be read for": a ledger that says permission
+    answers were rare exactly when the user refused one.
+    """
+    await store_ask(rig)
+    caplog.set_level(logging.INFO)
+    await rig.say("нет")
+    fields = turn_record(caplog)
+    assert fields["path"] == "permission"
+    assert fields["permission_asked"] == "True"
+
+
+async def test_a_voice_turn_that_outran_the_budget_on_a_permission_ask_says_so(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The one place an ask can appear while a turn is in flight, and it is read there.
+
+    The shape the live run measured: the voice agent reaches for a tool, opencode
+    raises `permission.asked` and blocks that turn, the question goes to the user,
+    and R2D2 gives up waiting at the deadline -- so the ask and the deadline belong
+    to the SAME turn, and a record that cannot say so is a turn that reads as an
+    ordinary slow one. `parked()` returned False at the entry of this turn (the ask
+    did not exist yet), which is exactly why the branch re-reads it after the last
+    await instead of trusting the check it already made.
+    """
+    # Given: a warm session and a voice turn that is ACCEPTED and never answers
+    session_id = await rig.warm()
+    rig.server.hang_turn = True
+    # A deadline generous enough that one SQLite write inside it is not a coin flip:
+    # the shipped value is 3.2 s and this is the same field, read by the same code.
+    rig.cfg.r2d2_fast_deadline = 0.5
+    broker = rig.brain.opencode.broker
+    assert broker is not None
+    hung = asyncio.Event()
+    rig.server.on_hung_turn = hung.set
+
+    async def the_server_raises_an_ask() -> None:
+        await hung.wait()
+        await broker.on_permission_requested(APP, session_id, "per_deadline", "ls -la", [])
+
+    raised = asyncio.create_task(the_server_raises_an_ask())
+    caplog.set_level(logging.INFO)
+    try:
+        text = await rig.say(QUESTION)
+    finally:
+        await raised
+    # Then: the user is acknowledged -- a deadline is not an abort ...
+    assert text == ACK
+    assert rig.server.aborted == []
+    # ... the question really did reach the user's chat ...
+    assert any("ls -la" in message for message in rig.net.telegram)
+    assert await rig.memory.get_pending(APP) is not None
+    # ... and the record says the turn was stopped on an ask, which is what happened
+    fields = turn_record(caplog)
+    assert fields["path"] == "deadline"
+    assert fields["permission_asked"] == "True"
+    assert int(fields["llm_ms"]) > 0
+
+
+async def test_a_deadline_turn_with_no_ask_records_no_ask(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The other half of the flag: it must not be True because a check exists.
+
+    A flag that is set whenever the code bothers to look is as false as one that is
+    never set -- it just fails in the direction nobody notices. A slow voice turn
+    with nothing parked is the common case, and it must read `False`.
+    """
+    await rig.warm()
+    rig.server.hang_turn = True
+    caplog.set_level(logging.INFO)
+    assert await rig.say(QUESTION) == ACK
+    fields = turn_record(caplog)
+    assert fields["path"] == "deadline"
+    assert fields["permission_asked"] == "False"
+
+
+async def test_a_turn_spoken_in_place_records_no_ask(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A turn that ended with text cannot have been parked: a blocked turn answers none.
+
+    This is the derivation the module docstring claims for the fast path, asserted
+    where the claim is made. It is the shape that proves `permission_asked` is a
+    measurement and not a mood: with the flag True-by-default this would pass, and
+    with it True-by-paranoia so would the test above.
+    """
+    await rig.warm()
+    rig.server.reply = ANSWER
+    caplog.set_level(logging.INFO)
+    assert await rig.say(QUESTION) == ANSWER
+    fields = turn_record(caplog)
+    assert fields["path"] == "voice"
+    assert fields["permission_asked"] == "False"
+
+
+async def test_a_permission_answer_leaves_no_trace_on_a_later_spoken_turn(
+    rig: Rig, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The flag is per TURN, not a latch the recorder forgot to clear.
+
+    `permission_asked` lives on one `Turn`, but nothing stops a future branch from
+    setting it on the wrong one, and a latch would show up as a whole session of
+    voice turns claiming to have been parked -- which would be worse than the
+    constant False it replaced, because it would look like a working metric.
+    """
+    await store_ask(rig)
+    await rig.say("да")
+    await rig.warm()
+    rig.server.reply = ANSWER
+    caplog.set_level(logging.INFO)
+    assert await rig.say(QUESTION) == ANSWER
+    assert turn_record(caplog)["permission_asked"] == "False"
 
 
 async def test_the_park_refusal_does_not_wedge_the_ask_it_refused_over(rig: Rig) -> None:

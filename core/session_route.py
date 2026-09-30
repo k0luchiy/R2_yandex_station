@@ -125,6 +125,22 @@ class SessionRoute:
         over inside the request; the deadline branch cannot, because its voice turn
         is still running, and gets the same acknowledgement from a call that hands
         over in a background continuation instead.
+
+        **`permission_asked` is decided per terminal path, and never on entry.**
+        The module docstring of `core/metrics.py` says what the field claims; this
+        is where that becomes three derivations rather than one default. The `parked`
+        branch already holds the fact, because the ask is why it refused. The
+        `deadline` branch is the ONE place an ask can appear while this turn is in
+        flight -- the voice turn is still running server-side and it is the turn
+        that can be parked right now -- so it re-reads the broker's row after the
+        branch's last await. The C8 branch, the sentinel branch and the spoken
+        branch cannot see one and are not asked to guess: C8 has submitted nothing,
+        so no turn of ours is running in that session for opencode to interrupt; the
+        sentinel branch is reached only after the voice turn ANSWERED with the
+        marker, and a turn that raised an ask never returns text; and the entry
+        check has already refused any session that was parked. What the agent turn
+        submitted here will ask is not this turn's to claim -- the next turn records
+        `path=parked permission_asked=True`.
         """
         rec = metrics.current()
         rec.agent = wiring.spec.voice_agent
@@ -133,6 +149,10 @@ class SessionRoute:
         if await self.collector.parked(wiring, app_id, session_id):
             rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
             rec.path = metrics.PATH_PARKED
+            # An ask of ours is outstanding for this session and it is WHY this turn
+            # was refused, so the fact is already in hand -- the one branch that does
+            # not have to race for it.
+            rec.permission_asked = True
             return PARKED, False
         if not await self._prepare(wiring, app_id, session_id):
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
@@ -159,6 +179,17 @@ class SessionRoute:
             # `llm_ms` is its cost.
             rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
             rec.path = metrics.PATH_DEADLINE
+            # The one place an ask can appear while THIS turn is in flight. The voice
+            # turn is still running server-side and it is the turn that can be parked
+            # right now: it reached for a tool, opencode raised `permission.asked`, and
+            # this request gave up waiting at the deadline with the question already on
+            # its way to the user -- which is a shape the live run logged as
+            # `permission_asked=False` because the field was set nowhere at all. So it
+            # is read HERE, after the branch's last await, and never on entry: an ask
+            # the still-running turn raises after this line belongs to no turn of ours,
+            # and the next turn is the one that records `parked` with it.
+            if await self.collector.parked(wiring, app_id, session_id):
+                rec.permission_asked = True
             # The voice turn is still running, so this branch hands the work over in a
             # background continuation instead of inside the request: two turns in one
             # session at once is what put a tool refusal the sweep could not see into
@@ -188,18 +219,36 @@ class SessionRoute:
         `unrelated` means there was no ask of ours, or the text is not an answer at
         all, and it changes nothing -- the question is then answered normally and
         the ask stays pending, which is the only way it can still be answered.
+
+        **A resolved ask is reported to the recorder before this returns**, because
+        the whole content of such a turn IS that answer. It used to leave every
+        field at its default, and the live run read it as
+        `turn route= path=voice model= agent= llm_ms=0 total_ms=35`: `voice` is the
+        vocabulary for "the user heard this spoken aloud", and a `да` typed in
+        Telegram is delivered as a message nobody speaks. So it is `permission`, and
+        the record says no model was involved -- `route=opencode` because this is the
+        opencode session route that answered, `model` empty for the same reason
+        `parked`'s is, `msgs=0` and no tools because nothing was sent to a model at
+        all. `permission_asked` is True because this turn is the answer to an ask,
+        which is the other half of what that field claims.
         """
         broker = wiring.broker if wiring is not None else None
         if broker is None:
             return None
         verdict: PermissionVerdict = await broker.resolve_from_text(app_id, command)
+        spoken: str
         match verdict:
             case "approved":
-                return PERMISSION_APPROVED
+                spoken = PERMISSION_APPROVED
             case "rejected":
-                return PERMISSION_REFUSED
+                spoken = PERMISSION_REFUSED
             case _:
                 return None
+        rec = metrics.current()
+        rec.answered(route=metrics.ROUTE_OPENCODE, model="", msgs=0, tools=())
+        rec.path = metrics.PATH_PERMISSION
+        rec.permission_asked = True
+        return spoken
 
     # -- internals ---------------------------------------------------------
 

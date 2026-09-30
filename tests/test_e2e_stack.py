@@ -14,8 +14,13 @@ What is real here: the real `FastAPI` app over its real lifespan, the real
 `Worker`, `Brain`, `EventSource` and `core.render`, over a real HTTP surface
 (`tests/fake_opencode.py`) that streams, hangs and refuses. The only doubles are
 the wire's far side and the two things R2D2 cannot be given a real one of: the
-opencode server, and Telegram (patched at the four `send_message` import sites,
-because the real one would answer for api.telegram.org).
+opencode server, and Telegram (patched at **every** `send_message` import site
+under `app/` and `core/`, because the real one would answer for
+api.telegram.org). That set was four while the code had six, and the two that were
+missed are `core/session_collector.py` -- the path the F1 parked-refusal message
+travels, i.e. the one user-facing message the F1 fix exists to deliver -- and
+`core/tools/tg_tool.py`. So the set is derived from the source by
+`telegram_sites` and asserted against the fixture, rather than remembered.
 
 **The metrics gap this todo closes is asserted here, not assumed.** An
 opencode-routed turn is the primary route and the one whose latency proves we fit
@@ -42,16 +47,18 @@ file pins after the JSON contract.
   event-stream attachment, or to the reaper's own log line.
 
 allow: SIZE_OK -- pure LOC is over the 250 ceiling and the file carries a
-`SIZE_OK` marker for it. Every test module in this repo is 436-751 pure LOC
-(`test_opencode_client.py` 751, `test_sse.py` 699) and a test module grows with
-the number of behaviours it pins, not with the number of concepts it owns. The
-250 pure-LOC ceiling targets source modules; splitting this would scatter one
-contract -- what Alice may be told, and what the record says about it -- across
-files that each need the whole app-over-its-own-lifespan harness to say anything.
+`SIZE_OK` marker for it. Test modules in this repo run from 44 pure LOC to 1863
+(`test_brain_hybrid.py`), and a test module grows with the number of behaviours it
+pins, not with the number of concepts it owns. The 250 pure-LOC ceiling targets
+source modules; splitting this would scatter one contract -- what Alice may be told,
+and what the record says about it -- across files that each need the whole
+app-over-its-own-lifespan harness to say anything.
+
 """
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import contextlib
 import json
@@ -74,7 +81,9 @@ from fastapi import FastAPI
 import core.brain
 import core.permissions
 import core.async_worker
+import core.session_collector
 import core.session_settle as settle_module
+import core.tools.tg_tool
 from app import main as main_module
 from app.config import Config
 from app.main import build_app
@@ -99,6 +108,9 @@ from tests.fake_opencode import (
 #: the composition root builds reaches for this address, finds nothing and
 #: reconnects, which is the harmless "no server" case rather than a test failure.
 BASE_URL: Final = "http://127.0.0.1:4599"
+#: The checkout these structural checks read. `__file__` rather than `Path.cwd()`, so a
+#: suite run from another directory still compares against the code it imported.
+REPO_ROOT: Final = Path(__file__).resolve().parent.parent
 ZEN_URL: Final = "https://zen.test/v1"
 OPENROUTER_URL: Final = "https://openrouter.test/api/v1"
 TELEGRAM_PREFIX: Final = "https://api.telegram.org/"
@@ -166,6 +178,77 @@ HEALTH_CEILING_S: Final = 4.0
 #: `permission.asked` and the answer R2D2 posts back -- never `always` (C5).
 PERMISSION_QUESTION: Final = "Нужно подтверждение"
 APPROVED_TEXT: Final = "Принято, выполняю."
+
+# ---------------------------------------------------------------------------
+# Where Telegram is replaced, and the guard that says the list is complete
+# ---------------------------------------------------------------------------
+#
+# `send_message` is the ONE function in this project that talks to a channel R2D2
+# does not own, and it is reached through a module-level name -- each caller does
+# `from core.tools.telegram_tool import send_message` and calls it by that name, so
+# a test double has to replace the name in EVERY module that bound it. A module that
+# binds it and is not patched is a module that reaches the real api.telegram.org,
+# which is exactly what happened here: the fixture patched four sites and the shipped
+# code had six, and one of the two it missed is the path `SessionCollector._say` takes
+# -- the F1 parked-refusal message, the one user-facing message the F1 fix exists to
+# deliver.
+#
+# So the list below is the fixture's, named once, and `telegram_sites` derives the
+# truth from the source: a new `from core.tools.telegram_tool import send_message`
+# anywhere under `app/` or `core/` is a red test rather than a silent live call.
+#: The module every caller of the channel imports the sender from.
+SENDER_MODULE: Final = "core.tools.telegram_tool"
+#: The packages the running ASGI app is built from. `opencode/` is deliberately NOT
+#: one of them: `opencode/r2d2_cli/r2d2_do.py` is a SUBPROCESS shim, never imported by
+#: the app, driven by `tests/test_r2d2_do_cli.py` through its own `R2D2_DO_TEST_TG`
+#: seam -- and `test_the_only_site_outside_those_packages_is_the_subprocess_shim`
+#: checks that exclusion instead of assuming it.
+APP_PACKAGES: Final = ("app", "core")
+#: The one module outside those packages that may bind the sender, and why.
+SUBPROCESS_SHIM: Final = "opencode/r2d2_cli/r2d2_do.py"
+#: Every module whose `send_message` the `telegram` fixture replaces. Shared with the
+#: completeness check so the fixture and the guard cannot disagree about the set.
+TELEGRAM_SITES: Final[tuple[Any, ...]] = (
+    main_module,
+    core.permissions,
+    core.brain,
+    core.async_worker,
+    core.session_collector,
+    core.tools.tg_tool,
+)
+
+
+def telegram_sites(root: Path) -> set[str]:
+    """Every module under `root` that binds the Telegram sender, parsed not grepped.
+
+    A site is an import that binds `send_message` in a module's own namespace, in any
+    of the three spellings that reach the channel: `from <sender> import send_message`,
+    `from core.tools import telegram_tool` followed by attribute access, and
+    `import core.tools.telegram_tool` likewise. Grepping for the word would match
+    every docstring in the project that explains why the seam exists -- this file's
+    included -- so the shape that matters is parsed instead.
+
+    `root` is a parameter so a test can point the checker at a tree it built, which
+    is the only honest way to show a guard is not vacuous.
+    """
+    sites: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        if any(part in {"__pycache__", ".venv", "db"} for part in path.parts):
+            continue
+        relative = path.relative_to(root).as_posix()
+        if not relative.startswith(APP_PACKAGES):
+            continue
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.ImportFrom):
+                names = {alias.asname or alias.name for alias in node.names}
+                if node.module == SENDER_MODULE and "send_message" in names:
+                    sites.add(relative)
+                elif node.module == "core.tools" and "telegram_tool" in names:
+                    sites.add(relative)
+            elif isinstance(node, ast.Import):
+                if any(alias.name == SENDER_MODULE for alias in node.names):
+                    sites.add(relative)
+    return sites
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +328,7 @@ class Switchable(httpx.AsyncBaseTransport):
 
 @dataclass
 class Telegram:
-    """The one channel that can push, replaced at its four import sites.
+    """The one channel that can push, replaced at every import site.
 
     The real `send_message` is covered by `tests/test_permission_broker.py`; what
     this file needs is the message the user would read AT THE MOMENT it arrives,
@@ -381,9 +464,14 @@ def json_of(response: httpx.Response) -> dict[str, Any]:
 
 
 def turn_records(caplog: pytest.LogCaptureFixture) -> list[dict[str, str]]:
-    """The `field=value` pairs of every turn record in a capture."""
+    """The `field=value` pairs of every turn record in a capture.
+
+    The value class is `\\S*` and not `\\S+`: `model=` is EMPTY on the two paths where no
+    model was asked anything, and a parser that cannot see an empty value drops the key
+    -- which would hide exactly what those paths are for.
+    """
     return [
-        dict(re.findall(r"(\w+)=(\S+)", record.getMessage()))
+        dict(re.findall(r"(\w+)=(\S*)", record.getMessage()))
         for record in caplog.records
         if record.getMessage().startswith(TURN_PREFIX)
     ]
@@ -488,7 +576,7 @@ def serve_in_process(monkeypatch: pytest.MonkeyPatch, fake: FakeOpencode) -> Fak
 @pytest.fixture
 def telegram(monkeypatch: pytest.MonkeyPatch) -> Telegram:
     channel = Telegram()
-    for module in (core.permissions, core.brain, core.async_worker, main_module):
+    for module in TELEGRAM_SITES:
         monkeypatch.setattr(module, "send_message", channel)
     return channel
 
@@ -1041,6 +1129,47 @@ async def test_the_telegram_round_trip_answers_the_ask_it_raised_itself(served: 
     assert served.fake.answers() == ["once"]
 
 
+async def test_a_yes_typed_in_telegram_is_not_recorded_as_a_spoken_answer(
+    served: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """NEW-4, over the whole stack: the record says what actually happened.
+
+    Measured on the live run, every such turn logged
+    `turn route= path=voice model= agent= llm_ms=0 total_ms=35`. `path=voice` is the
+    vocabulary for "the user heard this spoken aloud" and a `да` typed in Telegram is
+    delivered as a MESSAGE -- Alice never speaks it, because `/tg/webhook` hands the
+    reply to `send_message` and returns `{"ok": true}`. So the record claimed aloud a
+    text nobody heard, on the one path the ledger is read for.
+    """
+    # Given: a warm session with a live stream and an ask the server raises
+    await served.warm()
+    session_id = next(iter(served.fake.sessions))
+    await served.fake.wait_for_stream()
+    served.fake.ask_permission(session_id, title="echo привет")
+    await served.telegram.wait_for(PERMISSION_QUESTION)
+    caplog.clear()
+    caplog.set_level(logging.INFO)
+    # When: the user answers in Telegram
+    await served.say_telegram("да")
+    # Then: the turn is recorded as the ANSWER to an ask -- not as a voice answer,
+    # and not as an escalation, because nothing moved to the agent
+    fields = turn_records(caplog)[-1]
+    assert fields["path"] == "permission"
+    assert fields["permission_asked"] == "True"
+    assert fields["escalated"] == "False"
+    # ... the route is the opencode session route that answered it, and no model is
+    # named, because no model was asked anything on this turn at all
+    assert fields["route"] == "opencode"
+    assert fields["model"] == ""
+    assert int(fields["llm_ms"]) == 0
+    assert int(fields["msgs"]) == 0
+    assert fields["tools"] == "()"
+    # ... and the answer is delivered as a message, which is what `voice` denied
+    assert any(APPROVED_TEXT in message for message in served.telegram.messages)
+    # ... while the approval itself still reaches the server exactly once
+    assert served.fake.answers() == ["once"]
+
+
 # ---------------------------------------------------------------------------
 # 6. Lifecycle: start, stop, start again
 # ---------------------------------------------------------------------------
@@ -1268,8 +1397,6 @@ async def test_the_root_route_names_the_routes_that_exist(stack: Stack) -> None:
 
 async def test_the_app_package_never_manages_the_server_process() -> None:
     # Given every module of the ASGI application, parsed rather than grepped
-    import ast
-
     sources = {
         path.name: path.read_text(encoding="utf-8")
         for path in Path(main_module.__file__).parent.glob("*.py")
@@ -1288,6 +1415,156 @@ async def test_the_app_package_never_manages_the_server_process() -> None:
     # killing one would put a live server's lifetime inside a webhook's lifetime
     assert not forbidden, f"{sorted(forbidden)} in {sorted(sources)}"
     assert not [name for name, text in sources.items() if "subprocess" in text]
+
+
+# ---------------------------------------------------------------------------
+# 9b. The Telegram double covers every module that binds the sender
+# ---------------------------------------------------------------------------
+
+
+def patched_site_paths() -> set[str]:
+    """`TELEGRAM_SITES` as repo-relative paths -- the same shape `telegram_sites` returns."""
+    return {
+        Path(str(module.__file__)).resolve().relative_to(REPO_ROOT).as_posix()
+        for module in TELEGRAM_SITES
+    }
+
+
+def test_the_telegram_double_patches_every_import_site_the_shipped_code_has() -> None:
+    # Given: the modules the `telegram` fixture replaces, named once
+    patched = patched_site_paths()
+    # When: the shipped source is parsed for every module that binds the sender
+    shipped = telegram_sites(REPO_ROOT)
+    # Then the two are the SAME set -- so a sixth `from core.tools.telegram_tool
+    # import send_message` is a red test, not a live call to api.telegram.org
+    assert patched, "the fixture patches nothing, so it is not guarding anything"
+    assert shipped == patched, f"unpatched: {sorted(shipped - patched)}; stale: {sorted(patched - shipped)}"
+    # ... and the site the F1 parked-refusal message travels is one of them, because
+    # that is the one the four-site list was missing
+    assert "core/session_collector.py" in patched
+
+
+@pytest.mark.parametrize(
+    ("statement", "expected"),
+    (
+        pytest.param(
+            "from core.tools.telegram_tool import send_message", 1, id="from-the-sender"
+        ),
+        pytest.param("from core.tools import telegram_tool", 1, id="attribute-access"),
+        pytest.param("import core.tools.telegram_tool", 1, id="dotted-import"),
+        pytest.param("from core.tools.telegram_tool import other_name", 0, id="another-name"),
+        pytest.param("# from core.tools.telegram_tool import send_message", 0, id="a-comment"),
+        pytest.param('"""mentions core.tools.telegram_tool"""', 0, id="prose"),
+    ),
+)
+def test_the_site_checker_sees_every_spelling_of_the_import(
+    tmp_path: Path, statement: str, expected: int
+) -> None:
+    """The guard has to catch the three ways to bind the channel, and only those.
+
+    A checker that matched one spelling would be as false as the four-site list it
+    replaces -- a refactor from `from ... import send_message` to
+    `from core.tools import telegram_tool` reaches the same network call and would
+    sail past a guard that only knew the first. The three zero cases are the other
+    half: prose and a different name are not sites, and a guard that reported them
+    would be one nobody could keep switched on.
+    """
+    (tmp_path / "core").mkdir()
+    (tmp_path / "core" / "module.py").write_text(f"{statement}\n", encoding="utf-8")
+    assert len(telegram_sites(tmp_path)) == expected
+
+
+def test_the_site_checker_reports_a_site_the_double_does_not_patch(tmp_path: Path) -> None:
+    # Given: a tree shaped like the repository, plus one module that binds the sender
+    for relative in patched_site_paths():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("from core.tools.telegram_tool import send_message\n", encoding="utf-8")
+    newcomer = tmp_path / "core" / "brand_new_module.py"
+    newcomer.write_text(
+        "from core.tools.telegram_tool import send_message\n", encoding="utf-8"
+    )
+    # When/Then: the newcomer is named rather than missed, which is what fails
+    # `test_the_telegram_double_patches_every_import_site_the_shipped_code_has`
+    # the day a real module is added there
+    extra = telegram_sites(tmp_path) - patched_site_paths()
+    assert extra == {"core/brand_new_module.py"}
+    assert telegram_sites(tmp_path) != patched_site_paths()
+
+
+def test_the_only_site_outside_the_apps_packages_is_the_subprocess_shim() -> None:
+    # Given: every module of the repository that binds the sender, no filter
+    everywhere: set[str] = set()
+    for path in REPO_ROOT.rglob("*.py"):
+        if any(part in {".venv", "__pycache__", "db", ".git"} for part in path.parts):
+            continue
+        relative = path.relative_to(REPO_ROOT).as_posix()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            names: set[str] = set()
+            if isinstance(node, ast.ImportFrom) and node.module == SENDER_MODULE:
+                names = {alias.asname or alias.name for alias in node.names}
+            elif isinstance(node, ast.Import):
+                names = {alias.name for alias in node.names}
+            if "send_message" in names or SENDER_MODULE in names:
+                everywhere.add(relative)
+    # Then the one the exclusion names is the one that exists: a second site
+    # outside `app/` and `core/` would be a module this fixture cannot patch and
+    # this file's scope would have to grow to cover
+    outside = everywhere - telegram_sites(REPO_ROOT)
+    assert outside == {SUBPROCESS_SHIM}, sorted(outside)
+
+
+def test_the_double_is_the_sender_in_every_module_the_fixture_names(
+    telegram: Telegram,
+) -> None:
+    # Given/When: the `telegram` fixture has replaced the sender everywhere it names
+    # Then: every one of those modules now calls the double, not the network
+    assert TELEGRAM_SITES, "the fixture names no module, so it is not guarding anything"
+    for module in TELEGRAM_SITES:
+        assert module.send_message is telegram, f"{module.__name__} still holds the real sender"
+
+
+async def test_a_parked_session_refuses_the_question_in_the_users_own_chat(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """F1 over the whole stack: the refusal is DELIVERED, and the record says why.
+
+    The refusal reaches Telegram through `/tg/webhook`'s own send, which is the site
+    that carries it for a Telegram user -- `SessionCollector._say` carries the same
+    text on the paths where the park appears after the route's own check, and
+    `test_the_double_is_the_sender_in_every_module_the_fixture_names` is what keeps
+    that one honest. What is asserted here is the user-visible outcome and the
+    record beside it, because a refusal nobody receives is the defect F1 replaced.
+    """
+    # Given: a warm session with an ask of ours still unanswered
+    memory: Memory = stack.app.state.memory
+    session_id = await stack.app.state.route.wiring.store.resolve(APP_ID)
+    await stack.warm()
+    stack.fake.turns.clear()
+    await memory.set_pending(
+        APP_ID,
+        {
+            "kind": "opencode_permission",
+            "session_id": session_id,
+            "permission_id": "perm_parked",
+            "title": "echo привет",
+            "always": ["echo *"],
+            "requested_at": time.time(),
+        },
+    )
+    caplog.set_level(logging.INFO)
+    # When: the user asks something else, in the channel that can be answered
+    await stack.say_telegram(QUESTION)
+    # Then: nothing was submitted into the session the server calls busy ...
+    assert [turn for turn in stack.fake.turns if turn.submitted] == []
+    # ... the refusal reached the user's own chat ...
+    assert any("Не выполнил" in message for message in stack.telegram.messages)
+    # ... and the record says the turn was refused because of an ask, not answered
+    fields = turn_records(caplog)[-1]
+    assert fields["path"] == "parked"
+    assert fields["permission_asked"] == "True"
+    assert fields["model"] == ""
+    assert fields["escalated"] == "False"
 
 
 # ---------------------------------------------------------------------------
