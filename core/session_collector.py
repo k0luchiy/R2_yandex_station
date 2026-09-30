@@ -127,14 +127,15 @@ PARKED: Final = (
     "спросите ещё раз."
 )
 #: What the user is told when a turn is NOT submitted because the SERVER reports this
-#: session `busy` -- which is a different fact from the park above, and not one this
-#: process can name a cause for. It has to say so anyway, for the same reason: the
-#: promise it replaces is «Проверяю, пришлю в телеграм», and nothing is going to be sent.
-#: Measured at 15 refusals out of 15 (`qa/live-run-v12.md`).
+#: session `busy`. The session is keyed on the USER (`OcSessionStore.resolve`), so what
+#: occupies it is the user's OWN previous turn: submitted, still running, and already
+#: armed with a collector that delivers its answer to Telegram. Nothing is lost and
+#: there is something to wait for, so the wording must say both -- and it must not name
+#: the component that reported `busy`, which is ours and not the user's business.
 BUSY_REFUSED: Final = (
-    "Не выполнил: сессия сейчас занята — opencode не обслуживает ход, отправленный в "
-    "занятую сессию, а чем она занята, сервер не говорит. Ничего не отправлено и ждать "
-    "нечего. Спросите ещё раз через минуту."
+    "Не выполнил: предыдущая задача ещё выполняется, и сессия не берёт новых, пока та "
+    "не закончится. Её ответ придёт в телеграм — там ничего не теряется. Спросите ещё "
+    "раз после него."
 )
 
 
