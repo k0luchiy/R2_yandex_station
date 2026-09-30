@@ -177,6 +177,14 @@ class SessionRoute:
             # 3.2s and the agent saw none of them. The record stays a `deadline`,
             # because the turn that outran the budget was the voice turn and
             # `llm_ms` is its cost.
+            #
+            # It stays a `deadline` even when the hand-over below is about to decline
+            # on a park, and that was tried and reverted: `parked` means "refused
+            # BEFORE reaching a model", and this turn did reach one -- the voice turn
+            # was submitted and simply did not answer in time. The declining hand-over
+            # is the collector's event, told to the user in Telegram, not this turn's.
+            # `test_a_voice_turn_that_outran_the_budget_on_a_permission_ask_says_so`
+            # is what caught it.
             rec.answered(route=metrics.ROUTE_OPENCODE, model=wiring.spec.fast_model, msgs=1, tools=())
             rec.path = metrics.PATH_DEADLINE
             # The one place an ask can appear while THIS turn is in flight. The voice
