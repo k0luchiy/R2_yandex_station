@@ -352,13 +352,13 @@ pip install -r requirements.txt
 cp .env.example .env
 # заполнить .env (шаг 5)
 
-.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099
+.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080
 ```
 
 Проверка:
 
 ```bash
-curl http://127.0.0.1:8099/health
+curl http://127.0.0.1:8080/health
 # {"status":"ok","opencode":{"reachable":true,"version":"1.18.32"},"sessions":0,"chain":["zen","yandexgpt","openrouter"]}
 ```
 
@@ -369,7 +369,7 @@ curl http://127.0.0.1:8099/health
 Проверка webhook без туннеля (пример из [04-alice-protocol.md](04-alice-protocol.md)):
 
 ```bash
-curl -X POST http://127.0.0.1:8099/webhook -H "Content-Type: application/json" -d '{
+curl -X POST http://127.0.0.1:8080/webhook -H "Content-Type: application/json" -d '{
   "meta": {"locale":"ru-RU","interfaces":{}},
   "request": {"type":"SimpleUtterance","command":"привет"},
   "session": {
@@ -393,7 +393,7 @@ curl -u opencode:"$R2D2_OC_PASSWORD" http://127.0.0.1:4599/config/providers
 ### Вариант А: быстрый туннель (для теста, URL меняется)
 
 ```bash
-cloudflared tunnel --url http://127.0.0.1:8099
+cloudflared tunnel --url http://127.0.0.1:8080
 # → https://<random>.trycloudflare.com  (нужен каждый раз заново)
 ```
 
@@ -412,7 +412,7 @@ tunnel: <TUNNEL_ID>
 credentials-file: /home/<user>/.cloudflared/<TUNNEL_ID>.json
 ingress:
   - hostname: r2d2.example.com
-    service: http://127.0.0.1:8099
+    service: http://127.0.0.1:8080
   - service: http_status:404
 ```
 
@@ -444,7 +444,7 @@ Requires=r2d2-opencode.service
 
 [Service]
 WorkingDirectory=/home/<user>/R2_yandex_station
-ExecStart=/home/<user>/R2_yandex_station/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8099
+ExecStart=/home/<user>/R2_yandex_station/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8080
 Restart=always
 
 [Install]
@@ -501,7 +501,7 @@ R2D2_ALLOW_UNAUTHENTICATED=
 
 # --- прочее ---
 SERVER_HOST=127.0.0.1
-SERVER_PORT=8099
+SERVER_PORT=8080
 DB_PATH=db/sessions.db
 SHELL_ENABLED=true
 SHELL_TIMEOUT_SECONDS=10
@@ -572,7 +572,7 @@ R2D2_TG_APPLICATION_ID=123456789=aa11...9900,987654321=ff00ee11-dd22-cc33-bb44-a
 Проверка:
 
 ```bash
-curl http://127.0.0.1:8099/diagnostics/providers | python3 -m json.tool | grep -A3 telegram
+curl http://127.0.0.1:8080/diagnostics/providers | python3 -m json.tool | grep -A3 telegram
 # "telegram": {"declared": true, "variable": "R2D2_TG_APPLICATION_ID",
 #              "format": "chat_id=application_id"}
 ```

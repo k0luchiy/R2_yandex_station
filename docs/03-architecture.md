@@ -11,7 +11,7 @@
         ▼
 cloudflared tunnel (постоянный публичный URL: https://r2d2.<...>.trycloudflare.com или свой домен)
         ▼
-uvicorn (FastAPI, локально на ноутбуке, порт 8099)
+uvicorn (FastAPI, локально на ноутбуке, порт 8080)
         │
         ▼
 ┌────────────────────────────────────────────────────────────┐
@@ -278,7 +278,7 @@ ALICE_USER_ID=...                  # твой session.user.user_id (whitelist)
 
 # Сервер
 SERVER_HOST=0.0.0.0
-SERVER_PORT=8099
+SERVER_PORT=8080
 ```
 
 > `LLM_PROVIDER` и `FALLBACK_PROVIDER` больше не управляют выбором: порядок
@@ -288,5 +288,5 @@ SERVER_PORT=8099
 
 ```bash
 systemctl --user enable --now r2d2-opencode    # сервер opencode
-.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8099
+.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8080
 ```
