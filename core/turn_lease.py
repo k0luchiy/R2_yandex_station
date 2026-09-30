@@ -47,7 +47,7 @@ bind it to the older turn and make it give up on an answer nobody else collects.
 What ends the lease is not the next question -- questions are context -- but the next
 message carrying a task after the binding.
 
-allow: SIZE_OK -- 277 pure LOC. The three window rules, the measured failure behind
+allow: SIZE_OK -- 295 pure LOC. The three window rules, the measured failure behind
 each, and the direction the project chose are the documentation the next change needs;
 splitting the module would separate a rule from the failure that justifies it.
 """
@@ -68,6 +68,7 @@ __all__ = [
     "assistant_text",
     "newer_task",
     "own_text",
+    "window_after",
 ]
 
 #: The one role that asks (`GET /session/:id/message`, finding C7). A turn begins with
@@ -184,13 +185,33 @@ def assistant_text(records: Sequence[MessageRecord], since_message_id: str) -> s
     `docs/07-latency-strategy.md` already chose for every other bounded loss here: an
     answer that never arrives and says so, rather than one that arrives and is wrong.
     """
-    ids = [record.id for record in records]
-    if since_message_id and since_message_id not in ids:
-        return ""
-    start = ids.index(since_message_id) + 1 if since_message_id else 0
     return "\n".join(
-        record.text for record in records[start:] if record.role == ASSISTANT_ROLE and record.text
+        record.text
+        for record in window_after(records, since_message_id)
+        if record.role == ASSISTANT_ROLE and record.text
     )
+
+
+def window_after(
+    records: Sequence[MessageRecord], since_message_id: str
+) -> list[MessageRecord]:
+    """The records newer than `since_message_id`, under `assistant_text`'s three cases.
+
+    One definition of "the window", shared by the reader that produces the answer and
+    the ledger that decides whether it was already sent. They were once the same
+    boundary computed twice, and the copy the ledger used covered the **whole
+    session**: a lease whose window had merely not grown yet saw every assistant id
+    belonging to earlier turns, found them all already claimed, and abandoned the
+    turn without sending anything. Measured: the collector is armed before the
+    submit, so that race is the normal case under load, not an exotic one
+    (`qa/live-run-v11.md`). `test_a_stale_window_is_not_an_already_delivered_one` pins it.
+    """
+    if not since_message_id:
+        return list(records)
+    ids = [record.id for record in records]
+    if since_message_id not in ids:
+        return []
+    return list(records[ids.index(since_message_id) + 1 :])
 
 
 def own_text(
@@ -305,7 +326,7 @@ class TurnLease:
         nothing of its own -- or a window whose every answer was already
         delivered from this process.
         """
-        if self._delivered.already_delivered(session_id, records):
+        if self._delivered.already_delivered(session_id, window_after(records, self._anchor)):
             raise TurnSuperseded(
                 f"opencode: every assistant message in the window of session {session_id!r} has "
                 f"already been delivered from this process, so a second collector would send the "

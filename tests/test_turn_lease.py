@@ -274,3 +274,47 @@ def test_claiming_an_empty_window_locks_out_nothing() -> None:
     delivered.claim("ses_1", [])
     # When/Then it cannot lock out the collector that actually has the answer
     assert delivered.already_delivered("ses_1", [rec("a1", "assistant", "Готово")]) is False
+
+
+def test_a_stale_window_is_not_an_already_delivered_one() -> None:
+    """A window that has not grown yet is not a window that is finished.
+
+    Measured, not reasoned: a live full-suite run under load lost the answer to
+    every escalated turn. The collector is armed *before* the submit, so its
+    first poll routinely lands before the server has written anything, and the
+    window holds only the previous turns' assistant messages -- every one of them
+    already claimed. `already_delivered` was evaluated over the whole session, so
+    it read "not grown yet" as "already sent", raised `TurnSuperseded`, and the
+    worker sent nothing at all. Silent loss, not a slow delivery.
+
+    The `bool(ids)` guard did not help: the window here is not empty, it is
+    *stale*, and that is the case the guard does not cover.
+    """
+    # Given a previous collector that claimed the whole session, as the backend does
+    delivered = DeliveryLedger()
+    previous = [rec("a1", "assistant", "Понедельник."), rec("a2", "assistant", "Потом.")]
+    delivered.claim("ses_1", previous)
+    # And this turn's lease, anchored at the newest of them
+    lease = TurnLease("a2", TASK_N, delivered)
+    # When the first poll lands before the server has written this turn's answer:
+    # only the user's own message has appeared
+    records = [*previous, rec("a3", "user", "Сводка статей с arxiv")]
+    # Then the turn is NOT abandoned -- it reads as not ready, which is true
+    assert lease.read("ses_1", records) == ""
+    # ... and once the answer does arrive, the same lease delivers it
+    answered = [*records, rec("a4", "assistant", "Сводка готова.")]
+    assert lease.read("ses_1", answered) == "Сводка готова."
+
+
+def test_a_twin_still_cannot_deliver_the_same_answer_twice() -> None:
+    """The guard the fix had to keep: a second lease on the same window refuses.
+
+    Without this, "not grown yet" and "already sent" would be indistinguishable
+    in the other direction, and the same answer would reach the user twice.
+    """
+    delivered = DeliveryLedger()
+    window = [rec("a1", "assistant", "Сводка готова.")]
+    delivered.claim("ses_1", window)
+    twin = TurnLease("", TASK_N, delivered)
+    with pytest.raises(TurnSuperseded):
+        twin.read("ses_1", window)
