@@ -179,7 +179,7 @@ jobs:
           python-version: "3.13"
       - run: pip install -e ".[dev]"
       # ADVISORY, deliberately non-blocking, and the number is the point.
-      # mypy reports 44 findings over app/ core/ opencode/ today: 23 are
+      # mypy reports 41 findings over app/ core/ opencode/ today: 23 are
       # `union-attr` on a `Connection | None` in core/memory.py that no
       # annotation narrows, 6 are `valid-type` on dataclass-shaped callables
       # used as types, 6 `arg-type` and 3 `assignment` in the two config
@@ -190,11 +190,26 @@ jobs:
       # making this step blocking would mean shipping a permanently red build --
       # which is worse than no CI, because a red badge is a badge people learn
       # to ignore. What this step buys instead is a number that is recorded on
-      # every run and printed next to the 44 it had before, so the count
-      # cannot quietly grow. Promote it to blocking when the ledger is empty.
+      # every run, printed next to the baseline, and ENFORCED not to grow: the
+      # gate below is blocking, so a change that adds findings goes red even
+      # though the findings themselves do not. Promote mypy to blocking when
+      # the ledger is empty; until then only the direction is enforced.
       - name: mypy
         continue-on-error: true
-        run: mypy --no-error-summary 2>&1 | tee mypy.log; echo "--- $(grep -c 'error:' mypy.log || true) findings (baseline 44) ---"
+        run: mypy --no-error-summary 2>&1 | tee mypy.log || true
+      - name: mypy findings have not grown
+        run: |
+          baseline=41
+          count=$(grep -c 'error:' mypy.log || true)
+          echo "--- ${count} findings (baseline ${baseline}) ---"
+          if [ "$count" -gt "$baseline" ]; then
+            echo "::error::mypy findings grew from ${baseline} to ${count}." \
+                 "New type errors are not advisory. Fix them, or, if they are" \
+                 "pre-existing and outside this change's scope, say so in the PR." \
+                 "Lowering the baseline to make this pass is the one thing that" \
+                 "must not be done here: the number is the guard."
+            exit 1
+          fi
 
   packaging:
     name: pyproject · fresh venv

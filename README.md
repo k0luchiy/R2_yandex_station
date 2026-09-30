@@ -278,16 +278,20 @@ so the task can be collected before it runs. The action happened and the user wa
 told nothing, with nothing in the logs to say why. Every other `create_task` in
 the project kept its task; this was the one that did not, and it now does.
 
-**The type checker is advisory, and says so.** `mypy` reports **43** findings
+**The type checker is advisory, and says so.** `mypy` reports **41** findings
 over `app/`, `core/` and `opencode/`: 23 `union-attr` on a `Connection | None`
-in `core/memory.py` that no annotation narrows, 8 `valid-type` on
+in `core/memory.py` that no annotation narrows, 6 `valid-type` on
 dataclass-shaped callables used as types, 6 `arg-type` and 3 `assignment` from
-the two config loaders coercing env strings, 1 `name-defined` (the un-imported
-`Mapping` named above), and 6 smaller ones. Every one of them is in a file this
-change was not allowed to edit, so the CI step is `continue-on-error` and prints
-the count next to the 46 it had before. A permanently red badge is worse than no
-badge, because people learn to ignore red; this way the number cannot quietly
-grow. Promote the step to blocking when the ledger is empty.
+the two config loaders coercing env strings, 4 `misc`, 1 `name-defined` (the
+un-imported `Mapping` named above) and 1 `func-returns-value`. Every one of them
+is in a file this change was not allowed to edit, so the `mypy` step itself is
+`continue-on-error` and prints its breakdown on every run. A permanently red
+badge is worse than no badge, because people learn to ignore red — so the
+findings do not fail the build, but a **separate blocking step does compare the
+count against a baseline of 41 and fails if it grew.** That is what "cannot
+quietly grow" has to mean to be worth saying: an advisory number nobody acts on
+is a number that can rot, and this one already had. Promote `mypy` to blocking
+when the ledger is empty.
 
 **mypy needed an interpreter, not just an environment.** The first run reported
 `Cannot find implementation or library stub for module named "httpx"` for every
