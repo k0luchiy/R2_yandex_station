@@ -1,6 +1,6 @@
 """One opencode session per R2D2 user, behind the ordinary `Backend` protocol.
 
-The brain has two jobs -- answer a voice question inside 3.2 s, and get real work
+The brain has two jobs -- answer a voice question inside 3.3 s, and get real work
 done -- and opencode offers both through the same persistent session. This module
 is the seam that lets `core/brain.py` keep calling ONE interface: `complete()` is
 the fast voice turn, `submit_task()` is the agent turn, and the protocol signature
@@ -167,7 +167,7 @@ class OpencodeSessionBackend:
         """The voice turn for the current application, in the user's own session.
 
         `timeout` IS the deadline the caller wants -- todo 15 passes
-        `cfg.r2d2_fast_deadline`, measured at 3.2 s inside Alice's 4.5 s budget --
+        `cfg.r2d2_fast_deadline`, set at 3.3 s inside Alice's 4.5 s budget --
         so this does not second-guess it with a private default. `tools`,
         `max_tokens` and `temperature` are accepted and ignored (see the module
         docstring); `model` overrides the configured `fast_model` for one call.

@@ -174,7 +174,7 @@ class SessionRoute:
             # nobody can know whether the late voice turn will answer or ask for the
             # agent -- and guessing that it will is what dropped every request that
             # ran long: on the live run six laptop-control attempts all overran
-            # 3.2s and the agent saw none of them. The record stays a `deadline`,
+            # the deadline and the agent saw none of them. The record stays a `deadline`,
             # because the turn that outran the budget was the voice turn and
             # `llm_ms` is its cost.
             #

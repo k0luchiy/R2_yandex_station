@@ -77,8 +77,8 @@ log = logging.getLogger(__name__)
 HEALTH_TIMEOUT_S: Final = 1.5
 
 #: Reading the provider catalogue is also not a voice turn, and for the same reason
-#: it must not borrow the voice deadline. It was borrowing `spec.timeout` -- 3.2 s --
-#: which is the answer to "how long may I wait to speak", and a cold `opencode serve`
+#: it must not borrow the voice deadline. It was borrowing `spec.timeout` -- 3.2 s at the
+#: time, which is the answer to "how long may I wait to speak" -- and a cold `opencode serve`
 #: does not enumerate its providers that fast. Measured on a server started 36 s
 #: earlier: `GET /config/providers` was accepted and did not answer inside 3.2 s, so
 #: startup logged `catalogue-unreadable`, left the brain route UNWIRED, and every

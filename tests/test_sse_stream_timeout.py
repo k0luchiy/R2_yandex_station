@@ -8,13 +8,13 @@ timeout whose mock body stays silent for **0.6 s** still receives its frame
 for was therefore invisible to the whole suite, and stayed invisible through a
 live end-to-end run that missed 7 of 7 `permission.asked` events:
 
-* `spec.timeout` is the **voice** deadline (`3.2 s` in `config/backends.json`,
+* `spec.timeout` is the **voice** deadline (`3.3 s` in `config/backends.json`,
   `R2D2_FAST_DEADLINE`). It is right for `POST /session/:id/message` and wrong
   for a socket that is meant to stay open for the life of the process.
 * opencode 1.18.32's `server.heartbeat` interval was measured live at **10.0 s**
   (`docs/11-opencode-contract.md` U4, gaps `[10.0, 10.0]`). A reader whose read
-  bound is 3.2 s cannot survive to the next heartbeat, so it walks a
-  `3.2 s connect / 5 s sleep` ladder and is blind for most of every window.
+  bound is 3.3 s cannot survive to the next heartbeat, so it walks a
+  `3.3 s connect / 5 s sleep` ladder and is blind for most of every window.
 * The consequence is not degraded liveness, it is a **dead permission broker**:
   the ask is the one event that must not be missed, and it is exactly the one
   that arrives inside a heartbeat gap.
@@ -72,7 +72,7 @@ PASSWORD: Final = "R2D2_OC_PASSWORD_VALUE"
 
 #: The gap between `server.connected` and the ask. It is deliberately a little
 #: LONGER than the shipped voice deadline, because that is the whole defect: a
-#: reader that cannot stay quiet for 3.2 s is disconnected for every ask that
+#: reader that cannot stay quiet for 3.3 s is disconnected for every ask that
 #: arrives in a heartbeat gap. The measured opencode heartbeat is 10.0 s, so a
 #: real ask lands even deeper into a gap than this one does.
 SILENCE_S: Final = 3.6
@@ -293,7 +293,7 @@ async def test_the_reader_keeps_its_connection_through_a_silence_the_voice_deadl
     """D1, the whole defect in one test.
 
     Connection 1 sends `server.connected` and then says nothing for `SILENCE_S`
-    (3.6 s, longer than the shipped 3.2 s voice deadline) before the ask. Every
+    (3.6 s, longer than the shipped 3.3 s voice deadline) before the ask. Every
     later connection sends `server.connected` and then nothing for ever, which is
     what the live run saw: the reader kept reconnecting, and the ask was already
     gone.
@@ -325,7 +325,7 @@ async def test_the_two_bounds_are_independent_rather_than_one_number_saying_it_t
 ) -> None:
     """The same behaviour at a scale a test can afford, which is the real claim.
 
-    D1 was never "3.2 is too small", it was "one value is doing two jobs". So this
+    D1 was never "3.3 is too small", it was "one value is doing two jobs". So this
     test declares BOTH numbers in a config of its own and reads them back through
     the loader: a request deadline of **0.3 s** and a stream read bound of **2.0 s**,
     with the ask 0.9 s in. A reader that reads the stream with the request deadline
@@ -428,7 +428,7 @@ def test_the_shipped_config_separates_the_two_bounds_and_leaves_the_others_alone
     # When
     opencode = specs["opencode"]
     # Then: the voice deadline is untouched, and the stream has a bound of its own
-    assert opencode.timeout == 3.2
+    assert opencode.timeout == 3.3
     assert opencode.event_read_timeout == 30.0
     assert opencode.event_read_timeout > opencode.timeout
     assert declared["opencode"]["event_read_timeout"] == 30.0

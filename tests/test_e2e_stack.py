@@ -278,7 +278,7 @@ def registry_json(base_url: str) -> str:
                     "fast_model": MODEL,
                     "task_model": MODEL,
                     "summarize_model": MODEL,
-                    "timeout": 3.2,
+                    "timeout": 3.3,
                 },
                 {
                     "name": "zen",

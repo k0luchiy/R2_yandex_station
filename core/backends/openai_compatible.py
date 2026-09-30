@@ -64,7 +64,7 @@ log = logging.getLogger(__name__)
 #: 400/401/403/404/500 are verdicts, not weather.
 RETRY_STATUSES: Final[frozenset[int]] = frozenset({429, 502, 503})
 #: One retry, one pause: long enough to outlast the first burst of a throttling
-#: window, short enough to stay inside the 3.2 s voice budget.
+#: window, short enough to stay inside the 3.3 s voice budget.
 RETRY_BACKOFF_S: Final = 0.4
 MAX_ATTEMPTS: Final = 2
 BODY_EXCERPT_CHARS: Final = 240

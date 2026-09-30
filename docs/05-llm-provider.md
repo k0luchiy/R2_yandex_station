@@ -18,7 +18,7 @@
      "username": "${R2D2_OC_USERNAME}", "password": "${R2D2_OC_PASSWORD}",
      "voice_agent": "r2d2-voice", "task_agent": "r2d2-agent",
      "fast_model": "opencode/space-bunny-free", "task_model": "opencode/space-bunny-free",
-     "summarize_model": "opencode/space-bunny-free", "timeout": 3.2},
+     "summarize_model": "opencode/space-bunny-free", "timeout": 3.3},
     {"name": "zen", "kind": "openai_compatible", "base_url": "https://opencode.ai/zen/v1",
      "api_key": "${R2D2_ZEN_KEY}", "model": "space-bunny-free", "auth_style": "bearer"},
     {"name": "openrouter", "kind": "openai_compatible", "base_url": "https://openrouter.ai/api/v1",
@@ -102,7 +102,7 @@
 * **свободный идентификатор исчезает без предупреждения** — так и случилось с
   предыдущим;
 * **длинный ответ в голосовой бюджет не помещается**: короткий вопрос
-  0,84–1,85 с — влезает в `r2d2_fast_deadline` = 3,2 с, а сводка на 1200 токенов
+  0,84–1,85 с — влезает в `r2d2_fast_deadline` = 3,3 с, а сводка на 1200 токенов
   (4,0–4,4 с) уже нет. Фолбэк годится для короткого ответа и не годится для
   длинного.
 
@@ -246,4 +246,4 @@ Tools передаются в OpenAI-совместимом формате:
 | Голосовой ход в сессии (p50 1.667 с, p95 2.247 с) | 0.5–2.3 с |
 | Холодная сессия (первый ход) | 15.5–18.6 с — всегда в фоне |
 | Исполнение быстрого инструмента | 0.05–0.5 с |
-| **Итого от нас на голосовом пути** | **< 3.2 с** |
+| **Итого от нас на голосовом пути** | **< 3.3 с** |

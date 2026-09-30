@@ -4,7 +4,7 @@ voice turn that outran it still writing?
 `core/session_route.py` gives up on a voice turn at `r2d2_fast_deadline` and
 acknowledges the user. The turn is not aborted -- it keeps running server-side -- and
 the work still has to reach `r2d2-agent` (D5: on the live run six laptop-control
-attempts all outran 3.2 s and the agent saw none of them, so the requests existed
+attempts all outran the voice deadline and the agent saw none of them, so the requests existed
 nowhere at all). Submitting that work **immediately** is what put two turns in one
 session at once, and the live run measured what that costs (`qa/live-run-v6.md` §D9):
 the sweep could not see a message the voice turn had not written yet, so the residue

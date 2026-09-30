@@ -102,7 +102,16 @@ class Config:
 
     # --- opencode-backed brain (see .omo/plans/opencode-brain.md, todo 2) ---
     backends_path: str = "config/backends.json"
-    r2d2_fast_deadline: float = 3.2
+    #: The voice deadline, shipped at the project's own formula `min(3.6, 4.5 - 1.2)`
+    #: = 3.3 s rather than at a hand-picked round number. It was 3.2 -- a round-down of
+    #: the same formula -- and 3.2 was never measured: it came from p50 1.667 s / p95
+    #: 2.247 s on opencode 1.18.32, and on 1.18.33 the same machine and model gave
+    #: eleven voice turns of `2977 3132 3230 3236 3243 3244 3246 3249 3256 3274
+    #: 3284` ms, of which NINE ran past 3.2 s and TEN fit inside 3.3 s. 3.6 would win
+    #: one more and still leave only 0.9 s against Alice's hard 4.5 s.
+    #: `test_the_shipped_deadline_is_the_formula_and_not_a_rounded_down_literal` is what
+    #: holds the number to the arithmetic rather than to this comment.
+    r2d2_fast_deadline: float = 3.3
     r2d2_task_ack: str = "Проверяю, пришлю в телеграм."
     r2d2_needs_agent_sentinel: str = "[[NEEDS_AGENT]]"
     r2d2_voice_agent: str = "r2d2-voice"

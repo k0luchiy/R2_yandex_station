@@ -1,6 +1,6 @@
 """Tests for the config-driven backend registry loader (plan todo 2).
 
-allow: SIZE_OK -- 392 pure LOC, 63 tests. Every test file in this repo is
+allow: SIZE_OK -- 422 pure LOC, 64 tests. Every test file in this repo is
 257-991 pure LOC and a test module grows with the number of behaviours it pins;
 splitting the loader's happy path from its typed-error table would give each
 half a file that cannot say what the other half accepts.
@@ -63,9 +63,23 @@ SPEC_FIELDS = (
     "extra",
 )
 
+#: The arithmetic behind the shipped voice deadline, named so a test can hold the
+#: number to it instead of to itself: Alice's own timeout, less the reserve the
+#: plan keeps for the network and for delivering the answer, and never more than
+#: the cap -- so no configuration can spend Alice's whole budget on one turn.
+ALICE_TIMEOUT_S = 4.5
+RESERVED_FOR_ALICE_S = 1.2
+DEADLINE_CAP_S = 3.6
+
+
+def formula_deadline() -> float:
+    """The project's planned voice deadline, as arithmetic rather than a constant."""
+    return min(DEADLINE_CAP_S, ALICE_TIMEOUT_S - RESERVED_FOR_ALICE_S)
+
+
 CONFIG_FIELDS = (
     ("backends_path", "config/backends.json"),
-    ("r2d2_fast_deadline", 3.2),
+    ("r2d2_fast_deadline", formula_deadline()),
     ("r2d2_task_ack", "Проверяю, пришлю в телеграм."),
     ("r2d2_needs_agent_sentinel", "[[NEEDS_AGENT]]"),
     ("r2d2_voice_agent", "r2d2-voice"),
@@ -150,7 +164,7 @@ def test_shipped_opencode_uses_the_only_working_zen_model(
     assert specs["opencode"].base_url == "http://127.0.0.1:4599"
     assert specs["opencode"].voice_agent == "r2d2-voice"
     assert specs["opencode"].task_agent == "r2d2-agent"
-    assert specs["opencode"].timeout == 3.2
+    assert specs["opencode"].timeout == 3.3
 
 
 def test_placeholder_expands_from_environ(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -288,6 +302,37 @@ def test_config_declares_new_field_with_documented_default(name: str, default: o
     # Then
     assert name in Config.__dataclass_fields__
     assert getattr(cfg, name) == default
+
+
+def test_the_shipped_deadline_is_the_formula_and_not_a_rounded_down_literal() -> None:
+    """3.3 s is `min(3.6, 4.5 - 1.2)`, and the arithmetic is what holds it there.
+
+    3.2 s shipped for a long time and was **never measured**: it is this same
+    formula rounded DOWN, reached from p50 1.667 s / p95 2.247 s measured on
+    opencode 1.18.32. On 1.18.33 the same machine and model gave eleven voice
+    turns of `2977 3132 3230 3236 3243 3244 3246 3249 3256 3274 3284` ms, of
+    which NINE ran past 3.2 s and TEN fit inside 3.3 s (`qa/live-run-v10.md`
+    § NEW-1). A literal assertion would have pinned the round-down just as
+    happily as the formula does, so the subject here is the arithmetic and the
+    shipped number is only its evidence.
+
+    The second half reads `.env.example`, because that is the file an operator
+    actually copies; a value changed in one place and not the other is the drift
+    this is here to catch, and the shipped number in `config/backends.json` is
+    pinned separately by `test_shipped_opencode_uses_the_only_working_zen_model`.
+    """
+    # Given / When
+    shipped = Config().r2d2_fast_deadline
+    # Then: the formula, evaluated rather than restated
+    assert shipped == formula_deadline()
+    assert shipped == 3.3
+    # And: the operator's own file agrees with the code default
+    example = {
+        line.split("=", 1)[0].strip(): line.split("=", 1)[1].strip()
+        for line in (REPO_ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+        if "=" in line and not line.strip().startswith("#")
+    }
+    assert float(example["R2D2_FAST_DEADLINE"]) == shipped
 
 
 def test_config_still_maps_uppercase_env_to_new_fields(monkeypatch: pytest.MonkeyPatch) -> None:

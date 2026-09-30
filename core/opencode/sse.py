@@ -6,10 +6,10 @@ nowhere else. Three things in this module are decisions, not plumbing:
 * **The stream has its own read bound, and it is not the voice deadline.** This was
   measured, not guessed: opencode 1.18.32 heartbeats every **10.0 s**
   (`docs/11-opencode-contract.md` U4, gaps `[10.0, 10.0]`), while the opencode
-  backend's `timeout` is **3.2 s** -- `R2D2_FAST_DEADLINE`, correct for
+  backend's `timeout` is **3.3 s** -- `R2D2_FAST_DEADLINE`, correct for
   `POST /session/:id/message` and wrong for a socket meant to stay open for the
   life of the process. A reader whose read timeout is the request deadline can
-  never survive to the next heartbeat: it walks a `3.2 s connect / 5 s sleep`
+  never survive to the next heartbeat: it walks a `3.3 s connect / 5 s sleep`
   ladder, is blind for most of every window, and misses `permission.asked` --
   which is the one event that must not be missed. So the client this module builds
   bounds CONNECTING, WRITING and POOLING by `spec.timeout` and READING by
@@ -233,7 +233,7 @@ class EventSource:
 
         Sharing a single number here is what made the reader blind: the read bound
         has to outlast a 10.0 s heartbeat, and the request deadline must not, because
-        a caller waiting on a turn has 3.2 s of Alice budget. httpx applies the read
+        a caller waiting on a turn has 3.3 s of Alice budget. httpx applies the read
         timeout per socket read, so one long bound is exactly the patience an idle
         stream needs and never a ceiling on the whole connection.
         """

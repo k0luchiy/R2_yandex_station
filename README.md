@@ -8,7 +8,7 @@ send you a message after the fact.
 
 ```
 "Alice, run skill R2D2"
-"R2, what are quantum dots"                     → spoken, when it fits the 3.2 s budget
+"R2, what are quantum dots"                     → spoken, when it fits the 3.3 s budget
 "R2, find papers about RAG and summarise them"   → "Checking, I'll send it to Telegram"
 "R2, send me the arxiv digest to Telegram"      → arrives minutes later, as a message
 ```
@@ -205,10 +205,11 @@ pointed at the port.
 Four ideas, in the order they matter:
 
 **Two paths, not one model.** Alice gives you 4.5 seconds and 1024 characters.
-A tool-less `r2d2-voice` agent answers inside `R2D2_FAST_DEADLINE` (3.2 s) and is
+A tool-less `r2d2-voice` agent answers inside `R2D2_FAST_DEADLINE` (3.3 s) and is
 *spoken* — and **whether it fits is measured, not promised**: p50 1.667 s on
-opencode 1.18.32, but 9 of 11 voice turns ran past 3.2 s on 1.18.33, so on that
-build an ordinary question is spoken roughly one time in three. See
+opencode 1.18.32, while on 1.18.33 nine of eleven voice turns ran past the 3.2 s
+this deadline used to ship, which is why it is now the plan's own
+`min(3.6, 4.5 − 1.2)` = 3.3 s — ten of those eleven land inside it. See
 [`docs/07-latency-strategy.md`](docs/07-latency-strategy.md) and
 [`qa/live-run-v10.md`](qa/live-run-v10.md) § NEW-1. If the request is real work,
 that agent emits a `[[NEEDS_AGENT]]` sentinel instead of an
@@ -224,7 +225,7 @@ the agent's, so a turn that escalates to the full agent keeps the context the
 voice agent built instead of starting over.
 
 **The latency budget is a design constraint, not an optimisation.** `4.5 s` is
-Alice's timeout; `3.2 s` is `R2D2_FAST_DEADLINE`; the SSE reader's read bound is
+Alice's timeout; `3.3 s` is `R2D2_FAST_DEADLINE`; the SSE reader's read bound is
 looser still, so a 10-second heartbeat cannot be mistaken for a dead connection.
 Every number is in `docs/07-latency-strategy.md` with the measurement behind it.
 
@@ -460,7 +461,7 @@ Telegram — потому что Алиса не умеет присылать �
 
 ```
 «Алиса, запусти навык Р2Д2»
-«Р2, что такое квантовые точки»            → голосом, если уложился в 3,2 с
+«Р2, что такое квантовые точки»            → голосом, если уложился в 3,3 с
 «Р2, открой браузер»                       → голосом, через r2d2_do
 «Р2, найди статьи про RAG и сделай сводку» → «Проверяю, пришлю в телеграм»
 «Р2, отправь в телеграм сводку статей с arxiv»
@@ -470,10 +471,10 @@ Telegram — потому что Алиса не умеет присылать �
 
 - **Протокол Алисы:** webhook + JSON, таймаут **4,5 с**, ответ ≤ **1024 символа**.
 - **Два пути, а не одна модель.** Голосовой агент без инструментов укладывается
-  в `R2D2_FAST_DEADLINE` (3,2 с) и отвечает голосом. **Укладывается ли он — это
+  в `R2D2_FAST_DEADLINE` (3,3 с) и отвечает голосом. **Укладывается ли он — это
   измерено, а не обещано:** на opencode 1.18.32 p50 1,667 с, а на 1.18.33 девять
-  голосовых ходов из одиннадцати вышли за 3,2 с, то есть на этой сборке обычный
-  вопрос произносится примерно в одном случае из трёх (см.
+  голосовых ходов из одиннадцати вышли за прежние 3,2 с, и потому дедлайн равен
+  формуле `min(3.6, 4.5 − 1.2)` = 3,3 с, в которую укладываются десять (см.
   [`qa/live-run-v10.md`](qa/live-run-v10.md) § NEW-1). Если задача настоящая,
   агент выдаёт маркер
   `[[NEEDS_AGENT]]`, ход уходит полноценному агенту, а результат — в Telegram.

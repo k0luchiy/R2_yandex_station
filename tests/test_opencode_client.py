@@ -274,7 +274,7 @@ def _spec(
     base_url: str = BASE_URL,
     username: str = "opencode",
     password: str = PASSWORD,
-    timeout: float = 3.2,
+    timeout: float = 3.3,
 ) -> BackendSpec:
     """The `opencode_session` spec shape a test varies, and nothing else."""
     return BackendSpec(
@@ -1330,11 +1330,11 @@ async def test_a_self_built_client_carries_the_configured_timeout(
 ) -> None:
     """Given no injected client: the one this client builds is bounded too."""
     # Given
-    client = OpencodeClient(_spec(timeout=3.2), directory=WORKSPACE)
+    client = OpencodeClient(_spec(timeout=3.3), directory=WORKSPACE)
     # When
     await client.health()
     # Then
-    assert [c.timeout for c in built_clients] == [httpx.Timeout(3.2)]
+    assert [c.timeout for c in built_clients] == [httpx.Timeout(3.3)]
 
 
 async def test_basic_auth_is_sent_when_both_username_and_password_are_present() -> None:

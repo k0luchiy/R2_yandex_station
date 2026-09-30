@@ -101,7 +101,7 @@ TELEGRAM_PREFIX: Final = "https://api.telegram.org/"
 #: `app/config.py` is a test failure rather than a silent drift.
 ACK: Final = Config().r2d2_task_ack
 SENTINEL: Final = Config().r2d2_needs_agent_sentinel
-SHIPPED_DEADLINE_S: Final = 3.2
+SHIPPED_DEADLINE_S: Final = 3.3
 SHIPPED_POLL_S: Final = 2.0
 
 APP: Final = "alice-app-1"
@@ -1749,7 +1749,7 @@ async def test_a_voice_turn_that_outran_the_budget_on_a_permission_ask_says_so(
     session_id = await rig.warm()
     rig.server.hang_turn = True
     # A deadline generous enough that one SQLite write inside it is not a coin flip:
-    # the shipped value is 3.2 s and this is the same field, read by the same code.
+    # the shipped value is 3.3 s and this is the same field, read by the same code.
     rig.cfg.r2d2_fast_deadline = 0.5
     broker = rig.brain.opencode.broker
     assert broker is not None
@@ -2248,7 +2248,7 @@ async def test_a_turn_that_outran_the_deadline_still_gives_the_agent_the_request
     assert rig.server.aborted == []
     # ... and the AGENT was given the user's own words anyway. Guessing that the
     # late turn will answer is what dropped the request on the floor: on the live
-    # run six laptop-control attempts all overran 3.2s and the agent never saw one
+    # run six laptop-control attempts all overran the voice deadline and the agent saw none
     # of them, so the work existed nowhere at all. The submit is off Alice's clock
     # now -- it waits for that voice turn to stop writing -- so the test waits for
     # the collector that proves it happened.

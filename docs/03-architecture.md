@@ -92,7 +92,7 @@ opencode/space-bunny-free через подписку opencode
   2. Ответ на ожидающее подтверждение opencode, если оно есть.
   3. Проверка живости opencode и **открытие сессии пользователя** (одна на всех,
      создаётся один раз, переиспользуется).
-  4. Голосовой ход: агент `r2d2-voice`, дедлайн `R2D2_FAST_DEADLINE` (3,2 с).
+  4. Голосовой ход: агент `r2d2-voice`, дедлайн `R2D2_FAST_DEADLINE` (3,3 с).
      Холодная сессия (0 сообщений) идёт сразу в агента — она стоит 15–19 с.
   5. Сентинел `[[NEEDS_AGENT]]` в ответе → эскалация: асинхронный ход агента
      `r2d2-agent` + подтверждение голосом, результат в Telegram.
@@ -252,7 +252,7 @@ R2D2_OC_USERNAME=opencode
 R2D2_OC_PASSWORD=<из .env.oc, никогда не коммитить>
 
 # Маршрут opencode
-R2D2_FAST_DEADLINE=3.2
+R2D2_FAST_DEADLINE=3.3
 R2D2_TASK_ACK=Проверяю, пришлю в телеграм.
 R2D2_NEEDS_AGENT_SENTINEL=[[NEEDS_AGENT]]
 R2D2_VOICE_AGENT=r2d2-voice

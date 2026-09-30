@@ -113,8 +113,8 @@ query тоже принимается. Поэтому проверка живё�
 HEALTH_TIMEOUT_S: Final = 1.5
 
 #: Reading the provider catalogue is also not a voice turn, and for the same reason
-#: it must not borrow the voice deadline. It was borrowing `spec.timeout` -- 3.2 s --
-#: which is the answer to "how long may I wait to speak", and a cold `opencode serve`
+#: it must not borrow the voice deadline. It was borrowing `spec.timeout` -- 3.2 s at the
+#: time, which is the answer to "how long may I wait to speak" -- and a cold `opencode serve`
 #: does not enumerate its providers that fast. Measured on a server started 36 s
 #: earlier: `GET /config/providers` was accepted and did not answer inside 3.2 s, so
 #: startup logged `catalogue-unreadable`, left the brain route UNWIRED, and every
@@ -129,9 +129,9 @@ CATALOGUE_TIMEOUT_S: Final = 20.0
 **Поток событий не читается голосовым дедлайном.** `GET /event` — не запрос: это
 соединение, которое живёт столько, сколько живёт сессия, и opencode отправляет
 в него `server.heartbeat` раз в **10,0 с** (измерено на этой машине, U4).
-Наехав на тот же `timeout: 3.2` — это бюджет Алисы, а не потока — читатель не
+Наехав на тот же `timeout: 3.3` — это бюджет Алисы, а не потока — читатель не
 дожидался даже первого сердцебиения: он переподключался по лестнице
-`3,2 с / 5 с` и был слеп большую часть каждого окна. Живой прогон показал это
+`3,3 с / 5 с` и был слеп большую часть каждого окна. Живой прогон показал это
 буквально: **7 из 7** `permission.asked`, отправленных сервером в провод, читатель
 не увидел, а брокер разрешений, который живёт только на этом событии, не
 работает совсем. Поэтому у потока своя граница — `event_read_timeout` в
@@ -157,7 +157,7 @@ DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
 
         Sharing a single number here is what made the reader blind: the read bound
         has to outlast a 10.0 s heartbeat, and the request deadline must not, because
-        a caller waiting on a turn has 3.2 s of Alice budget. httpx applies the read
+        a caller waiting on a turn has 3.3 s of Alice budget. httpx applies the read
         timeout per socket read, so one long bound is exactly the patience an idle
         stream needs and never a ceiling on the whole connection.
         """
@@ -430,7 +430,7 @@ prose после неё — нет, и это разговор, который �
      "username": "${R2D2_OC_USERNAME}", "password": "${R2D2_OC_PASSWORD}",
      "voice_agent": "r2d2-voice", "task_agent": "r2d2-agent",
      "fast_model": "opencode/space-bunny-free", "task_model": "opencode/space-bunny-free",
-     "summarize_model": "opencode/space-bunny-free", "timeout": 3.2,
+     "summarize_model": "opencode/space-bunny-free", "timeout": 3.3,
      "event_read_timeout": 30.0},
 ```
 
@@ -475,7 +475,7 @@ r2d2-voice  «найди последние статьи про RAG и сдел�
 а из-за порядка:
 
 ```text
-  r2d2-voice   вопрос не уложился в 3,2 с ──► OpencodeDeadlineExceeded
+  r2d2-voice   вопрос не уложился в 3,3 с ──► OpencodeDeadlineExceeded
        │                                        (ход НЕ отменён, он ещё пишет)
        ├──► голосом «Проверяю, пришлю в телеграм.»      ◄── всё, что ждёт Алиса
        │
@@ -545,7 +545,16 @@ prose, который отказавший агент написал вмест�
 
 ```verbatim app/config.py
     backends_path: str = "config/backends.json"
-    r2d2_fast_deadline: float = 3.2
+    #: The voice deadline, shipped at the project's own formula `min(3.6, 4.5 - 1.2)`
+    #: = 3.3 s rather than at a hand-picked round number. It was 3.2 -- a round-down of
+    #: the same formula -- and 3.2 was never measured: it came from p50 1.667 s / p95
+    #: 2.247 s on opencode 1.18.32, and on 1.18.33 the same machine and model gave
+    #: eleven voice turns of `2977 3132 3230 3236 3243 3244 3246 3249 3256 3274
+    #: 3284` ms, of which NINE ran past 3.2 s and TEN fit inside 3.3 s. 3.6 would win
+    #: one more and still leave only 0.9 s against Alice's hard 4.5 s.
+    #: `test_the_shipped_deadline_is_the_formula_and_not_a_rounded_down_literal` is what
+    #: holds the number to the arithmetic rather than to this comment.
+    r2d2_fast_deadline: float = 3.3
     r2d2_task_ack: str = "Проверяю, пришлю в телеграм."
     r2d2_needs_agent_sentinel: str = "[[NEEDS_AGENT]]"
     r2d2_voice_agent: str = "r2d2-voice"
@@ -940,7 +949,7 @@ ASK_SOURCE: Final[Mapping[str, str]] = MappingProxyType(
 
 | место | что не даёт |
 |---|---|
-| `core/session_route.py`, **до** голосового хода | потратить 3,2 с бюджета Алисы на заведомо не обслуживаемый ход |
+| `core/session_route.py`, **до** голосового хода | потратить 3,3 с бюджета Алисы на заведомо не обслуживаемый ход |
 | `_hand_over` в `core/session_collector.py` | отправить задачу агенту в сессию, которую сервер всё ещё зовёт `busy` |
 
 `_hand_over` в `core/session_collector.py` — единственное место во всём сервере,
@@ -1046,7 +1055,7 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 
 ### 7.2 Что это значит для бюджета Алисы
 
-`r2d2_fast_deadline` = 3.2 с — это p95 плюс запас, и оно укладывается в
+`r2d2_fast_deadline` = 3.3 с — это `min(3.6, 4.5 − 1.2)`, и оно укладывается в
 4,5 с вместе с распознаванием речи и доставкой. Два вывода из таблицы:
 
 1. **Первый ход пользователя не может ждать.** 15.5–18.6 с не влезают ни в
@@ -1073,7 +1082,7 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 ```
 
 2. **Дедлайн не отменяет ход, но и не прощает его забыть.** Голосовой ход, не
-   уложившийся в 3.2 с, продолжает работать на сервере; R2D2 отвечает
+   уложившийся в 3.3 с, продолжает работать на сервере; R2D2 отвечает
    пользователю подтверждением, **а ход всё равно уходит `r2d2-agent`**, и воркер
    забирает ответ позже и отправляет в Telegram. Отменять было бы уничтожение
    уже оплаченной работы.
@@ -1126,7 +1135,7 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
 |---|---|---|
 | Агент | `r2d2-voice` | `r2d2-agent` |
 | Маршрут | `POST /session/{session_id}/message`, блокирующий | `POST /session/{session_id}/prompt_async`, 204 |
-| Дедлайн | `r2d2_fast_deadline` = 3.2 с | нет: сервер работает, R2D2 не ждёт |
+| Дедлайн | `r2d2_fast_deadline` = 3.3 с | нет: сервер работает, R2D2 не ждёт |
 | Что слышит пользователь | ответ голосом | «Проверяю, пришлю в телеграм.» |
 | Куда уходит результат | в `text`/`tts` Алисы | в Telegram через `opencode_reply` |
 | Вход | тёплая сессия, без сентинела | холодная сессия (C8), сентинел, **превышен дедлайн** |
@@ -1394,7 +1403,7 @@ def turn_is_complete(events: Iterable[OpencodeEvent]) -> bool:
 | **C5** | Строки событий точные: `server.connected`, `permission.asked`, `permission.replied`, `session.idle`, `message.part.delta`. События «ход завершён» **не существует**. `GET /event` глобальный — фильтровать по `properties.sessionID`. `always` не отправлять никогда. `server.heartbeat` идёт раз в **10,0 с**, поэтому граница чтения потока — `event_read_timeout`, а не голосовой `timeout` | `core/opencode/sse.py`, `core/opencode/sse_frames.py`, `core/permissions.py` |
 | **C6** | Каталог сессии — **query-параметр** `?directory=`. Тот же ключ в теле принимается с 200 и молча игнорируется, а сам путь сервер **не проверяет** — проверяет клиент | `core/opencode/transport.py`, `core/opencode/session_store.py` |
 | **C7** | `GET /session/{session_id}/message` возвращает `{info, parts}`, а не плоский список: чтение `role` верхнего уровня молча даёт `None`. Неизвестный агент — **500** с бесполезным телом; неизвестный `model id` — **не ошибка** | `core/opencode/wire.py`, `core/opencode/models.py` |
-| **C8** | Измеренная задержка: p50 1.667 с, p95 2.247 с, `r2d2_fast_deadline` = 3.2 с. **Первый ход в новой сессии — 15.5–18.6 с** и не должен стоять на синхронном голосовом пути | `app/config.py`, `core/brain.py` |
+| **C8** | Измеренная задержка: p50 1.667 с, p95 2.247 с (1.18.32), `r2d2_fast_deadline` = 3.3 с — формула, а не замер. **Первый ход в новой сессии — 15.5–18.6 с** и не должен стоять на синхронном голосовом пути | `app/config.py`, `core/brain.py` |
 
 ### 9.1 Свип моделей: почему в трёх слотах одна и та же строка
 

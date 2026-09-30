@@ -44,7 +44,7 @@ which reports
 them itself since todo 18: it is the only branch that knows which agent spoke and
 whether the voice turn ran out of budget, so a recorder that could not be told
 would be a recorder nobody fills in. `docs/11-opencode-contract.md`'s measured
-p50 of 1.667 s against the `R2D2_FAST_DEADLINE` of 3.2 s is the number the record
+p50 of 1.667 s against the `R2D2_FAST_DEADLINE` of 3.3 s is the number the record
 exists to keep
 watching, and it lands on that branch -- and on 1.18.33 it is not the typical
 case, so that is exactly the number worth watching. `confirm` is set one layer up,
