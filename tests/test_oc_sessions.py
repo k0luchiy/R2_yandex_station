@@ -47,7 +47,7 @@ import pytest
 from app.config import Config
 from core.backends.config_loader import BackendSpec
 from core.memory import Memory, OcSession
-from core.opencode.client import OpencodeClient, OpencodeError
+from core.opencode.client import CATALOGUE_TIMEOUT_S, OpencodeClient, OpencodeError
 from core.opencode.session_store import OcSessionStore
 
 BASE_URL = "http://127.0.0.1:4599"
@@ -588,3 +588,42 @@ async def test_message_count_of_an_unbound_application_is_zero(
     # Then: zero rather than an error -- the fast path must not be blocked by bookkeeping
     assert count == 0
     assert await memory.all_oc_sessions() == []
+
+
+async def test_the_provider_catalogue_read_does_not_borrow_the_voice_deadline(
+    tmp_path: Path,
+) -> None:
+    """A cold catalogue is a startup read, not a voice turn, and it is not on Alice's clock.
+
+    Measured, not reasoned: with the bound taken from `spec.timeout` -- the shipped
+    3.2 s, which is the answer to "how long may I wait to SPEAK" -- a server started
+    36 s earlier accepted `GET /config/providers` and did not answer inside it.
+    Startup then logged `catalogue-unreadable`, left the brain route UNWIRED, and
+    every question fell through to a chain with no model behind it.
+
+    The control assertion matters as much as the first: a call that *is* a voice
+    turn must still get the small bound, or this would pass for the wrong reason --
+    a client whose every call got 20 s would satisfy it too.
+    """
+    seen: dict[str, float | None] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        seen[path] = request.extensions.get("timeout", {}).get("read")
+        if path == "/config/providers":
+            return httpx.Response(200, json={"providers": [], "default": {}})
+        return httpx.Response(200, json=[])  # /agent is a bare list route
+
+    # A bound so small that borrowing it would be unmistakable, and so small that
+    # a real request would fail if it were actually applied to the socket.
+    spec = BackendSpec(name="opencode", kind="opencode_session", base_url=BASE_URL, timeout=0.01)
+    client = OpencodeClient(
+        spec, str(tmp_path), client=httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    )
+    # When: the startup catalogue read
+    await client.providers()
+    # Then: it carries its own bound, not the voice deadline
+    assert seen["/config/providers"] == CATALOGUE_TIMEOUT_S
+    # ... and a voice turn still gets the small one, so only the catalogue moved
+    await client.agents()
+    assert seen["/agent"] == spec.timeout

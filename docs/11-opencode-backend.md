@@ -106,15 +106,24 @@ query тоже принимается. Поэтому проверка живё�
 
 **Дедлайн — это не отмена.** Голосовой ход, переживший `r2d2_fast_deadline`,
 продолжает работать на стороне сервера, а ответ забирает фоновый сборщик.
-Поэтому у клиента два разных таймаута:
+Поэтому у клиента свои границы для чтений, которые **не являются** голосовым ходом, и каждая не должна съедать его бюджет:
 
 ```verbatim core/opencode/client.py
 #: A liveness probe must not eat the voice budget, so it gets its own bound.
 HEALTH_TIMEOUT_S: Final = 1.5
-#: The request timeout for a deadline-bounded call is the deadline plus this, so
-#: `asyncio.wait_for` is always what fires first and the caller always sees
-#: `OpencodeDeadlineExceeded` rather than a bare `httpx.TimeoutException`.
-DEADLINE_GRACE_S: Final = 0.5
+
+#: Reading the provider catalogue is also not a voice turn, and for the same reason
+#: it must not borrow the voice deadline. It was borrowing `spec.timeout` -- 3.2 s --
+#: which is the answer to "how long may I wait to speak", and a cold `opencode serve`
+#: does not enumerate its providers that fast. Measured on a server started 36 s
+#: earlier: `GET /config/providers` was accepted and did not answer inside 3.2 s, so
+#: startup logged `catalogue-unreadable`, left the brain route UNWIRED, and every
+#: question fell through to a fallback chain with no model. Nothing about that read
+#: is on Alice's clock -- it happens once, at startup, before any turn exists -- so
+#: the 4.5 s budget has no bearing on it and a bound that pretends otherwise is
+#: simply wrong. Generous, because a cold catalogue is the slow case, and still
+#: bounded, so a wedged server fails loudly instead of hanging startup.
+CATALOGUE_TIMEOUT_S: Final = 20.0
 ```
 
 **Поток событий не читается голосовым дедлайном.** `GET /event` — не запрос: это
