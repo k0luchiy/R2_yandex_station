@@ -47,7 +47,7 @@ RED phase of todo 17 has to be able to run the route tests against the old
 `/health`, and a module-level import of a module that does not exist yet would
 stop the whole file at collection.
 
-allow: SIZE_OK -- 687 pure LOC, 23 tests. Test modules in this repo run from 44 pure
+allow: SIZE_OK -- 717 pure LOC, 24 tests. Test modules in this repo run from 44 pure
 LOC to 1928 (`test_brain_hybrid.py`), and a test module grows with the number of
 behaviours it pins, not with the number of concepts it owns. The 250 pure-LOC
 ceiling targets source modules; splitting this would scatter one contract -- what an
@@ -1014,3 +1014,41 @@ def test_the_strings_this_file_asserts_are_the_shipped_ones() -> None:
     assert ACK == "Проверяю, пришлю в телеграм."
     assert ERROR_TEXT == "Что-то пошло не так. Попробуй ещё раз."
     assert HELP_PREFIX == "Я Р2Д2"
+
+
+def test_diagnostics_providers_route_redacts_credentials() -> None:
+    """A public route must not hand out the credentials it is describing.
+
+    The provider catalog is a third party's body and carries `key`,
+    `options.apiKey` and `options.headers`. Echoing it unedited put a live console
+    token on an unauthenticated route a public tunnel was pointed at. This locks
+    the redaction: a leak here is silent, and the route's own docstring forbids
+    exactly this content.
+    """
+    from app.diagnostics import _redact_credentials
+
+    catalog = {
+        "providers": [
+            {
+                "id": "opencode-go",
+                "name": "OpenCode Go",
+                "key": "st_live_token_value",
+                "options": {
+                    "apiKey": "st_live_token_value",
+                    "headers": {"Authorization": "Bearer sk_live_secret"},
+                },
+                "models": {"mimo-v2.6-pro": {"id": "mimo-v2.6-pro"}},
+            }
+        ]
+    }
+    rendered = json.dumps(_redact_credentials(catalog))
+
+    assert "st_live_token_value" not in rendered
+    assert "sk_live_secret" not in rendered
+    # A redacted key is still a DIAGNOSTIC: "is one configured" is the whole point
+    # of the endpoint, so set and unset must not collapse into the same token.
+    assert "***set***" in rendered
+    assert json.dumps(_redact_credentials({"key": ""})) == '{"key": "***unset***"}'
+    # Non-credential facts survive: the endpoint is worthless without them.
+    assert "mimo-v2.6-pro" in rendered
+    assert "Authorization" in rendered

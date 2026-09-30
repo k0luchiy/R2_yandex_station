@@ -137,6 +137,51 @@ async def health_view(
     )
 
 
+#: Field names whose value is a credential, matched case-insensitively as a
+#: substring. `key`, `apiKey` and `OPENCODE_CONSOLE_TOKEN` all land here, and so
+#: would a field like `monkey` -- the trade is deliberate: a false positive costs an
+#: operator one masked field, and a real key costs the deployment.
+_SECRET_FIELDS: Final = ("key", "token", "secret", "password", "authorization")
+
+#: What a credential becomes. Set-or-unset SURVIVES, because that is the fact this
+#: route exists to show: a provider dropped for an empty `api_key` is something an
+#: operator acts on, and blanking the field would hide exactly the signal that got
+#: someone to open this endpoint.
+_REDACTED_SET: Final = "***set***"
+_REDACTED_UNSET: Final = "***unset***"
+
+
+def _redact_credentials(value: object) -> object:
+    """Every credential in an upstream payload, replaced by whether it is there.
+
+    The catalog is a third party's body and carries keys this module's docstring
+    forbids in a public response; echoing it unedited put a live `st_...` token on
+    an unauthenticated route a public tunnel was pointed at.
+
+    The walk is by STRUCTURE, not schema: providers nest options differently, so a
+    redactor knowing one shape leaks on the others. `headers` keeps its names and
+    loses its values -- the name says which carrier is in use, and an
+    `Authorization` value is a credential under another label.
+    """
+    if isinstance(value, dict):
+        redacted: dict[str, object] = {}
+        for name, item in value.items():
+            lowered = name.lower()
+            if any(field in lowered for field in _SECRET_FIELDS):
+                redacted[name] = _REDACTED_SET if item else _REDACTED_UNSET
+            elif lowered == "headers" and isinstance(item, dict):
+                redacted[name] = {
+                    header: _REDACTED_SET if val else _REDACTED_UNSET
+                    for header, val in item.items()
+                }
+            else:
+                redacted[name] = _redact_credentials(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_credentials(item) for item in value]
+    return value
+
+
 async def providers_view(
     cfg: Config, load: RegistryLoader, factory: ClientFactory
 ) -> dict[str, object] | JSONResponse:
@@ -176,8 +221,8 @@ async def providers_view(
     finally:
         await client.aclose()
     return {
-        "providers": providers,
-        "agents": agents,
+        "providers": _redact_credentials(providers),
+        "agents": _redact_credentials(agents),
         "route": await route_view(cfg, load),
         "telegram": telegram_binding(cfg),
     }
