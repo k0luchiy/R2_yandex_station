@@ -157,9 +157,24 @@ def credential_source(command: str) -> str | None:
     """The credential this command could print, or `None` if it reads nothing secret.
 
     A SOURCE and not a verdict about danger: the string is what the broker tells the
-    user it refused to ask about, so it names a place and never a value. The value is
-    read out of R2D2's own environment by a subprocess R2D2 does not run and cannot
-    scrub afterwards, which is why this is decided BEFORE the question is asked.
+    user it refused to ask about, so it names a place and never a value. The decision
+    is made BEFORE the question is asked, because what would answer it is printed by a
+    subprocess nobody in this chain can scrub afterwards.
+
+    **Which environment, precisely** -- this was wrong here once and the correction
+    matters, because the wrong answer sends the reader to the wrong file. The agent's
+    `bash` is spawned by the **opencode server**, not by R2D2: its environment is the
+    unit's, which is `EnvironmentFile=.env.oc` plus what `scripts/opencode_serve.sh`
+    exports. So the secret actually reachable that way is
+    `OPENCODE_SERVER_PASSWORD`. The Telegram bot token is **not** among them -- it
+    lives in `.env`, which only the gateway reads, and the gateway is a *client* of
+    opencode rather than an ancestor of the agent's shell.
+
+    The guard still refuses the Telegram shapes, deliberately. This is a closed list
+    of sources, so it is defence in depth rather than a proof, and the honest limit
+    is that a rewrite the list cannot see is not stopped by it. The structural fix is
+    the deployment's: the opencode server needs its password in the environment to
+    authenticate, and every child inherits it from there.
 
     Two passes, and the second exists because the first cannot see the case that
     matters most: `cat .env` has a harmless head word and a credential in its
