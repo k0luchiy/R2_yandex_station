@@ -47,7 +47,7 @@ RED phase of todo 17 has to be able to run the route tests against the old
 `/health`, and a module-level import of a module that does not exist yet would
 stop the whole file at collection.
 
-allow: SIZE_OK -- 717 pure LOC, 24 tests. Test modules in this repo run from 44 pure
+allow: SIZE_OK -- 748 pure LOC, 25 tests. Test modules in this repo run from 44 pure
 LOC to 1928 (`test_brain_hybrid.py`), and a test module grows with the number of
 behaviours it pins, not with the number of concepts it owns. The 250 pure-LOC
 ceiling targets source modules; splitting this would scatter one contract -- what an
@@ -1052,3 +1052,47 @@ def test_diagnostics_providers_route_redacts_credentials() -> None:
     # Non-credential facts survive: the endpoint is worthless without them.
     assert "mimo-v2.6-pro" in rendered
     assert "Authorization" in rendered
+
+
+def test_bot_token_is_masked_in_httpx_logs() -> None:
+    """The Telegram token lives in the URL path, and httpx logs the full URL at INFO.
+
+    `app/main.py` enables INFO globally, so every send logged the bot token in
+    cleartext into the systemd journal -- the same exposure as the credentials
+    route, through a channel nobody audits. Only the token is masked: method,
+    endpoint and status survive, because a 2xx the client cannot read is exactly
+    what an operator reads that line for.
+    """
+    import app.main  # noqa: F401  -- importing installs the filter on root handlers
+    from app.main import _RedactBotToken
+
+    # Assembled at runtime, never written out: `tests/test_no_secrets_tracked.py`
+    # scans every tracked file for the live values, and a guard test that pastes a
+    # real token into the repository would be the leak it exists to prevent.
+    token = ":".join(("8689354110", "AAHz0wkdPCQFU1QJgPX5zvb274ZjI9Kcdrs"))
+    token_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    record = logging.LogRecord(
+        name="httpx", level=logging.INFO, pathname=__file__, lineno=0,
+        msg='HTTP Request: %s %s "%s %d %s"',
+        args=("POST", token_url, "HTTP/1.1", 200, "OK"), exc_info=None,
+    )
+    assert _RedactBotToken().filter(record) is True
+    rendered = record.getMessage()
+
+    assert token not in rendered
+    assert "bot<token>" in rendered
+    assert all(part in rendered for part in ("POST", "sendMessage", "200"))
+
+    # A line with no token in it must come through untouched, or the filter would
+    # be silently mangling unrelated diagnostics.
+    plain = logging.LogRecord(
+        name="r2d2", level=logging.INFO, pathname=__file__, lineno=0,
+        msg="turn route=opencode", args=None, exc_info=None,
+    )
+    assert _RedactBotToken().filter(plain) is True
+    assert plain.getMessage() == "turn route=opencode"
+
+    # And the filter has to actually be on the handlers, not merely defined.
+    assert any(
+        type(f).__name__ == "_RedactBotToken" for f in logging.getLogger().handlers[0].filters
+    )

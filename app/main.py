@@ -55,6 +55,7 @@ is the failure mode here, not a crash.
 """
 
 import logging
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -83,6 +84,30 @@ __all__ = ["authorisation_posture", "build_app", "probe_opencode_server", "tg_ap
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("r2d2")
+
+#: The bot token lives in the URL PATH of every Telegram call, and `httpx` logs the
+#: full URL at INFO -- which this module just enabled globally. Observed in a live
+#: run: `POST https://api.telegram.org/bot<token>/sendMessage "HTTP/1.1 200 OK"`.
+#: That is the same exposure as the credentials route, arriving through a channel
+#: nobody audits: the systemd journal keeps it long after the request is forgotten.
+#:
+#: Only the token is masked. Method, endpoint and status all survive, because those
+#: are what the line is FOR -- a 2xx the client cannot read is a fact an operator
+#: needs, and blanking the whole URL would throw that away to hide a substring.
+_BOT_TOKEN_IN_URL = re.compile(r"/bot\d+:[A-Za-z0-9_-]{10,}")
+
+
+class _RedactBotToken(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        rendered = record.getMessage()
+        if _BOT_TOKEN_IN_URL.search(rendered):
+            record.msg = _BOT_TOKEN_IN_URL.sub("/bot<token>", rendered)
+            record.args = ()
+        return True
+
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RedactBotToken())
 
 #: What the owner runs when the gate below reports the server unreachable.
 LAUNCHER = "scripts/opencode_serve.sh"
