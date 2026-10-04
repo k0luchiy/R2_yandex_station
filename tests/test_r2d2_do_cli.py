@@ -26,7 +26,7 @@ not "does `echo hi` work" but:
 * **stdout is a machine contract.** Exactly one line of JSON, always, whatever
   the exit code -- including usage errors.
 
-allow: SIZE_OK -- 541 pure LOC, 36 tests. Every test file in this repo is
+allow: SIZE_OK -- 542 pure LOC, 36 tests. Every test file in this repo is
 257-991 pure LOC and a test module grows with the number of behaviours it pins;
 splitting the risk gate from the invocation contract would give each half a file
 that cannot say what the other half assumes about the harness.
@@ -399,11 +399,13 @@ def test_open_app_refuses_a_path_shaped_name_and_launches_nothing(tmp_path: Path
 def test_open_app_never_interpolates_the_name_into_the_command(tmp_path: Path) -> None:
     log = _fake_launcher(tmp_path)
     marker = tmp_path / "pwned"
-    # `browser` fuzzy-matches the allowlist, so the launch happens -- which is
-    # exactly why the recorded argv matters: it must be the fixed APPS command.
+    # This name used to fuzzy-match `browser`, so the launch happened and only the
+    # recorded argv stood between the caller and a shell. `resolve_app` is an exact
+    # lookup now, so the name matches nothing and there is nothing to interpolate.
     proc = _run(tmp_path, "open-app", f"browser; touch {marker}")
-    assert proc.returncode == EXIT_OK, (proc.returncode, proc.stdout, proc.stderr)
-    assert _wait_for_lines(log, 1) == ["https://ya.ru"]
+    assert proc.returncode == EXIT_FAIL, (proc.returncode, proc.stdout, proc.stderr)
+    assert _contract(proc.stdout)["ok"] is False
+    assert not log.exists(), "an injection-shaped name must launch nothing at all"
     assert not marker.exists(), "the name must never reach a shell"
 
 

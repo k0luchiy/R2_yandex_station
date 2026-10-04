@@ -92,15 +92,17 @@ APPS = {
 
 
 def resolve_app(app: str) -> str | None:
-    key = (app or "").strip().lower()
-    if not key:
-        return None
-    if key in APPS:
-        return APPS[key]
-    for name, cmd in APPS.items():
-        if name in key or key in name:
-            return cmd
-    return None
+    """The command for `app`, or `None` when it is not one of ours.
+
+    Exact match only. This used to fall back to a bidirectional substring test
+    (`name in key or key in name`), which resolved any phrase containing an app
+    name: "найди статьи про браузеры" contains "браузер", so a request to search
+    for papers launched Firefox. A launcher that guesses from a phrase is a
+    launcher that fires on whatever sentence happens to contain its key, so the
+    model is required to name the app -- which is what `APP_SCHEMA`'s examples
+    already tell it to do.
+    """
+    return APPS.get((app or "").strip().lower())
 
 
 async def open_app(ctx: ToolContext, args: dict) -> ToolResult:
@@ -108,6 +110,8 @@ async def open_app(ctx: ToolContext, args: dict) -> ToolResult:
     cmd = resolve_app(app)
     if not cmd:
         return ToolResult(f"Не знаю приложения «{app}».", ok=False)
+    if not ctx.cfg.shell_enabled:
+        return ToolResult("Запуск приложений сейчас отключён.", ok=False)
     proc = await asyncio.create_subprocess_shell(
         f"nohup {cmd} >/dev/null 2>&1 &",
         stdout=asyncio.subprocess.DEVNULL,
