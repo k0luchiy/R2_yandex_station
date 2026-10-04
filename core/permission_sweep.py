@@ -167,5 +167,14 @@ class PermissionSweep:
 
     async def _forever(self, tick: Callable[[], Awaitable[None]]) -> None:
         while True:
-            await tick()
+            try:
+                await tick()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # A tick that raises used to end this loop, and nothing restarts
+                # it: the 300-second refusal that stops a parked session being
+                # answerable FOREVER stopped happening, silently, for the life of
+                # the process. One bad tick is a bad tick, not the end of the sweep.
+                self._log.exception("permission sweep tick failed; the next one still runs")
             await asyncio.sleep(self._interval_s)

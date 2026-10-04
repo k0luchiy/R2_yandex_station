@@ -43,7 +43,7 @@ Timing: no test sleeps. An expired ask is produced by writing a record whose
 and the sweep loop's cadence is injected, so the loop test subscribes to the
 Telegram delivery instead of waiting out a 30 s interval.
 
-allow: SIZE_OK -- 847 pure LOC, a test module for the most safety-critical module in
+allow: SIZE_OK -- 865 pure LOC, a test module for the most safety-critical module in
 R2D2 grows with the properties it pins, and each section here is one property rather
 than one test.
 """
@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import sqlite3
 import json
 import logging
 import re
@@ -67,6 +68,7 @@ from app.config import Config
 from core.backends.config_loader import BackendSpec
 from core.memory import Memory
 from core.opencode.client import OpencodeClient
+from core.permission_sweep import PermissionSweep
 
 # ---------------------------------------------------------------------------
 # Doubles
@@ -1234,3 +1236,34 @@ def test_the_seam_carries_the_answer_domain_and_nothing_wider():
 
     hints = get_type_hints(PermissionBroker._post)
     assert hints["answer"] == PermissionAnswer
+
+
+# ---------------------------------------------------------------------------
+# the sweep is the fail-safe, so one bad tick must not end it
+# ---------------------------------------------------------------------------
+
+
+async def test_one_failing_tick_does_not_end_the_sweep() -> None:
+    # Given a sweep whose tick raises on the first call and succeeds after
+    calls = 0
+
+    async def tick() -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+
+    # When the loop runs for two intervals
+    sweep = PermissionSweep.__new__(PermissionSweep)
+    sweep._interval_s = 0.01
+    sweep._log = logging.getLogger("r2d2.test.sweep")
+    task = asyncio.create_task(sweep._forever(tick))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # Then the second tick still ran. It used to raise out of `_forever`, and
+    # nothing restarts that task, so the 300-second refusal that stops a parked
+    # session being answerable forever stopped happening for the life of the
+    # process -- with nothing in the logs but an unretrieved task exception.
+    assert calls >= 2, calls
