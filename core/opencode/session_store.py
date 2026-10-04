@@ -62,6 +62,7 @@ class OcSessionStore:
         self._client = client
         self._workspace = cfg.resolved_workspace()
         self._stale_after_s = cfg.r2d2_stale_session_seconds
+        self._retention_s = cfg.r2d2_session_retention_seconds
         self._resolving: dict[str, asyncio.Lock] = {}
 
     async def resolve(self, application_id: str) -> str:
@@ -117,6 +118,49 @@ class OcSessionStore:
             )
         return aborted
 
+    async def forget_unused(self) -> int:
+        """Drop bindings no user has spoken through in the retention window.
+
+        The other half of `reap`, and the only caller of `unbind_oc_session` in the
+        project. Without it `oc_sessions` grows one row per identity forever: there
+        was no delete, no expiry and no eviction anywhere, so every test run and
+        every abandoned experiment left a row behind permanently. Rows are cheap and
+        the table is PRIMARY KEYed on identity, so this is housekeeping rather than
+        a fix for unbounded growth -- but a deployment you cannot clean up is a
+        deployment whose junk is indistinguishable from its users.
+
+        A session still BUSY on the server is never unbound, however old: `last_used_at`
+        is refreshed by reuse but a turn in flight has not reused it yet, and dropping
+        that binding would orphan a live turn.
+        """
+        window = self._retention_s
+        if window <= 0:
+            return 0
+        now = time.time()
+        bindings = await self._memory.all_oc_sessions()
+        if not bindings:
+            return 0
+        try:
+            statuses = await self._client.session_status()
+        except (httpx.HTTPError, OpencodeError) as exc:
+            log.warning("opencode session store: forgot nothing: %s", exc)
+            return 0
+        forgotten = 0
+        for binding in bindings:
+            if now - binding.last_used_at <= window:
+                continue
+            if statuses.get(binding.session_id) == BUSY:
+                continue
+            await self._memory.unbind_oc_session(binding.application_id)
+            forgotten += 1
+            log.info(
+                "opencode session store: forgot %s -> session %s, unused for %.0fs (retention "
+                "%.0fs). The next thing this user says starts a new session.",
+                binding.application_id, binding.session_id,
+                now - binding.last_used_at, window,
+            )
+        return forgotten
+
     async def message_count(self, application_id: str) -> int:
         """How many messages this user's session holds; 0 means brand new.
 
@@ -133,10 +177,26 @@ class OcSessionStore:
         binding = await self._memory.get_oc_session(application_id)
         if binding is None:
             return await self._create(application_id, title)
-        live = await self._client.find_session(title)
+        sessions = await self._client.list_sessions()
+        live = next((s.id for s in sessions if s.title == title), None)
         if live == binding.session_id:
             await self._memory.touch_oc_session(application_id, message_delta=0)
             return live
+        if live is None and not sessions:
+            # An empty listing is not evidence that this session is gone. It is what
+            # a server that has not finished restoring, a `?directory=` scope that
+            # does not match, or a truncated answer also looks like -- and treating
+            # it as death replaced the session, reset `message_count` and dropped
+            # the user's conversation without a word. A POPULATED listing that
+            # lacks the title is the only real evidence, and it is handled below.
+            log.warning(
+                "opencode session store: the server listed no sessions at all, so the binding of "
+                "%s to %s is trusted rather than replaced; if the turn fails as not-found, the "
+                "session is genuinely gone",
+                application_id, binding.session_id,
+            )
+            await self._memory.touch_oc_session(application_id, message_delta=0)
+            return binding.session_id
         # The bound session is gone, and it is NOT unbound before the create: a
         # create that then fails must leave a row that still reads as dead, not a
         # user with no session at all. `bind_oc_session` replaces it atomically.
