@@ -274,55 +274,23 @@ DEFAULT_EVENT_READ_TIMEOUT: Final = 30.0
 `config/opencode/r2d2.opencode.json`:
 
 ```verbatim config/opencode/r2d2.opencode.json
-      "permission": {
-        "*": "deny",
-        "read": {
-          "*": "allow",
-          "*.env": "deny",
-          "*.env.*": "deny",
-          "*.env.example": "allow"
-        },
-        "edit": "deny",
-        "glob": "allow",
-        "grep": "allow",
-        "bash": {
-          "*": "ask",
-          "*/.r2d2/r2d2_do.py *": "allow",
-          "python3 */.r2d2/r2d2_do.py *": "allow",
-          "*/.venv/bin/python */.r2d2/r2d2_do.py *": "allow",
-          "upower *": "allow",
-          "cat /sys/class/power_supply/*": "allow",
-          "df *": "allow",
-          "free *": "allow",
-          "uname *": "allow",
-          "hostname *": "allow",
-          "ps *": "allow",
-          "uptime *": "allow",
-          "date *": "allow",
-          "*/.r2d2/r2d2_do.py shell *": "deny",
-          "python3 */.r2d2/r2d2_do.py shell *": "deny",
-          "*/.venv/bin/python */.r2d2/r2d2_do.py shell *": "deny"
-        },
-        "task": "deny",
-        "skill": "deny",
-        "lsp": "deny",
-        "question": "deny",
-        "webfetch": "deny",
-        "websearch": "deny",
-        "external_directory": "deny",
-        "doom_loop": "deny"
-      },
+  
 ```
 
 Три вещи в нём неочевидны:
 
 - `read` разрешён, но `*.env` и `*.env.*` запрещены, а `*.env.example`
   разрешён. Агент читает репозиторий и не читает секреты.
-- `bash` — это не «включён», это список из двенадцати разрешённых команд плюс
-  `*` в `ask`. В списке три формы вызова шима (см. [06-tools.md](06-tools.md))
-  и девять read-only проб (`upower *`, `df *`, `uptime *`, `date *`, …).
+- `bash` — это не «включён», это **одна** разрешённая команда плюс `*` в `ask`.
+  Разрешён ровно `status` шима, в трёх формах вызова (см.
+  [06-tools.md](06-tools.md)). Девять read-only проб, стоявших рядом раньше, убраны:
+  каждая кончалась на ` *` и потому молча разрешала `<проба>; rm -rf ~`.
 - Три правила `deny` на `r2d2_do.py shell *` идут **после** allow и перекрывают
   его: allow на `r2d2_do.py *` сам по себе включал бы подкоманду `shell`.
+
+Обратите внимание на [11-opencode-contract.md](11-opencode-contract.md): там
+приведён **снимок** ответа сервера, снятый до этого изменения. Он описывает
+состояние конфигурации на момент съёмки и намеренно оставлен как есть.
 
 Про `*` в `ask` у `bash` — это решение владельца, и оно уменьшает защиту,
 которую документ утверждал раньше: голосовой агент больше не отказывает по
@@ -346,43 +314,7 @@ prose после неё — нет, и это разговор, который �
 разрешений **дословно**:
 
 ```verbatim config/opencode/r2d2.opencode.json
-      "permission": {
-        "*": "ask",
-        "*_*": "deny",
-        "todowrite": "deny",
-        "read": {
-          "*": "allow",
-          "*.env": "deny",
-          "*.env.*": "deny",
-          "*.env.example": "allow"
-        },
-        "edit": "ask",
-        "glob": "allow",
-        "grep": "allow",
-        "bash": {
-          "*": "ask",
-          "*/.r2d2/r2d2_do.py *": "allow",
-          "python3 */.r2d2/r2d2_do.py *": "allow",
-          "*/.venv/bin/python */.r2d2/r2d2_do.py *": "allow",
-          "upower *": "allow",
-          "cat /sys/class/power_supply/*": "allow",
-          "df *": "allow",
-          "free *": "allow",
-          "uname *": "allow",
-          "hostname *": "allow",
-          "ps *": "allow",
-          "uptime *": "allow",
-          "date *": "allow"
-        },
-        "task": "ask",
-        "skill": "ask",
-        "lsp": "ask",
-        "question": "deny",
-        "webfetch": "allow",
-        "websearch": "allow",
-        "external_directory": "ask",
-        "doom_loop": "ask"
-      },
+  
 ```
 
 Отличия от голосового агента, которые стоит запомнить:
@@ -569,6 +501,14 @@ prose, который отказавший агент написал вмест�
     r2d2_permission_timeout: float = 300.0
     r2d2_session_soft_limit: int = 40
     r2d2_stale_session_seconds: float = 900.0
+    #: How long a session may sit UNUSED before its binding is dropped, so a
+    #: deployment accumulates one row per real user rather than one per test
+    #: run, per throwaway identity and per abandoned experiment. Deliberately
+    #: far longer than `r2d2_stale_session_seconds`, which is about a wedged
+    #: TURN and not about retention: unbinding a session a user still wants
+    #: costs them their conversation, so the window has to exceed any plausible
+    #: gap between two questions. `0` disables unbinding entirely.
+    r2d2_session_retention_seconds: float = 2_592_000.0
     r2d2_cli_path: str = "~/.r2d2/r2d2_do.py"
     r2d2_event_poll_interval: float = 2.0
 ```
@@ -1145,8 +1085,7 @@ REQUIRED_CREDENTIALS: Final[Mapping[str, tuple[str, ...]]] = MappingProxyType(
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
             self._handoff(rec, wiring)
-            return await self.collector.hand_to_agent(wiring, app_id, session_id, command)
-        current_application_id.set(app_id)
+            return await self.collector.hand_to_agent(wiring, app_id, session_id, spoken)
 ```
 
 2. **Дедлайн не отменяет ход, но и не прощает его забыть.** Голосовой ход, не
@@ -1550,6 +1489,33 @@ opencode — не ошибка, а подмена: HTTP 200 и ответ, по�
 
 ## 10. Сессия на пользователя
 
+Три свойства, каждое из которых было отдельной находкой, а не работой по
+умолчанию.
+
+**Переиспользование, а не создание на каждый вопрос.** `application_id` —
+первичный ключ таблицы `oc_sessions`, поэтому у пользователя физически не может
+быть двух строк. Создаёт сессию единственный код — `_create`; `resolve` при
+существующей привязке, чей заголовок ещё принадлежит той же сессии, просто
+возвращает её и обновляет часы.
+
+**Пустой `GET /session` — не доказательство смерти.** Раньше `find_session`
+возвращал `None` и когда сессии действительно нет, и когда сервер ответил пустым
+списком, и тогда код создавал замену: `message_count` обнулялся, а разговор
+пользователя исчезал без единого слова. Так выглядит и сервер, который не
+закончил восстановление, и несовпавший `?directory=`, и обрезанный ответ.
+Пустой список — это повод **довериться привязке**, а не заменить её;
+единственное настоящее доказательство — заполненный список без нашего
+заголовка.
+
+**Забывание привязок, которых больше нет.** `unbind_oc_session` существовал и не
+имел ни одного вызова вне тестов, поэтому таблица росла на строку на каждый
+прогон и на каждый брошенный эксперимент, навсегда. Теперь `forget_unused()`
+снимает привязку, которой не пользовались дольше `R2D2_SESSION_RETENTION_SECONDS`
+(по умолчанию 30 суток), и это единственный его вызывающий. Сессия, которая на
+сервере ещё `busy`, не забывается никогда: её `last_used_at` обновляется при
+повторном использовании, а висящий ход ещё не использовался, и снятие привязки
+оставило бы живой ход сиротой. `0` отключает забывание полностью.
+
 ```verbatim core/opencode/session_store.py
 #: The prefix of the one title R2D2 gives a user's session. It carries the
 #: application id, so a session is findable again even if the database is lost.
@@ -1580,14 +1546,13 @@ opencode и единственного ожидающего вопроса. По
 
 ```verbatim app/identity.py
 def tg_application_id(cfg: Config, chat_id: int) -> str | None:
-    """The `application_id` this Telegram chat was bound to, or `None` for no binding.
+    """The identity this Telegram chat was bound to, or `None` for no binding.
 
-    **The binding is declared, never derived.** One human is one `application_id`,
-    and that id is what owns their single opencode session and their single pending
-    permission question -- so a Telegram turn and an Alice turn of the same person
-    have to arrive under the same one, or the answer to «да» is delivered to a
-    session the question was never asked in. `/tg/webhook` used to build
-    `f"tg:{chat_id}"` for itself, which is the live defect in `qa/live-run.md` §4c.
+    The identity is `session.user.user_id`, NOT
+    `session.application.application_id`: memory is keyed on the user id, and the
+    platform scopes the application id to one app, so a phone and a Station would
+    otherwise be two different people here. It is printed at startup as
+    `alice_user=`.
 ```
 
 Чат, которому пара не объявлена, **отказывается**: сообщение не отвечает, и в
@@ -1640,7 +1605,7 @@ def tg_application_id(cfg: Config, chat_id: int) -> str | None:
 | `core/metrics.py` | одна запись на ход: `route`, `path`, `llm_ms`, `total_ms` |
 | `core/opencode/client.py` | **14 маршрутов `opencode serve`** по таблице раздела 2: 13 вызовов `_request` в этом файле плюс живой `GET /event`, который читает SSE, а не запрашивает (его читает `core/opencode/sse.py`) |
 | `core/opencode/models.py` | проверка `model id` по `GET /config/providers` (ворота C1) |
-| `core/opencode/session_store.py` | одна сессия на пользователя плюс сборщик зависших |
+| `core/opencode/session_store.py` | одна сессия на пользователя, пустой список не считается смертью сессии, сборщик зависших и забывание неиспользуемых привязок |
 | `core/opencode/sse.py` | чтение `GET /event`: соединение, границы таймаутов, фильтр по сессии |
 | `core/opencode/sse_frames.py` | словарь событий opencode и разбор кадра SSE (`OpencodeEvent`, `turn_is_complete`) |
 | `core/opencode/transport.py` | соединение с `opencode serve`: адрес, basic-auth, `?directory=` (C6), тело хода, non-2xx как исключение, **прочитанный по таймауту ответ — как `OpencodeDeadlineExceeded`** |
