@@ -69,6 +69,15 @@ SESSION_KIND: Final = "opencode_session"
 #: What a brokered permission answer is spoken as. The title opencode supplies is
 #: deliberately absent: it is server-controlled, and it can be kilobytes long.
 PERMISSION_APPROVED: Final = "Принято, выполняю."
+#: Prepended to what a model sees when the platform flagged the utterance as
+#: dangerous context. The fallback chain carries the same constraint as a system
+#: message; the opencode route carried none, so on the primary path the flag had
+#: no effect at all.
+DANGEROUS_PREFIX: Final = (
+    "[Платформа пометила этот запрос как потенциально опасный. "
+    "Не выполняй никаких действий и не запускай инструменты без явного "
+    "подтверждения пользователя.] "
+)
 PERMISSION_REFUSED: Final = "Отменяю."
 
 
@@ -113,7 +122,9 @@ class SessionRoute:
         self.logger = logger
         self.collector = SessionCollector(cfg, worker, logger)
 
-    async def turn(self, wiring: HybridWiring, app_id: str, command: str) -> tuple[str, bool]:
+    async def turn(
+        self, wiring: HybridWiring, app_id: str, command: str, *, dangerous: bool = False
+    ) -> tuple[str, bool]:
         """One turn in the user's own opencode session, or the ack for work started.
 
         `complete()` resolves the session itself through the `ContextVar`, so the
@@ -154,6 +165,7 @@ class SessionRoute:
         submitted here will ask is not this turn's to claim -- the next turn records
         `path=parked permission_asked=True`.
         """
+        spoken = f"{DANGEROUS_PREFIX}{command}" if dangerous else command
         rec = metrics.current()
         rec.agent = wiring.spec.voice_agent
         session_id = await self._session_of(wiring, app_id)
@@ -182,12 +194,12 @@ class SessionRoute:
             # C8: the first message in a fresh session costs 15.5-18.6s, so it is
             # submitted to the agent and acknowledged rather than waited on.
             self._handoff(rec, wiring)
-            return await self.collector.hand_to_agent(wiring, app_id, session_id, command)
+            return await self.collector.hand_to_agent(wiring, app_id, session_id, spoken)
         current_application_id.set(app_id)
         try:
             choice = await rec.measure(
                 wiring.backend.complete(
-                    [{"role": "user", "content": command}],
+                    [{"role": "user", "content": spoken}],
                     timeout=self.cfg.r2d2_fast_deadline,
                     model=wiring.spec.fast_model,
                 )
@@ -230,7 +242,7 @@ class SessionRoute:
             # the wait is bounded and a bound is not a promise.
             self.collector.note_may_leave_signal(session_id)
             return self.collector.hand_to_agent_after_the_voice_turn(
-                wiring, app_id, session_id, command, time.monotonic()
+                wiring, app_id, session_id, spoken, time.monotonic()
             )
         rec.answered(route=metrics.ROUTE_OPENCODE, model=choice.model, msgs=1, tools=())
         decision = routing.parse_voice_reply(
@@ -240,7 +252,7 @@ class SessionRoute:
             return decision.spoken, False
         self._handoff(rec, wiring)
         return await self.collector.hand_to_agent(
-            wiring, app_id, session_id, command, hint=decision.task_hint
+            wiring, app_id, session_id, spoken, hint=decision.task_hint
         )
 
     async def answer_permission(

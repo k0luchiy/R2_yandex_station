@@ -81,11 +81,21 @@ class Memory:
 
     async def _load_history(self, application_id: str) -> list[dict]:
         async with self._lock:
-            cur = await self._db.execute(
-                "SELECT history FROM sessions WHERE application_id = ?",
-                (application_id,),
-            )
-            row = await cur.fetchone()
+            return await self._load_history_unlocked(application_id)
+
+    async def _load_history_unlocked(self, application_id: str) -> list[dict]:
+        """The read half of a read-modify-write. The caller holds `_lock`.
+
+        Separate from `_load_history` so `append_message` can hold the lock across
+        BOTH halves: read, append, write. Reading under the lock and writing under
+        it again leaves a window in which another turn for the same person reads
+        the same history and its write silently drops the first turn's message.
+        """
+        cur = await self._db.execute(
+            "SELECT history FROM sessions WHERE application_id = ?",
+            (application_id,),
+        )
+        row = await cur.fetchone()
         if row is None:
             return []
         try:
@@ -98,10 +108,15 @@ class Memory:
     ) -> None:
         if not content:
             return
-        history = await self._load_history(application_id)
-        history.append({"role": role, "content": content[:4000]})
-        history = history[-max_history:]
+        # ONE lock acquisition for the whole read-modify-write. It used to take
+        # the lock to read, release it, then take it again to write -- so two
+        # turns for the same person both read the same history and the second
+        # write overwrote the first, losing a message. With the lock held across
+        # both, the second turn reads what the first wrote.
         async with self._lock:
+            history = await self._load_history_unlocked(application_id)
+            history.append({"role": role, "content": content[:4000]})
+            history = history[-max_history:]
             await self._db.execute(
                 "INSERT INTO sessions (application_id, history, updated_at) "
                 "VALUES (?, ?, ?) "

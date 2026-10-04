@@ -53,7 +53,7 @@ from core.opencode.client import (
     OpencodeClient,
     OpencodeError,
 )
-from core.opencode.session_store import OcSessionStore
+from core.opencode.session_store import BUSY, OcSessionStore
 
 BASE_URL = "http://127.0.0.1:4599"
 APP = "alice-123"
@@ -382,11 +382,15 @@ async def test_the_workspace_is_sent_as_the_directory_query_parameter(
 async def test_resolve_replaces_a_dead_session_once_and_names_it_in_a_warning(
     store: OcSessionStore, server: FakeOpencode, caplog, memory: Memory
 ):
-    # Given: a binding whose session the server no longer has
+    # Given: a binding whose session the server no longer has. The listing is left
+    # POPULATED on purpose -- an empty listing is not proof of death (see the test
+    # below), so "dead" has to be expressed the way a real server expresses it:
+    # a list of sessions that does not include ours.
     await store.resolve(APP)
     dead_id = (await memory.get_oc_session(APP)).session_id
     server.sessions.clear()
     server.status.clear()
+    server.put("ses_unrelated", "someone else's session")
     # When: the user speaks again
     with caplog.at_level(logging.WARNING, logger="core.opencode.session_store"):
         replacement = await store.resolve(APP)
@@ -396,6 +400,29 @@ async def test_resolve_replaces_a_dead_session_once_and_names_it_in_a_warning(
     binding = await memory.get_oc_session(APP)
     assert binding is not None and binding.session_id == replacement
     assert dead_id in caplog.text
+
+
+async def test_an_empty_session_listing_does_not_replace_a_bound_session(
+    store: OcSessionStore, server: FakeOpencode, memory: Memory
+):
+    """`GET /session` returning nothing is not evidence that our session died.
+
+    A server that has not finished restoring, a `?directory=` scope that does not
+    match, and a truncated answer all look exactly like an empty list. Replacing
+    the binding on that evidence reset `message_count` and dropped the user's
+    conversation without a word, so the binding is trusted instead.
+    """
+    # Given: a live binding, and a server that suddenly lists no sessions at all
+    bound = await store.resolve(APP)
+    server.sessions.clear()
+    server.status.clear()
+    # When: the user speaks again
+    resolved = await store.resolve(APP)
+    # Then: the same session is returned, and nothing was created
+    assert resolved == bound
+    assert len(server.creates_on_wire()) == 1
+    binding = await memory.get_oc_session(APP)
+    assert binding is not None and binding.session_id == bound
 
 
 async def test_resolve_adopts_a_server_session_rebound_under_our_title(
@@ -673,3 +700,106 @@ async def test_the_collector_transcript_read_does_not_borrow_the_voice_deadline(
     # ... and a voice-path read still gets the small one, so only the transcript moved
     await client.agents()
     assert seen["/agent"] == spec.timeout
+
+
+async def test_append_message_takes_the_lock_once_for_the_whole_update(tmp_path) -> None:
+    """The read and the write must be ONE critical section.
+
+    Two turns for one person can be in flight at once -- a Station and the phone,
+    or a webhook retry arriving beside the original -- and the history is stored as
+    one JSON blob, so appending is a read-modify-write. Taking the lock for the
+    read and again for the write leaves a window between them in which both turns
+    read the same history and the second write drops the first turn's message.
+    Counting acquisitions pins the invariant without depending on interleaving.
+    """
+    memory = await Memory(str(tmp_path / "sessions.db")).connect()
+    try:
+        acquisitions = 0
+        real = memory._lock
+
+        class Counting:
+            async def __aenter__(self) -> None:
+                nonlocal acquisitions
+                await real.acquire()
+                acquisitions += 1
+
+            async def __aexit__(self, *exc: object) -> None:
+                real.release()
+
+        memory._lock = Counting()  # type: ignore[assignment]
+        await memory.append_message("u", "user", "привет")
+        # Then one acquisition, not two
+        assert acquisitions == 1
+        assert [e["content"] for e in await memory.load_history("u")] == ["привет"]
+    finally:
+        memory._lock = real  # type: ignore[assignment]
+        await memory.close()
+
+
+async def test_two_concurrent_appends_both_land(tmp_path) -> None:
+    # Given one person whose gateway is answering two turns at once
+    memory = await Memory(str(tmp_path / "sessions.db")).connect()
+    try:
+        # When both append before either is read back
+        await asyncio.gather(
+            memory.append_message("u", "user", "первый"),
+            memory.append_message("u", "assistant", "второй"),
+        )
+        # Then the history holds both, in some order
+        assert {e["content"] for e in await memory.load_history("u")} == {"первый", "второй"}
+    finally:
+        await memory.close()
+
+
+async def test_a_binding_unused_past_retention_is_forgotten(
+    store: OcSessionStore, server: FakeOpencode, memory: Memory
+):
+    """`oc_sessions` grew one row per identity forever: nothing ever unbound.
+
+    `unbind_oc_session` existed and had no production caller, so every test run,
+    every throwaway identity and every abandoned experiment left its row behind.
+    This is the only caller, and the sweep is the only thing that makes forgetting
+    possible.
+    """
+    # Given a binding nobody has spoken through in longer than the window
+    await store.resolve(APP)
+    binding = await memory.get_oc_session(APP)
+    assert binding is not None
+    age(memory, APP, seconds=40 * 86_400)
+    # When the sweep runs
+    forgotten = await store.forget_unused()
+    # Then the row is gone
+    assert forgotten == 1
+    assert await memory.get_oc_session(APP) is None
+
+
+async def test_retention_never_unbinds_a_session_that_is_still_busy(
+    store: OcSessionStore, server: FakeOpencode, memory: Memory
+):
+    # Given a long-idle binding whose session is BUSY on the server
+    await store.resolve(APP)
+    binding = await memory.get_oc_session(APP)
+    assert binding is not None
+    age(memory, APP, seconds=40 * 86_400)
+    server.status[binding.session_id] = BUSY
+    # When the sweep runs
+    forgotten = await store.forget_unused()
+    # Then nothing was forgotten: `last_used_at` is refreshed by reuse but a turn
+    # in flight has not reused it yet, and dropping that binding orphans a live turn
+    assert forgotten == 0
+    assert await memory.get_oc_session(APP) is not None
+
+
+async def test_an_ordinary_gap_between_two_questions_keeps_the_session(
+    store: OcSessionStore, server: FakeOpencode, memory: Memory
+):
+    # Given a binding last used a month ago -- well inside the default window
+    await store.resolve(APP)
+    binding = await memory.get_oc_session(APP)
+    assert binding is not None
+    age(memory, APP, seconds=29 * 86_400)
+    # When the sweep runs
+    forgotten = await store.forget_unused()
+    # Then the user keeps their conversation
+    assert forgotten == 0
+    assert await memory.get_oc_session(APP) is not None
