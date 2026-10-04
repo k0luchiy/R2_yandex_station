@@ -44,6 +44,7 @@ copied, so these bytes travel through the same reader the rest of the suite uses
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import json
 import logging
 from pathlib import Path
@@ -427,3 +428,62 @@ async def test_the_three_unreadable_frame_paths_still_drop_a_body_only_frame(
     # rules it is not a malformed frame and must not cry wolf.
     assert "unreadable JSON" in caplog.text
     assert "'properties' is not an object" in caplog.text
+
+
+async def test_a_reader_that_ended_is_replaced_rather_than_counted_forever() -> None:
+    """A finished reader must not hold the slot that would restart it.
+
+    `EventSource.run` lets anything that is not an `httpx.HTTPError` or an
+    `OpencodeError` escape -- `sqlite3.OperationalError` from the broker's write
+    does -- and the finished task stayed in `_tasks`. `ensure` then skipped that
+    session forever, so its permission asks were never brokered again, while
+    `count` -- the one number an operator reads -- still said 1.
+    """
+    readers = SessionReaders(_spec(), WORKSPACE, RecordingBroker())  # type: ignore[arg-type]
+    started: list[int] = []
+
+    async def dead(self: object, app_id: str, session_id: str) -> None:
+        started.append(1)
+        raise sqlite3.OperationalError("database is locked")
+
+    readers._read = dead.__get__(readers)  # type: ignore[attr-defined]
+    readers.ensure("r2d2:alice:owner", SESSION_ID)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    # Then the reader is not being watched, and `count` says so
+    assert readers.count == 0
+    # ... and the next turn starts a new one
+    readers.ensure("r2d2:alice:owner", SESSION_ID)
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+    assert len(started) == 2
+    await readers.aclose()
+
+
+async def test_a_rebound_session_does_not_orphan_the_previous_reader() -> None:
+    """Readers are keyed by session id, so a rebind used to leak the old one.
+
+    `SessionReaders._tasks` maps SESSION -> task. When `resolve` replaced a dead
+    binding the new session got a new key and the previous reader stayed in the dict
+    under the old one, alive and reconnecting to a session nobody was bound to. It
+    was reachable only from `aclose` at shutdown, and `count` counted it, so an
+    operator watching that number saw readers for sessions that no longer existed.
+    """
+    # Given a reader running for the session a user is currently bound to
+    readers = SessionReaders(_spec(), WORKSPACE, RecordingBroker())  # type: ignore[arg-type]
+    readers.ensure("alice", "ses_old")
+    await asyncio.sleep(0)
+    assert readers.count == 1
+    # When the binding is replaced and the store drops the old session
+    readers.discard("alice", "ses_old")
+    readers.ensure("alice", "ses_new")
+    await asyncio.sleep(0)
+    # Then only the new session is watched, and the old task is finished
+    assert readers.count == 1
+    assert set(readers._tasks) == {"ses_new"}
+    old = [t for t in asyncio.all_tasks() if "ses_old" in (t.get_name() or "")]
+    assert all(t.done() for t in old)
+    # The surviving reader is closed here rather than left to the loop teardown:
+    # it opens a real connection, and a cancelled one surfaces as an unraisable
+    # "coroutine was never awaited" warning in whichever test runs next.
+    await readers.aclose()
