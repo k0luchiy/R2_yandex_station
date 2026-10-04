@@ -57,7 +57,7 @@ is the failure mode here, not a crash.
 import logging
 import re
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request
@@ -131,7 +131,14 @@ async def probe_opencode_server(cfg: Config) -> OpencodeHealth | None:
         logger.info("opencode: no 'opencode' backend in %s", cfg.backends_path)
         return None
 
-    health = await OpencodeClient(spec, cfg.resolved_workspace()).health()
+    client = OpencodeClient(spec, cfg.resolved_workspace())
+    try:
+        health = await client.health()
+    finally:
+        # The sibling probe in app/diagnostics.py closes its client and says why:
+        # an unclosed client leaks one connection pool per probe. This one built
+        # one at every process start and never closed it.
+        await client.aclose()
     if health.reachable:
         logger.info("opencode: server reachable at %s, version %s", spec.base_url, health.version)
     else:
@@ -150,67 +157,86 @@ def build_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         memory = await Memory(cfg.resolved_db_path()).connect()
-        health = await probe_opencode_server(cfg)
-        route = await wire_opencode(cfg, memory, health, OpencodeClient)
-        worker = Worker(cfg, memory, logger, route.wiring.backend if route else None)
-        brain = Brain(cfg, memory, worker, logger, opencode=route.wiring if route else None)
-        app.state.cfg = cfg
-        app.state.memory = memory
-        app.state.worker = worker
-        app.state.brain = brain
-        app.state.route = route
-        await worker.start()
-        if route is not None:
-            await route.start()
-        fallback = await diagnostics.fallback_backends(cfg, load_backend_specs)
-        # `opencode=wired`/`unwired` is the field that keeps this line from reading
-        # as a guarantee: a startup that says only "started" is what an operator
-        # with a dead opencode server (or a refused model) would take for a brain.
-        # `reason` is the same decision named, so "unwired" is never the whole
-        # answer -- it is one token of `app/route_status.py`'s vocabulary, and it
-        # says WHICH of the refusals this is. The last field is `fallback` and NOT
-        # `chain` on purpose: these are the backends `build_chain` could actually
-        # build, while `/health`'s `chain` is the declared order minus the session
-        # backend. Two different numbers under one name is how an operator
-        # concludes the health probe is lying.
-        auth = authorisation_posture(cfg)
-        if auth is not None:
-            logger.error("%s", auth)
-        status = route_status()
-        telegram = diagnostics.telegram_binding(cfg)
-        if not telegram["declared"]:
-            # Discoverability, not a behaviour change: `/tg/webhook` already refuses
-            # an undeclared chat, and it must keep refusing. What was missing is
-            # that the deployment LOOKS complete while its headline feature is inert
-            # -- long results and permission questions never arrive, and the only
-            # symptom is a Telegram chat that answers nothing.
-            logger.warning(
-                "telegram: %s is empty, so no chat has an identity. Long results and "
-                "permission questions will not arrive, /tg/webhook drops every message with a "
-                "warning, and no identity is invented for it -- one chat, one application_id, "
-                "or a 'да' in Telegram cannot answer a question asked by voice. Declare %s='%s' "
-                "and restart (pairs are separated by commas or whitespace).",
-                TG_APPLICATION_ID_VAR, TG_APPLICATION_ID_VAR,
-                f"{diagnostics.TG_BINDING_FORMAT} for each chat",
-            )
-        logger.info(
-            "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s, alice=%s, reason=%s, "
-            "telegram=%s",
-            cfg.resolved_db_path(),
-            "wired" if route is not None else "unwired",
-            route.models_label if route is not None else "none",
-            fallback,
-            "declared" if auth is None else "closed",
-            status.reason,
-            "declared" if telegram["declared"] else "unbound",
-        )
-        try:
-            yield
-        finally:
+        # Unwind is registered BEFORE the corresponding `start()`, because a
+        # callback pushed after the thing it stops cannot run in the case that
+        # matters: a startup that raises partway through. Every stop below is
+        # safe on a never-started object -- `Worker.stop` cancels and gathers two
+        # empty lists, `route.stop` returns at once behind its `_stopped` guard --
+        # so the LIFO unwind closes route, worker and memory on a failed boot in
+        # the same order as a clean one. The old code started the worker and the
+        # route, then called `fallback_backends`, and only reached its `finally`
+        # if all of that succeeded: a bad backends.json raised with the worker's
+        # loop task and the sqlite connection still open, and the traceback named
+        # the config error while saying nothing about the two objects it leaked.
+        async with AsyncExitStack() as stack:
+            stack.push_async_callback(memory.close)
+            health = await probe_opencode_server(cfg)
+            route = await wire_opencode(cfg, memory, health, OpencodeClient)
+            worker = Worker(cfg, memory, logger, route.wiring.backend if route else None)
+            # Push order is memory, worker, route: LIFO stops route, then worker,
+            # then memory. Each push must precede its `start()` -- a callback
+            # registered after the line that can raise protects nothing.
             if route is not None:
-                await route.stop()
-            await worker.stop()
-            await memory.close()
+                stack.push_async_callback(route.stop)
+            stack.push_async_callback(worker.stop)
+            brain = Brain(cfg, memory, worker, logger, opencode=route.wiring if route else None)
+            app.state.cfg = cfg
+            app.state.memory = memory
+            app.state.worker = worker
+            app.state.brain = brain
+            app.state.route = route
+            await worker.start()
+            if route is not None:
+                await route.start()
+            fallback = await diagnostics.fallback_backends(cfg, load_backend_specs)
+            # `opencode=wired`/`unwired` is the field that keeps this line from reading
+            # as a guarantee: a startup that says only "started" is what an operator
+            # with a dead opencode server (or a refused model) would take for a brain.
+            # `reason` is the same decision named, so "unwired" is never the whole
+            # answer -- it is one token of `app/route_status.py`'s vocabulary, and it
+            # says WHICH of the refusals this is. The last field is `fallback` and NOT
+            # `chain` on purpose: these are the backends `build_chain` could actually
+            # build, while `/health`'s `chain` is the declared order minus the session
+            # backend. Two different numbers under one name is how an operator
+            # concludes the health probe is lying.
+            auth = authorisation_posture(cfg)
+            if auth is not None:
+                logger.error("%s", auth)
+            status = route_status()
+            telegram = diagnostics.telegram_binding(cfg)
+            if not telegram["declared"]:
+                # Discoverability, not a behaviour change: `/tg/webhook` already refuses
+                # an undeclared chat, and it must keep refusing. What was missing is
+                # that the deployment LOOKS complete while its headline feature is inert
+                # -- long results and permission questions never arrive, and the only
+                # symptom is a Telegram chat that answers nothing.
+                logger.warning(
+                    "telegram: %s is empty, so no chat has an identity. Long results and "
+                    "permission questions will not arrive, /tg/webhook drops every message with a "
+                    "warning, and no identity is invented for it -- one chat, one application_id, "
+                    "or a 'да' in Telegram cannot answer a question asked by voice. Declare %s='%s' "
+                    "and restart (pairs are separated by commas or whitespace).",
+                    TG_APPLICATION_ID_VAR, TG_APPLICATION_ID_VAR,
+                    f"{diagnostics.TG_BINDING_FORMAT} for each chat",
+                )
+            alice_posture = (
+                "open"
+                if cfg.r2d2_allow_unauthenticated
+                else ("declared" if auth is None else "closed")
+            )
+            logger.info(
+                "R2D2 started, db=%s, opencode=%s, models=%s, fallback=%s, alice=%s, "
+                "alice_user=%s, reason=%s, telegram=%s",
+                cfg.resolved_db_path(),
+                "wired" if route is not None else "unwired",
+                route.models_label if route is not None else "none",
+                fallback,
+                alice_posture,
+                cfg.alice_user_id or "unset",
+                status.reason,
+                "declared" if telegram["declared"] else "unbound",
+            )
+            yield
 
     app = FastAPI(title="R2D2", lifespan=lifespan)
 

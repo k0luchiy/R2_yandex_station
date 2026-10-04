@@ -376,7 +376,11 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt as exc:
         return _emit(ToolResult("", ok=False, error=f"прервано: {str(exc) or 'сигнал'}"))
     except Exception as exc:
-        _LOGGER.exception("command failed")
+        # `exc_info=True` writes the traceback, and the traceback carries the
+        # exception MESSAGE -- so a stub that embeds the bot token wrote it to
+        # stderr in clear while stdout was redacted. opencode reads stderr into
+        # the agent's context, so that is the same leak by another route.
+        _LOGGER.error("command failed: %s", _redact(f"{type(exc).__name__}: {exc}"))
         return _emit(ToolResult("", ok=False, error=f"{type(exc).__name__}: {exc}"))
 
 

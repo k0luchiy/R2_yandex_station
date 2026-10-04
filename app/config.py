@@ -120,6 +120,14 @@ class Config:
     r2d2_permission_timeout: float = 300.0
     r2d2_session_soft_limit: int = 40
     r2d2_stale_session_seconds: float = 900.0
+    #: How long a session may sit UNUSED before its binding is dropped, so a
+    #: deployment accumulates one row per real user rather than one per test
+    #: run, per throwaway identity and per abandoned experiment. Deliberately
+    #: far longer than `r2d2_stale_session_seconds`, which is about a wedged
+    #: TURN and not about retention: unbinding a session a user still wants
+    #: costs them their conversation, so the window has to exceed any plausible
+    #: gap between two questions. `0` disables unbinding entirely.
+    r2d2_session_retention_seconds: float = 2_592_000.0
     r2d2_cli_path: str = "~/.r2d2/r2d2_do.py"
     r2d2_event_poll_interval: float = 2.0
 
@@ -143,6 +151,13 @@ class Config:
             raw = os.environ[key]
             if f.type is bool:
                 kwargs[f.name] = raw.strip().lower() in ("1", "true", "yes", "on")
+            elif raw.strip() == "":
+                # `SERVER_PORT=` in a .env is a blank line, not a number, and
+                # `int("")` raised ValueError at IMPORT time -- `app = build_app()`
+                # runs on import, so uvicorn died on a traceback instead of on the
+                # operator's typo. A blank reads as "not declared", which is what
+                # the dataclass default already says.
+                continue
             elif f.type is int:
                 kwargs[f.name] = int(raw)
             elif f.type is float:
