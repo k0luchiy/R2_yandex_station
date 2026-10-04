@@ -47,6 +47,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from app import diagnostics
+from core import render
 from app.config import Config
 from app.diagnostics import TG_APPLICATION_ID_VAR, ClientFactory, RegistryLoader
 from app.identity import tg_application_id
@@ -104,14 +105,27 @@ async def root() -> dict[str, str]:
 
 
 async def webhook(request: Request) -> Any:
+    """One Alice turn.
+
+    Every outcome is a **200 carrying a speakable envelope**, including a
+    refusal and a body that is not JSON at all. The platform reads only what a
+    200 returns, so a 4xx here is not a refusal to the caller -- it is Alice
+    saying "the skill is not responding" and closing the session, which is both
+    a worse answer and a silent one. The distinction that matters is still
+    visible: `text` says what happened.
+    """
+    brain: Brain = request.app.state.brain
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": "bad json"}, status_code=400)
-    brain: Brain = request.app.state.brain
+        logger.warning("webhook received a body that is not JSON; answering in band")
+        return render.alice_response(
+            "Не расслышала запрос. Попробуй ещё раз.", end_session=False
+        )
     if not brain.authorized(body):
-        return JSONResponse({"error": "forbidden"}, status_code=403)
-    return await brain.process_alice(body)
+        logger.warning("webhook refused a turn from an undeclared skill or user")
+        return render.alice_response("Доступ запрещён.", end_session=True)
+    return await brain.process(body)
 
 
 async def tg_webhook(request: Request, *, send: MessageSender) -> Any:

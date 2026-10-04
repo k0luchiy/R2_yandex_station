@@ -40,7 +40,7 @@ proves the environment is passed without a socket ever being opened; the
 password-gate tests assert that stub was never reached, so a regression that
 starts a server fails the suite instead of binding a port.
 
-allow: SIZE_OK -- 548 pure LOC, 36 tests. Every test file in this repo is 257-991
+allow: SIZE_OK -- 550 pure LOC, 36 tests. Every test file in this repo is 257-991
 pure LOC (test_opencode_client.py 991, test_sse.py 699) and a test module grows
 with the number of behaviours it pins, not with the number of concepts it owns.
 The 250 pure-LOC ceiling targets source modules; splitting this would scatter one
@@ -926,5 +926,8 @@ def _fake_client(*, unhealthy: bool = False):
             if unhealthy:
                 return OpencodeHealth(reachable=False, version=None)
             return OpencodeHealth(reachable=True, version="1.18.32")
+
+        async def aclose(self):
+            self.closed = True
 
     return FakeClient
