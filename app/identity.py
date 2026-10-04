@@ -43,9 +43,15 @@ TG_BINDING_SEPARATORS: Final = re.compile(r"[,\s]+")
 
 
 def tg_application_id(cfg: Config, chat_id: int) -> str | None:
-    """The `application_id` this Telegram chat was bound to, or `None` for no binding.
+    """The identity this Telegram chat was bound to, or `None` for no binding.
 
-    **The binding is declared, never derived.** One human is one `application_id`,
+    The identity is `session.user.user_id`, NOT
+    `session.application.application_id`: memory is keyed on the user id, and the
+    platform scopes the application id to one app, so a phone and a Station would
+    otherwise be two different people here. It is printed at startup as
+    `alice_user=`.
+
+    **The binding is declared, never derived.** One human is one user id,
     and that id is what owns their single opencode session and their single pending
     permission question -- so a Telegram turn and an Alice turn of the same person
     have to arrive under the same one, or the answer to «да» is delivered to a

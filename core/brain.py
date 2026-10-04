@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from typing import Final
 
 import httpx
 
@@ -93,11 +94,49 @@ GREETING = "Привет, я Р2Д2. Спрашивай что угодно ил
 
 ERROR_TEXT = "Что-то пошло не так. Попробуй ещё раз."
 
+#: `pending_actions` holds ONE ROW PER KEY, and two features write it: this module
+#: for a risky tool's confirmation, and `core/permissions.py` for the opencode
+#: permission broker. They wrote the SAME key, so whichever went last destroyed the
+#: other's row: a shell confirmation overwrote an outstanding ask -- which the
+#: sweep then skips, because a row with no `kind` is not a queue it can refuse --
+#: and opencode stayed blocked forever; and a broker save overwrote the
+#: confirmation, so a «да» meant for `rm -rf` was delivered to an opencode
+#: permission instead. The row key is opaque and the sweep already ignores rows
+#: that are not a queue, so the tool confirmation gets a key of its own.
+TOOL_PENDING_KEY: Final = "#tool-confirm"
+
+
+def tool_pending_key(app_id: str) -> str:
+    """The `pending_actions` key this module owns, distinct from the broker's."""
+    return f"{app_id}{TOOL_PENDING_KEY}"
+
+
 EXIT_WORDS = {"стоп", "выход", "хватит", "закончить", "до свидания", "пока", "завершить"}
 
 HELP_WORDS = {"помощь", "help", "что ты умеешь", "что умеешь", "команды", "справка", "что ты можешь"}
 
 GREET_WORDS = {"привет", "здравствуй", "здравствуйте", "салют", "добрый день", "добрый вечер", "доброе утро", "hello", "hi", "хелоу"}
+
+
+def memory_key(body: dict) -> str | None:
+    """The identity one turn is stored and answered under, or `None` for nobody.
+
+    `session.user.user_id` is one value for every device a person speaks to
+    Alice from. `session.application.application_id` is scoped to one app on one
+    skill, so a phone and a Station are two different values for the same human --
+    keying memory on it gave one person two opencode sessions, two histories and
+    two pending permission questions. So the user id is the key and the
+    application id is what is left for a caller with no account.
+
+    `None` means the body identifies nobody, and it is never replaced by a
+    placeholder. A shared literal is not a safe default: every caller that fell
+    onto it would share one session and one pending row, so a stranger's «да»
+    would execute the previous caller's stored command.
+    """
+    session = body.get("session", {})
+    return (session.get("user") or {}).get("user_id") or (
+        session.get("application") or {}
+    ).get("application_id")
 
 
 class Brain:
@@ -163,32 +202,40 @@ class Brain:
         command = (request.get("command") or "").strip()
         original = request.get("original_utterance") or ""
         new = bool(session.get("new"))
-        app_id = (
-            (session.get("application") or {}).get("application_id")
-            or (session.get("user") or {}).get("user_id")
-            or "unknown"
-        )
+        app_id = memory_key(body)
+        if app_id is None:
+            self.logger.warning(
+                "alice turn carried neither session.user.user_id nor "
+                "session.application.application_id; it is answered and not stored"
+            )
+            return "Не могу определить, кто говорит. Попробуй ещё раз.", False
 
         low = command.lower()
-        if low == "ping" or "ping" in original.lower():
+        # The platform's liveness probe is `original_utterance == "ping"`. It used
+        # to be matched as a SUBSTRING of the raw utterance, so any request
+        # containing "ping" was answered "Понг." and the real one was dropped --
+        # and `low == "ping"` never fired for the real probe at all, because a
+        # probe arrives with an empty `command`. Both fields are accepted, but
+        # only as the whole value.
+        if low == "ping" or original.strip().lower() == "ping":
             return "Понг.", False
         if low in EXIT_WORDS:
             return "До встречи.", True
 
-        pending = await self.memory.get_pending(app_id)
-        if pending is not None and PendingPermission.from_record(pending) is None:
+        pending = await self.memory.get_pending(tool_pending_key(app_id))
+        if pending is not None:
             verdict = policies.confirmation_verdict(command)
             if verdict is not None:
                 metrics.current().path = metrics.PATH_CONFIRM
             if verdict == "yes":
-                await self.memory.clear_pending(app_id)
+                await self.memory.clear_pending(tool_pending_key(app_id))
                 if pending.get("tool") == "run_shell":
                     ctx = ToolContext(self.cfg, self.memory, app_id, self.logger, approved=True)
                     result = await self.registry.execute(ctx, "run_shell", pending.get("arguments", {}))
                     return result.text, False
                 return "Готово.", False
             if verdict == "no":
-                await self.memory.clear_pending(app_id)
+                await self.memory.clear_pending(tool_pending_key(app_id))
                 return "Отменяю.", False
 
         if low in HELP_WORDS:
@@ -200,10 +247,13 @@ class Brain:
         if answered is not None:
             return answered, False
 
+        dangerous = bool((request.get("markup") or {}).get("dangerous_context"))
         wiring = self.opencode
         if wiring is not None and (await wiring.client.health()).reachable:
             try:
-                return await self.session.turn(wiring, app_id, command)
+                return await self.session.turn(
+                    wiring, app_id, command, dangerous=dangerous
+                )
             except (BackendError, httpx.HTTPError) as exc:
                 # C1: a 200 whose body is a refusal arrives here, and it is a
                 # failure -- the chain below answers, and the refusal is never spoken.
@@ -211,8 +261,7 @@ class Brain:
                     "opencode %r could not answer %s; the turn falls back to the chain: %r",
                     wiring.spec.name, app_id, exc,
                 )
-        markup = request.get("markup") or {}
-        return await self._chain_turn(app_id, command, bool(markup.get("dangerous_context")))
+        return await self._chain_turn(app_id, command, dangerous)
 
     async def _chain_turn(self, app_id: str, command: str, dangerous: bool) -> tuple[str, bool]:
         rec = metrics.current()
@@ -239,6 +288,17 @@ class Brain:
         )
         if choice.tool_calls:
             tool_call = choice.tool_calls[0]
+            if not self.registry.offers(tool_call.name):
+                # Defence in depth behind `FALLBACK_SAFE_TOOLS`: a model that was
+                # never offered a tool can still name one. Refused here rather than
+                # at the registry, because this is the line where "no agent is
+                # behind this decision" stops being an excuse.
+                self.logger.warning(
+                    "fallback chain asked for %r, which is not offered to a bare LLM; "
+                    "refused. A task belongs to the opencode agent.",
+                    tool_call.name,
+                )
+                return self._agent_unavailable(), False
             ctx = ToolContext(self.cfg, self.memory, app_id, self.logger)
             result = await self.registry.execute(ctx, tool_call.name, tool_call.arguments)
             await self.memory.append_message(app_id, "assistant", f"[{tool_call.name}]", self.cfg.max_history)
@@ -248,7 +308,7 @@ class Brain:
                 rec.escalated = True
                 await self.worker.enqueue(result.job)
             if result.needs_confirm and result.pending:
-                await self.memory.set_pending(app_id, result.pending)
+                await self.memory.set_pending(tool_pending_key(app_id), result.pending)
             return result.text or "Готово.", False
 
         text = choice.content or ""
@@ -274,7 +334,7 @@ class Brain:
         chain, specs = load_backend_specs(self.cfg)
         order = tuple(name for name in chain.order if specs[name].kind != SESSION_KIND)
         backends = build_chain(specs, BackendChain(order=order, unused=chain.unused))
-        tools = self.registry.schemas()
+        tools = self.registry.offered_schemas()
         last_error: Exception | None = None
         try:
             for backend in backends:
@@ -292,6 +352,17 @@ class Brain:
             for backend in backends:
                 await backend.aclose()
         raise RuntimeError(f"all LLM providers failed: {last_error!r}")
+
+    def _agent_unavailable(self) -> str:
+        """What to say when a task arrived with no agent to run it.
+
+        The honest answer, and deliberately not an apology: opencode is what runs
+        tasks, so with opencode down there is nobody to do this one. Saying so is
+        what keeps "a task is performed by the agent" true when the agent is not
+        there -- the alternative, a fallback improvising the task in Python, is the
+        behaviour this replaced.
+        """
+        return "Это задача для агента, а он сейчас недоступен. Попробуй позже."
 
     def _notify(self, text: str) -> None:
         """Send a Telegram notification without blocking the turn, and keep it alive.

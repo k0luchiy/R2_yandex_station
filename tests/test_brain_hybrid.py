@@ -44,7 +44,7 @@ is asking what they mean, and escalating their question to the agent would drop
 the turn on the floor. The text still reaches the session verbatim
 (`test_a_user_message_carrying_the_sentinel_is_not_an_escalation_signal`).
 
-allow: SIZE_OK -- 2020 pure LOC, a test module grows with the behaviours it pins.
+allow: SIZE_OK -- 2084 pure LOC, a test module grows with the behaviours it pins.
 """
 
 from __future__ import annotations
@@ -73,7 +73,7 @@ from core.backends.opencode_session import (
     OpencodeWiring,
     current_application_id,
 )
-from core.brain import ERROR_TEXT, GREETING, HELP_TEXT, Brain
+from core.brain import ERROR_TEXT, GREETING, HELP_TEXT, Brain, tool_pending_key
 from core.memory import Memory
 from core.opencode.client import OpencodeClient, OpencodeDeadlineExceeded
 from core.opencode.session_store import OcSessionStore, title_for
@@ -105,7 +105,7 @@ SHIPPED_DEADLINE_S: Final = 3.3
 SHIPPED_POLL_S: Final = 2.0
 
 APP: Final = "alice-app-1"
-OTHER_APP: Final = "bob-app-2"
+OTHER_USER: Final = "bob-2"
 SKILL_ID: Final = "skill-abc"
 USER_ID: Final = "user-xyz"
 
@@ -589,14 +589,18 @@ class Rig:
         self.store = store
         self.backend = backend
 
-    async def warm(self, app_id: str = APP, count: int = 6) -> str:
-        """Give `app_id` a bound session and a non-zero message count.
+    async def warm(self, user_id: str = USER_ID, count: int = 6) -> str:
+        """Give `user_id` a bound session and a non-zero message count.
 
         A brand-new session is the C8 case and has its own test; every other test
         is about a warm one, so this is the fixture's job rather than each test's.
+
+        The identity is the USER, not the application: R2D2 keys memory on
+        `session.user.user_id`, so warming an `application_id` would warm a key no
+        turn ever looks up.
         """
-        session_id = await self.store.resolve(app_id)
-        await self.memory.touch_oc_session(app_id, message_delta=count)
+        session_id = await self.store.resolve(user_id)
+        await self.memory.touch_oc_session(user_id, message_delta=count)
         return session_id
 
     async def ask(
@@ -630,7 +634,13 @@ def alice_body(
     skill_id: str = SKILL_ID,
     user_id: str = USER_ID,
 ) -> dict:
-    """One Alice `SimpleUtterance` webhook body, shaped as the platform sends it."""
+    """One Alice `SimpleUtterance` webhook body, shaped as the platform sends it.
+
+    `application_id` and `user_id` really are different values in production --
+    the platform scopes the first to one app and the second to the person -- and
+    `test_the_memory_key_is_the_user_so_two_apps_share_one_session` is what pins
+    which of the two R2D2 stores under.
+    """
     request: dict = {"type": "SimpleUtterance", "command": command}
     if original:
         request["original_utterance"] = original
@@ -970,7 +980,7 @@ async def test_an_escalated_turn_enqueues_the_collector_that_will_ship_the_answe
     assert len(jobs) == 1
     job = jobs[0]
     assert set(job) == JOB_FIELDS
-    assert (job["application_id"], job["session_id"]) == (APP, session_id)
+    assert (job["application_id"], job["session_id"]) == (USER_ID, session_id)
     # ... anchored on the last message the session held BEFORE this turn's work was
     # submitted, so the collector returns the agent's answer and never replays the
     # conversation the user already had
@@ -1147,14 +1157,14 @@ async def test_two_turns_that_escalate_arm_one_collector_each_and_never_twice(
 ) -> None:
     # Given a cold session, and then a warm one -- the two branches that submit
     # work to the agent without a deadline
-    session_id = await rig.store.resolve(APP)
+    session_id = await rig.store.resolve(USER_ID)
     assert await rig.say() == ACK
     rig.server.reply = f"Понял. {SENTINEL} собрать сводку"
     assert await rig.say() == ACK
     # When / Then: two turns, two collectors, one each
     jobs = [job for job in rig.brain.worker.jobs if job["type"] == JOB_TYPE]
     assert len(jobs) == 2
-    assert all(job["application_id"] == APP for job in jobs)
+    assert all(job["application_id"] == USER_ID for job in jobs)
     assert all(job["session_id"] == session_id for job in jobs)
     # ... a second collector for one turn would deliver the same answer twice, which
     # on a phone reads as two answers and is the failure a duplicate Telegram
@@ -1428,7 +1438,7 @@ async def test_the_collected_answer_is_the_agents_and_not_a_replay(
 # ---------------------------------------------------------------------------
 
 
-async def store_ask(rig: Rig, app_id: str = APP, title: str = "rm -rf /tmp/x") -> dict:
+async def store_ask(rig: Rig, app_id: str = USER_ID, title: str = "rm -rf /tmp/x") -> dict:
     """An unanswered `permission.asked`, stored the way the broker stores it."""
     record = {
         "kind": "opencode_permission",
@@ -1458,7 +1468,7 @@ async def test_yes_answers_a_pending_opencode_ask_with_a_one_time_approval(rig: 
     assert text != ACK and len(text) <= 60
     assert "rm -rf" not in text
     # ... the record is gone, so the same "да" cannot answer a second time
-    assert await rig.memory.get_pending(APP) is None
+    assert await rig.memory.get_pending(USER_ID) is None
     # ... and no LLM turn happened at all
     assert rig.server.turns == []
 
@@ -1469,7 +1479,7 @@ async def test_no_refuses_a_pending_opencode_ask(rig: Rig) -> None:
     text = await rig.say("нет")
     # Then
     assert [answer[2] for answer in rig.server.permission_answers] == [{"response": "reject"}]
-    assert await rig.memory.get_pending(APP) is None
+    assert await rig.memory.get_pending(USER_ID) is None
     assert rig.server.turns == []
     assert len(text) <= 60
 
@@ -1494,7 +1504,7 @@ async def test_text_that_is_not_an_answer_leaves_the_ask_pending(rig: Rig) -> No
     # Then nothing was posted to the permissions route -- "unrelated" must change
     # nothing -- and the ask is still exactly as it was
     assert rig.server.permission_answers == []
-    assert await rig.memory.get_pending(APP) == record
+    assert await rig.memory.get_pending(USER_ID) == record
     # And the turn is the F1 stated loss, not a submit into a parked session
     assert text == PARKED
     assert rig.server.turns == []
@@ -1503,7 +1513,7 @@ async def test_text_that_is_not_an_answer_leaves_the_ask_pending(rig: Rig) -> No
 async def test_the_shell_confirmation_gate_still_runs_its_own_pending_action(rig: Rig) -> None:
     # Given the OTHER feature's pending row: a risky shell command
     await rig.memory.set_pending(
-        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+        tool_pending_key(USER_ID), {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
     )
     # When the user confirms
     text = await rig.say("да")
@@ -1527,7 +1537,7 @@ async def test_a_shell_confirmation_is_not_recorded_as_a_spoken_voice_answer(
     `confirm` claims only what both channels share.
     """
     await rig.memory.set_pending(
-        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+        tool_pending_key(USER_ID), {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
     )
     caplog.set_level(logging.INFO)
     text = await rig.say("да")
@@ -1550,7 +1560,7 @@ async def test_a_refused_shell_confirmation_is_recorded_as_a_confirmation_too(
     confirmations were rare exactly when the user refused one.
     """
     await rig.memory.set_pending(
-        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+        tool_pending_key(USER_ID), {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
     )
     caplog.set_level(logging.INFO)
     await rig.say("нет")
@@ -1580,14 +1590,14 @@ async def test_an_unrelated_reply_is_not_recorded_as_a_confirmation(
     witness is named here.
     """
     await rig.memory.set_pending(
-        APP, {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
+        tool_pending_key(USER_ID), {"tool": "run_shell", "arguments": {"command": "echo r2d2-hybrid-gate-ok"}}
     )
     caplog.set_level(logging.INFO)
     await rig.say("помощь")
     fields = turn_record(caplog)
     assert fields["path"] == "voice"
     # ... and the pending action is untouched, because nothing was decided
-    pending = await rig.memory.get_pending(APP)
+    pending = await rig.memory.get_pending(tool_pending_key(USER_ID))
     assert pending is not None
     assert pending["tool"] == "run_shell"
 
@@ -1626,7 +1636,7 @@ async def test_a_question_asked_while_the_session_is_parked_is_refused_not_queue
     # And the ask is untouched: the gate refuses THIS turn, it does not answer
     # the question the user is already being asked
     assert rig.server.permission_answers == []
-    assert await rig.memory.get_pending(APP) == record
+    assert await rig.memory.get_pending(USER_ID) == record
     # And the user is told the truth, in seconds, naming the cause and the remedy
     assert text == PARKED
     assert "не выполнил" in text.lower()
@@ -1763,7 +1773,7 @@ async def test_a_hand_over_into_a_session_that_turned_busy_states_the_loss_in_te
     # When: the hand-off runs against that session
     assert rig.brain.opencode is not None
     text, escalated = await rig.brain.session.collector.hand_to_agent(
-        rig.brain.opencode, APP, session_id, QUESTION
+        rig.brain.opencode, USER_ID, session_id, QUESTION
     )
     # Then: nothing was submitted into the busy session ...
     assert [turn for turn in rig.server.turns if turn.submitted] == []
@@ -1908,7 +1918,7 @@ async def test_a_voice_turn_that_outran_the_budget_on_a_permission_ask_says_so(
 
     async def the_server_raises_an_ask() -> None:
         await hung.wait()
-        await broker.on_permission_requested(APP, session_id, "per_deadline", "ls -la", [])
+        await broker.on_permission_requested(USER_ID, session_id, "per_deadline", "ls -la", [])
 
     raised = asyncio.create_task(the_server_raises_an_ask())
     caplog.set_level(logging.INFO)
@@ -1921,7 +1931,7 @@ async def test_a_voice_turn_that_outran_the_budget_on_a_permission_ask_says_so(
     assert rig.server.aborted == []
     # ... the question really did reach the user's chat ...
     assert any("ls -la" in message for message in rig.net.telegram)
-    assert await rig.memory.get_pending(APP) is not None
+    assert await rig.memory.get_pending(USER_ID) is not None
     # ... and the record says the turn was stopped on an ask, which is what happened
     fields = turn_record(caplog)
     assert fields["path"] == "deadline"
@@ -2001,7 +2011,7 @@ async def test_the_park_refusal_does_not_wedge_the_ask_it_refused_over(rig: Rig)
     text = await rig.say("да")
     # Then: the ask was approved, and the pending row is gone
     assert [answer[2] for answer in rig.server.permission_answers] == [{"response": "once"}]
-    assert await rig.memory.get_pending(APP) is None
+    assert await rig.memory.get_pending(tool_pending_key(USER_ID)) is None
     assert len(text) <= 60
 
 
@@ -2015,7 +2025,7 @@ async def test_the_park_gate_closes_once_the_ask_is_answered(rig: Rig) -> None:
     await rig.warm()
     record = await store_ask(rig)
     await rig.say("да")
-    assert await rig.memory.get_pending(APP) is None
+    assert await rig.memory.get_pending(tool_pending_key(USER_ID)) is None
     # When: the user asks a normal question, answered in place
     rig.server.reply = ANSWER
     text = await rig.say(QUESTION)
@@ -2033,15 +2043,15 @@ async def test_an_ask_in_another_users_session_does_not_park_this_one(rig: Rig) 
     The two halves have to match, and matching only the user would make a stranger's
     ask park this user's session; matching only the session would make the check
     unreadable, because the row is stored per user. This is the direction that is
-    wrong in silence, so it is pinned: `OTHER_APP` has its own session, and its ask
+    wrong in silence, so it is pinned: `OTHER_USER` has its own session, and its ask
     must not reach across.
     """
     # Given: a warm session for this user and an ask parked on a DIFFERENT user's session
     await rig.warm()
-    other_session = await rig.store.resolve(OTHER_APP)
+    other_session = await rig.store.resolve(OTHER_USER)
     assert other_session
     await rig.memory.set_pending(
-        OTHER_APP,
+        OTHER_USER,
         {
             "kind": "opencode_permission",
             "session_id": other_session,
@@ -2172,7 +2182,7 @@ async def test_a_brand_new_session_skips_the_synchronous_voice_turn(rig: Rig) ->
     assert text == ACK
     # ... the session was created ...
     assert rig.server.route_count("POST", "/session") == 1
-    assert list(rig.server.sessions.values())[0]["title"] == title_for(APP)
+    assert list(rig.server.sessions.values())[0]["title"] == title_for(USER_ID)
     # ... and NOT ONE blocking voice turn was issued
     assert rig.server.route_count("POST", "/message") == 0
     # ... the request went to the agent instead, submitted and not awaited
@@ -2196,7 +2206,7 @@ async def test_a_cold_first_turn_enqueues_the_collector_that_will_ship_the_answe
     rig: Rig,
 ) -> None:
     # Given a user R2D2 has never asked anything, so the turn takes the C8 branch
-    session_id = await rig.store.resolve(APP)
+    session_id = await rig.store.resolve(USER_ID)
     # When
     text = await rig.say("собери последние статьи про RAG")
     # Then the ack is spoken, and the work is with the agent ...
@@ -2209,7 +2219,7 @@ async def test_a_cold_first_turn_enqueues_the_collector_that_will_ship_the_answe
     assert len(jobs) == 1
     job = jobs[0]
     assert set(job) == JOB_FIELDS
-    assert (job["application_id"], job["session_id"]) == (APP, session_id)
+    assert (job["application_id"], job["session_id"]) == (USER_ID, session_id)
     # ... anchored on an empty session: the marker is `""`, which the collector reads
     # as "everything the session ever holds is newer than this", the truth for a
     # session that was created microseconds ago
@@ -2256,7 +2266,7 @@ async def test_a_deadline_turn_is_handed_to_the_worker_as_an_opencode_reply_job(
     assert set(job) == JOB_FIELDS
     # ... carrying everything the collector needs and nothing it does not
     assert job["session_id"] == session_id
-    assert job["application_id"] == APP
+    assert job["application_id"] == USER_ID
     # ... anchored to the last message BEFORE this turn, so the collector can
     # only return text produced after it and never replays the whole session
     assert job["since_message_id"] == rig.server.hung_ids[0]
@@ -2358,7 +2368,7 @@ async def test_a_re_verification_that_stays_slow_leaves_the_answer_a_deadline_no
     assert spoken != ERROR_TEXT
     job = await _armed_job(rig)
     assert [job["type"] for job in [job]] == [JOB_TYPE]
-    assert job["application_id"] == APP
+    assert job["application_id"] == USER_ID
 
 
 async def test_a_re_verification_deadline_with_no_binding_still_falls_back(
@@ -2370,7 +2380,9 @@ async def test_a_re_verification_deadline_with_no_binding_still_falls_back(
     The turn then does what it always did on a transport failure -- the chain answers --
     which is the supported degradation rather than a new one.
     """
-    # Given: a user R2D2 has never bound, and a re-verification that cannot complete
+    # Given: this person on an app R2D2 has never bound, and a re-verification
+    # that cannot complete. The identity is unchanged -- only the app is new, which
+    # is what makes this the same human reaching the gateway somewhere else.
     async def always_slow(_app_id: str) -> str:
         raise OpencodeDeadlineExceeded("opencode: GET /session did not answer within 3.2s")
 
@@ -2868,7 +2880,7 @@ async def test_two_concurrent_fallback_turns_leave_well_formed_history(rig: Rig)
     # of two turns, none is half-written, and the row still parses. (A lost
     # update is a separate, pre-existing matter in core/memory.py -- what this
     # pins is that concurrent writes cannot CORRUPT the row.)
-    history = await rig.memory.load_history(APP)
+    history = await rig.memory.load_history(USER_ID)
     assert isinstance(history, list)
     assert history
     for entry in history:
@@ -2893,7 +2905,7 @@ async def test_no_credential_reaches_a_reply_or_a_log_record(
     await rig.warm()
     await rig.say()
     rig.server.down = True
-    await rig.ask(QUESTION, app_id=OTHER_APP)
+    await rig.ask(QUESTION, user_id=OTHER_USER)
     # Then neither the opencode password nor either provider key is in a record
     for secret in (PASSWORD, ZEN_KEY, OPENROUTER_KEY, TELEGRAM_TOKEN):
         assert secret not in caplog.text
@@ -2951,3 +2963,89 @@ async def test_a_brain_built_without_the_wiring_answers_from_the_chain(
         assert payload["response"]["text"] == FALLBACK_ANSWER
     finally:
         await memory.close()
+
+
+# ---------------------------------------------------------------------------
+# the identity a turn is stored and answered under
+# ---------------------------------------------------------------------------
+
+
+async def test_the_memory_key_is_the_user_so_two_apps_share_one_session(
+    rig: Rig,
+) -> None:
+    # Given: one person who has already spoken to R2D2, from one app
+    session_id = await rig.warm()
+    # When: the same person speaks from a DIFFERENT app -- a phone and a Station
+    # are two application ids for one human, and the platform says so
+    rig.server.requests.clear()
+    spoken = await rig.say(app_id="a-second-app")
+    # Then: it is the same session, so the warm answer comes back rather than the
+    # C8 acknowledgement a never-bound identity would earn
+    assert spoken == ANSWER
+    assert rig.server.turns[-1].session_id == session_id
+
+
+async def test_two_people_never_share_a_session_or_a_pending_question(
+    rig: Rig,
+) -> None:
+    # Given: a pending opencode ask belonging to the first person
+    session_id = await rig.warm()
+    await store_ask(rig)
+    assert await rig.memory.get_pending(USER_ID) is not None
+    # When: a different person says «да»
+    await rig.ask("да", user_id=OTHER_USER)
+    # Then: it did not answer the first person's question
+    assert await rig.memory.get_pending(USER_ID) is not None
+    assert await rig.memory.get_pending(OTHER_USER) is None
+
+
+async def test_a_body_that_identifies_nobody_is_answered_and_not_stored(
+    tmp_path: Path, net: Net
+) -> None:
+    # Given: a gateway opened to anyone, and a turn carrying neither
+    # session.user.user_id nor session.application.application_id
+    backends_path = tmp_path / "backends.json"
+    backends_path.write_text(BACKENDS_JSON, encoding="utf-8")
+    memory = await Memory(str(tmp_path / "sessions.db")).connect()
+    cfg = Config(backends_path=str(backends_path), telegram_chat_id="42",
+                 alice_skill_id=SKILL_ID, r2d2_allow_unauthenticated=True)
+    try:
+        brain = Brain(cfg, memory, RecordingWorker(cfg, memory), logging.getLogger("r2d2.test"))
+        body = alice_body(QUESTION, user_id="")
+        del body["session"]["application"]
+        # When
+        payload = await brain.process_alice(body)
+        # Then: it is told so, and nothing was written under a key nobody owns --
+        # a shared placeholder would let one stranger answer another's ask
+        assert payload["response"]["end_session"] is False
+        assert await memory.load_history("") == []
+        assert await memory.get_pending("") is None
+    finally:
+        await memory.close()
+
+
+async def test_a_shell_confirmation_and_a_brokered_ask_stop_overwriting_each_other(
+    rig: Rig,
+) -> None:
+    """`pending_actions` holds one row per key, and two features used to share it.
+
+    A risky tool's confirmation and the opencode permission broker both wrote
+    `pending_actions[app_id]`, so whichever went last destroyed the other's row.
+    The broker's row is the one that cannot be rebuilt: the sweep skips a row with
+    no `kind`, so a shell confirmation written over an outstanding ask left
+    opencode blocked on a question nobody could ever refuse, and a broker save
+    written over a confirmation answered the wrong question with the user's «да».
+    """
+    # Given a brokered ask AND a shell confirmation, for the same person
+    await rig.warm()
+    await store_ask(rig)
+    await rig.memory.set_pending(
+        tool_pending_key(USER_ID),
+        {"tool": "run_shell", "arguments": {"command": "rm -rf /tmp/x"}},
+    )
+    # Then both rows exist, each readable by its own owner
+    assert (await rig.memory.get_pending(USER_ID))["kind"] == "opencode_permission"
+    assert (await rig.memory.get_pending(tool_pending_key(USER_ID)))["tool"] == "run_shell"
+    # ... and the sweep still finds the ask, which is the half that used to vanish
+    broker_ids = list(await rig.memory.all_pending_ids())
+    assert USER_ID in broker_ids

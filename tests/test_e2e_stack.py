@@ -135,9 +135,9 @@ MODEL: Final = "opencode/space-bunny-free"
 MODEL_ID: Final = "space-bunny-free"
 
 APP_ID: Final = "alice-app-1"
-#: Somebody else's application id. A private skill has one human, so this exists
-#: only to prove that binding one chat to `APP_ID` does not answer a stranger's ask.
-OTHER_APP_ID: Final = "alice-app-2"
+#: Somebody else's user id. A private skill has one human, so this exists only
+#: to prove that binding one chat to `USER_ID` answers nobody else's ask.
+OTHER_USER: Final = "user-abc"
 SKILL_ID: Final = "skill-abc"
 USER_ID: Final = "user-xyz"
 CHAT_ID: Final = "4242"
@@ -145,7 +145,7 @@ CHAT_ID: Final = "4242"
 #: form `R2D2_TG_APPLICATION_ID` is read in: one `chat_id=application_id` pair per
 #: chat. The chat is the owner's own, so the pair names the same person their Alice
 #: turns do -- which is the whole point (section 10).
-TG_BINDING: Final = f"{CHAT_ID}={APP_ID}"
+TG_BINDING: Final = f"{CHAT_ID}={USER_ID}"
 #: A chat this deployment does not bind: the "second chat id" the identity model
 #: has to stay honest about, rather than mint an id for.
 OTHER_CHAT_ID: Final = "7777"
@@ -1237,8 +1237,8 @@ async def test_the_startup_sweep_reaps_a_session_the_server_still_calls_busy(
     }
     fake.busy_sessions.add("ses_stuck")
     memory = await Memory(str(tmp_path / "sessions.db")).connect()
-    await memory.bind_oc_session(APP_ID, "ses_stuck", "r2d2:alice:alice-app-1")
-    await memory.touch_oc_session(APP_ID, message_delta=0)
+    await memory.bind_oc_session(USER_ID, "ses_stuck", f"r2d2:alice:{USER_ID}")
+    await memory.touch_oc_session(USER_ID, message_delta=0)
     await memory.close()
     # When the app starts
     app = build_app()
@@ -1336,14 +1336,18 @@ async def test_a_model_this_server_does_not_list_refuses_the_route_and_names_the
 # ---------------------------------------------------------------------------
 
 
-async def test_a_webhook_that_is_not_json_is_a_400(stack: Stack) -> None:
+async def test_a_webhook_that_is_not_json_is_answered_in_band(stack: Stack) -> None:
     # Given a body Alice would never send
     response = await stack.http.post(
         "/webhook", content=b"{not json", headers={"content-type": "application/json"}
     )
-    # Then it is refused as bad input, in JSON, with no traceback
-    assert response.status_code == 400
-    assert json_of(response) == {"error": "bad json"}
+    # Then it is a 200 with a speakable envelope and no traceback. It used to be a
+    # 400, and the platform reads nothing from a 4xx -- so Alice said "the skill is
+    # not responding" and closed the session instead of relaying this sentence.
+    assert response.status_code == 200
+    body = json_of(response)
+    assert body["response"]["text"] and body["response"]["end_session"] is False
+    assert body["version"] == "1.0"
     assert "Traceback" not in response.text
 
 
@@ -1352,9 +1356,15 @@ async def test_a_webhook_without_a_session_is_refused_rather_than_answered(stack
     # and no skill to check -- the whitelist is the only thing between a public
     # webhook and somebody's laptop
     response = await stack.http.post("/webhook", json={"request": {"command": QUESTION}})
-    # Then it is refused, in JSON
-    assert response.status_code == 403
-    assert json_of(response) == {"error": "forbidden"}
+    # Then it is refused IN BAND: a 200 whose text says so, so the refusal reaches
+    # the speaker. A 403 says nothing the platform reads, and the refusal the
+    # project documents as spoken was unreachable behind it.
+    assert response.status_code == 200
+    body = json_of(response)
+    assert body["response"]["text"] == "Доступ запрещён."
+    assert body["response"]["end_session"] is True
+    # ... and the question was NOT answered: the refusal is not a turn
+    assert QUESTION not in body["response"]["text"]
 
 
 async def test_no_credential_reaches_a_log_record_a_body_or_the_server(
@@ -1538,11 +1548,11 @@ async def test_a_parked_session_refuses_the_question_in_the_users_own_chat(
     """
     # Given: a warm session with an ask of ours still unanswered
     memory: Memory = stack.app.state.memory
-    session_id = await stack.app.state.route.wiring.store.resolve(APP_ID)
+    session_id = await stack.app.state.route.wiring.store.resolve(USER_ID)
     await stack.warm()
     stack.fake.turns.clear()
     await memory.set_pending(
-        APP_ID,
+        USER_ID,
         {
             "kind": "opencode_permission",
             "session_id": session_id,
@@ -1591,12 +1601,12 @@ async def test_an_alice_turn_and_a_telegram_turn_are_the_same_person(stack: Stac
     # Then exactly one opencode session exists for that human ...
     assert stack.asked("POST", "/session") == 1
     assert {entry["title"] for entry in stack.fake.sessions.values()} == {
-        f"r2d2:alice:{APP_ID}"
+        f"r2d2:alice:{USER_ID}"
     }
     # ... one binding row, carrying the id the owner's Alice turns already used ...
     memory: Memory = stack.app.state.memory
     bindings = await memory.all_oc_sessions()
-    assert [binding.application_id for binding in bindings] == [APP_ID]
+    assert [binding.application_id for binding in bindings] == [USER_ID]
     # ... and both turns went to that one session
     assert {turn.session_id for turn in stack.turns()} == set(stack.fake.sessions)
 
@@ -1605,9 +1615,9 @@ async def test_a_yes_in_telegram_answers_the_ask_the_alice_turn_raised(stack: St
     # Given an ask this person's agent raised on their Alice-side session
     memory: Memory = stack.app.state.memory
     store = stack.app.state.route.wiring.store
-    session_id = await store.resolve(APP_ID)
+    session_id = await store.resolve(USER_ID)
     await memory.set_pending(
-        APP_ID,
+        USER_ID,
         {
             "kind": "opencode_permission",
             "session_id": session_id,
@@ -1623,7 +1633,7 @@ async def test_a_yes_in_telegram_answers_the_ask_the_alice_turn_raised(stack: St
     assert stack.fake.answers() == ["once"]
     assert stack.fake.permission_answers[0][0] == session_id
     # And the row is closed, so the same word cannot approve a second time
-    assert await memory.get_pending(APP_ID) is None
+    assert await memory.get_pending(USER_ID) is None
     # And the user was told it was accepted
     await stack.telegram.wait_for(APPROVED_TEXT)
 
@@ -1634,7 +1644,7 @@ async def test_a_telegram_chat_with_no_declared_identity_answers_nothing_and_say
 ) -> None:
     # Given a deployment whose binding names a DIFFERENT chat, so this one has no
     # identity -- the misconfiguration, not the default
-    install(tmp_path, monkeypatch, r2d2_tg_application_id=f"{OTHER_CHAT_ID}={APP_ID}")
+    install(tmp_path, monkeypatch, r2d2_tg_application_id=f"{OTHER_CHAT_ID}={USER_ID}")
     fake = serve_in_process
     app = build_app()
     async with app.router.lifespan_context(app):
@@ -1661,12 +1671,13 @@ async def test_a_telegram_chat_with_no_declared_identity_answers_nothing_and_say
 
 async def test_the_binding_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     # Given the operator's declaration in the environment, not in a test double
-    monkeypatch.setenv("R2D2_TG_APPLICATION_ID", f"{CHAT_ID}={APP_ID}")
+    monkeypatch.setenv("R2D2_TG_APPLICATION_ID", f"{CHAT_ID}={USER_ID}")
     # When the configuration is loaded the way the app loads it
     cfg = Config.load()
-    # Then the chat resolves to that human's application id
-    assert cfg.r2d2_tg_application_id == f"{CHAT_ID}={APP_ID}"
-    assert main_module.tg_application_id(cfg, int(CHAT_ID)) == APP_ID
+    # Then the chat resolves to that human's user id -- the value a memory key is
+    # built from, which is what makes one person one session across both channels
+    assert cfg.r2d2_tg_application_id == f"{CHAT_ID}={USER_ID}"
+    assert main_module.tg_application_id(cfg, int(CHAT_ID)) == USER_ID
     # And a chat the declaration does not name resolves to nothing at all
     assert main_module.tg_application_id(cfg, int(OTHER_CHAT_ID)) is None
 
@@ -1674,13 +1685,13 @@ async def test_the_binding_is_read_from_the_environment(monkeypatch: pytest.Monk
 async def test_a_yes_answers_the_ask_of_this_person_and_nobody_elses(stack: Stack) -> None:
     # Given an ask pending under ANOTHER application id, and one of this person's
     memory: Memory = stack.app.state.memory
-    session_id = await stack.app.state.route.wiring.store.resolve(APP_ID)
-    for app_id, permission_id in ((OTHER_APP_ID, "perm_stranger"), (APP_ID, "perm_own")):
+    session_id = await stack.app.state.route.wiring.store.resolve(USER_ID)
+    for app_id, permission_id in ((OTHER_USER, "perm_stranger"), (USER_ID, "perm_own")):
         await memory.set_pending(
             app_id,
             {
                 "kind": "opencode_permission",
-                "session_id": session_id if app_id == APP_ID else "ses_stranger",
+                "session_id": session_id if app_id == USER_ID else "ses_stranger",
                 "permission_id": permission_id,
                 "title": "echo привет",
                 "always": ["echo *"],
@@ -1694,7 +1705,7 @@ async def test_a_yes_answers_the_ask_of_this_person_and_nobody_elses(stack: Stac
         (session_id, "perm_own", {"response": "once"})
     ]
     # And the other row is untouched, so the binding does not blur identities
-    stranger = await memory.get_pending(OTHER_APP_ID)
+    stranger = await memory.get_pending(OTHER_USER)
     assert stranger is not None and stranger["permission_id"] == "perm_stranger"
 
 
@@ -1702,10 +1713,10 @@ def test_a_second_chat_is_bound_by_declaration_and_a_mistake_binds_nothing(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # Given a declaration naming two chats, so a second human is possible
-    cfg = Config(r2d2_tg_application_id=f"{CHAT_ID}={APP_ID}, {OTHER_CHAT_ID}={OTHER_APP_ID}")
+    cfg = Config(r2d2_tg_application_id=f"{CHAT_ID}={USER_ID}, {OTHER_CHAT_ID}={OTHER_USER}")
     # When each chat is resolved
-    assert main_module.tg_application_id(cfg, int(CHAT_ID)) == APP_ID
-    assert main_module.tg_application_id(cfg, int(OTHER_CHAT_ID)) == OTHER_APP_ID
+    assert main_module.tg_application_id(cfg, int(CHAT_ID)) == USER_ID
+    assert main_module.tg_application_id(cfg, int(OTHER_CHAT_ID)) == OTHER_USER
     # Then a chat nobody declared resolves to nothing, and no id is derived from it
     assert main_module.tg_application_id(cfg, 1) is None
     # And given a declaration with a token this build cannot read ...
@@ -1716,3 +1727,38 @@ def test_a_second_chat_is_bound_by_declaration_and_a_mistake_binds_nothing(
     # Then the operator is told WHICH variable holds the mistake
     assert main_module.TG_APPLICATION_ID_VAR in caplog.text
     assert "alice-main" in caplog.text
+
+
+async def test_a_startup_that_fails_after_the_worker_started_still_closes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, serve_in_process: FakeOpencode,
+    telegram: Telegram,
+) -> None:
+    """A boot that raises partway through must not leave the worker's task running.
+
+    `fallback_backends` reads the registry a second time, after the worker and the
+    opencode route have already been started. When it raised, the old `finally`
+    was never reached: the worker's `_loop` task, the route's readers, the broker's
+    sweep and the sqlite connection all stayed open, and the traceback named only
+    the config error. The process then exits with live tasks, which is exactly the
+    "Task was destroyed but it is pending" warning nobody reads.
+    """
+    # Given a startup that raises after the worker and the route are already running
+    install(tmp_path, monkeypatch)
+
+    async def refuse(*args: object, **kwargs: object) -> list[str]:
+        raise RuntimeError("registry unreadable")
+
+    monkeypatch.setattr("app.main.diagnostics.fallback_backends", refuse)
+    app = build_app()
+    mine = asyncio.current_task()
+    before = {task for task in asyncio.all_tasks() if task is not mine}
+
+    # When the lifespan is entered
+    with pytest.raises(RuntimeError, match="registry unreadable"):
+        async with app.router.lifespan_context(app):
+            pass
+
+    await asyncio.sleep(0.05)
+    after = {task for task in asyncio.all_tasks() if task is not mine and not task.done()}
+    # Then the failure surfaces, and nothing it started is still running
+    assert not after - before
