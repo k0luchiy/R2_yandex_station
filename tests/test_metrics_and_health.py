@@ -47,7 +47,7 @@ RED phase of todo 17 has to be able to run the route tests against the old
 `/health`, and a module-level import of a module that does not exist yet would
 stop the whole file at collection.
 
-allow: SIZE_OK -- 748 pure LOC, 25 tests. Test modules in this repo run from 44 pure
+allow: SIZE_OK -- 758 pure LOC, 25 tests. Test modules in this repo run from 44 pure
 LOC to 1928 (`test_brain_hybrid.py`), and a test module grows with the number of
 behaviours it pins, not with the number of concepts it owns. The 250 pure-LOC
 ceiling targets source modules; splitting this would scatter one contract -- what an
@@ -132,6 +132,7 @@ WORKSPACE_NAME: Final = "r2d2-workspace-MUST-NOT-LEAK"
 QUESTION: Final = "что такое квантовые точки"
 ANSWER: Final = "Квантовая точка — это наночастица."
 SPOKEN: Final = "Собираю сводку, пришлю в телеграм."
+AGENT_ABSENT: Final = "Это задача для агента, а он сейчас недоступен. Попробуй позже."
 HELP_PREFIX: Final = "Я Р2Д2"
 ERROR_TEXT: Final = "Что-то пошло не так. Попробуй ещё раз."
 ACK: Final = Config().r2d2_task_ack
@@ -942,25 +943,40 @@ async def test_the_recorded_durations_are_real_and_ordered(
     assert total_ms < BUDGET_MS
 
 
-async def test_a_turn_that_hands_work_to_the_background_is_recorded_as_an_escalation(
+async def test_a_fallback_llm_cannot_run_a_task_the_agent_owns(
     turn_rig: TurnRig, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Given a fallback LLM that answers with a TOOL CALL rather than text -- the
-    # ack-then-background pattern docs/07 is built on
+    # Given a fallback LLM that answers with a TOOL CALL for a task-shaped tool --
+    # the shape it used to be able to execute in process, with no agent behind it
     caplog.set_level(logging.INFO)
     turn_rig.answer_with(calling_tool("arxiv_search", {"query": "rag"}))
     # When
     payload = await turn_rig.brain.process_alice(alice_body("пришли мне свежие статьи про RAG с arxiv"))
-    # Then the user is acknowledged with the tool's own spoken_reply ...
-    assert payload["response"]["text"] == SPOKEN
-    # ... the tool that ran is named in the record ...
+    # Then the task did NOT run: the user is told the agent is what runs tasks, and
+    # is unavailable -- not handed a Python-improvised digest
+    assert payload["response"]["text"] == AGENT_ABSENT
+    assert payload["response"]["text"] != SPOKEN
+    # ... the refusal is in the journal, because a security-relevant refusal that
+    # only the code knows about is indistinguishable from a model that changed its mind
+    assert "not offered to a bare LLM" in caplog.text
+    # ... and the turn is recorded as a refusal, not as work moved to the background
     fields = one_turn_record(caplog)
-    assert fields["tools"] == "('arxiv_search',)"
-    # ... and the turn is recorded as an ESCALATION rather than as an answer: the
-    # voice budget was met by moving the work, which is a different fact, and the
-    # one that explains a 4.5 s turn with a 40 ms number in it
-    assert fields["path"] == "escalate"
-    assert fields["escalated"] == "True"
+    assert fields["escalated"] == "False"
+
+
+async def test_a_fallback_llm_keeps_the_read_only_capability_it_is_allowed(
+    turn_rig: TurnRig, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Given a fallback LLM asking for the one tool that reads a fact and changes
+    # nothing -- the basic capability the partition deliberately keeps
+    caplog.set_level(logging.INFO)
+    turn_rig.answer_with(calling_tool("system_status", {}))
+    # When
+    payload = await turn_rig.brain.process_alice(alice_body("сколько заряда"))
+    # Then it ran, and the tool that ran is named in the record
+    assert payload["response"]["text"] != AGENT_ABSENT
+    fields = one_turn_record(caplog)
+    assert fields["tools"] == "('system_status',)"
 
 
 async def test_a_fixed_reply_costs_no_model_call(
