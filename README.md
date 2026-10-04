@@ -422,6 +422,32 @@ contributor should read before touching the permission matrix.
 Два файла с номером 11 — это не опечатка: первый содержит сырые измерения,
 второй — описание того, как код на них опирается.
 
+### `docs/platform/` — сама платформа
+
+Отдельная папка: файлы `docs/` выше описывают **этот проект**, а `docs/platform/` — **платформу
+Алисы**, на которой он работает. Почти каждое решение R2D2 упирается в ограничение платформы,
+поэтому эти ограничения описаны отдельно и с источниками.
+
+| Файл | О чём |
+|---|---|
+| [docs/platform/README.md](docs/platform/README.md) | Индекс, легенда достоверности, приём чтения документации |
+| [docs/platform/01-console-and-lifecycle.md](docs/platform/01-console-and-lifecycle.md) | Консоль, приватный/публичный, модерация, публикация |
+| [docs/platform/02-protocol-reference.md](docs/platform/02-protocol-reference.md) | Запрос и ответ построчно, все лимиты, таймаут |
+| [docs/platform/03-response-surface.md](docs/platform/03-response-surface.md) | `text`, `tts`, карточки, кнопки, медиа |
+| [docs/platform/04-nlu-intents-entities.md](docs/platform/04-nlu-intents-entities.md) | `nlu`, интенты, слоты, грамматика в консоли |
+| [docs/platform/05-station-and-activation.md](docs/platform/05-station-and-activation.md) | Станция как поверхность без экрана, активация имени |
+| [docs/platform/06-scripts-and-voice.md](docs/platform/06-scripts-and-voice.md) | Нормализация реплики, TTS/SSML, голоса |
+| [docs/platform/07-hosting-and-webhook.md](docs/platform/07-hosting-and-webhook.md) | HTTPS, сертификаты, туннели, стабильный адрес |
+| [docs/platform/08-errors-and-debugging.md](docs/platform/08-errors-and-debugging.md) | Симптом → причина → диагностика |
+| [docs/platform/09-identity-and-access.md](docs/platform/09-identity-and-access.md) | Идентификаторы, OAuth, стейты |
+| [docs/platform/10-smart-home-iot.md](docs/platform/10-smart-home-iot.md) | Навыки Умного дома, MQTT |
+| [docs/platform/11-pitfalls-and-recipes.md](docs/platform/11-pitfalls-and-recipes.md) | **Несуществующие поля, ловушки, рецепты** |
+| [docs/platform/12-sources.md](docs/platform/12-sources.md) | Источники с датами обращения |
+
+Три вывода, которые стоит знать до чтения остального: **таймаут 4,5 с** — целиком, включая сеть;
+**весь ответ ≤ 5000 символов**, а `text` и `tts` — по 1024; **Станция — поверхность без
+экрана**, поэтому карточки в ответе не отображаются.
+
 The live-run evidence, including the defects that measurement found and the fix
 for each, is in [`qa/live-run.md`](qa/live-run.md) and its successors.
 
