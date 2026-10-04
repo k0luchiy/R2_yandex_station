@@ -36,7 +36,7 @@ as the wiring:
   `SessionWatchingStore.resolve` is the one public method through which a new
   session can appear.
 
-allow: SIZE_OK -- 371 pure LOC, over the 250 ceiling because the C1 gate carries the
+allow: SIZE_OK -- 410 pure LOC, over the 250 ceiling because the C1 gate carries the
 closed vocabulary that names its outcomes, and most of that is docstrings recording
 decisions an operator has to be able to re-derive. The separable half is
 `SessionReaders` + `SessionWatchingStore` (the event fleet), and splitting it out
@@ -134,8 +134,15 @@ class SessionReaders:
 
     @property
     def count(self) -> int:
-        """How many sessions are being read. The only thing an operator needs to see."""
-        return len(self._tasks)
+        """How many sessions are being read RIGHT NOW. The only thing an operator
+        needs to see, so a finished reader must not be counted: `ensure` skips a
+        session whose entry is still there, and a reader that raised once --
+        `sqlite3.OperationalError` out of the broker's write is not an
+        `httpx.HTTPError`, so it escapes `EventSource.run` -- left its entry
+        behind. `count` then read 1 for a session nothing was watching, which is
+        the one number an operator would believe.
+        """
+        return sum(1 for task in self._tasks.values() if not task.done())
 
     def ensure(self, app_id: str, session_id: str) -> None:
         """Start a reader for this session unless one is already running.
@@ -144,13 +151,36 @@ class SessionReaders:
         per already-bound session at startup, so a returning user's permission asks
         can be heard without waiting for them to ask a question first.
         """
-        if session_id in self._tasks:
+        existing = self._tasks.get(session_id)
+        if existing is not None and not existing.done():
             return
+        if existing is not None:
+            log.warning(
+                "opencode events: reader for session %s ended; starting a new one", session_id
+            )
+            self._tasks.pop(session_id, None)
         self._tasks[session_id] = asyncio.create_task(
             self._read(app_id, session_id), name=f"r2d2-opencode-events:{session_id}"
         )
         log.info(
             "opencode events: watching session %s of %s for permission asks", session_id, app_id
+        )
+
+    def discard(self, app_id: str, session_id: str) -> None:
+        """Stop and forget the reader of a session this user is no longer bound to.
+
+        The tasks are keyed by SESSION id, so replacing a dead binding used to leave
+        the previous reader running under its own key forever -- alive, reconnecting
+        to a session nobody is bound to, and reachable only from `aclose` at
+        shutdown. Every rebind leaked one, and nothing in the process could see it.
+        """
+        task = self._tasks.pop(session_id, None)
+        if task is None or task.done():
+            return
+        task.cancel()
+        log.info(
+            "opencode events: stopped the reader of session %s: %s is no longer bound to it",
+            session_id, app_id,
         )
 
     async def aclose(self) -> None:
@@ -161,7 +191,9 @@ class SessionReaders:
         for task in tasks:
             task.cancel()
         for task in tasks:
-            with suppress(asyncio.CancelledError):
+            # A reader that already ended on an exception re-raises it here, and
+            # shutdown must not fail because a background reader died earlier.
+            with suppress(asyncio.CancelledError, Exception):
                 await task
         if tasks:
             log.info("opencode events: %d reader(s) stopped", len(tasks))
@@ -173,6 +205,16 @@ class SessionReaders:
         events = EventSource(self._spec, self._directory, session_id=session_id)
         try:
             await events.run(self._handler(app_id, session_id), stop=self._stop)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # `EventSource.run` re-raises anything that is not a transport error --
+            # a `sqlite3.OperationalError` from the broker's write qualifies -- and a
+            # task that ends on an exception nobody retrieves is how this stayed
+            # invisible: `ensure` saw a live entry, the ask was never brokered again,
+            # and the reason surfaced only as "Task exception was never retrieved" at
+            # collection. It is logged here, where the session is in scope.
+            log.exception("opencode events: reader for session %s of %s ended", session_id, app_id)
         finally:
             # The reader owns the EventSource it built, so cancelling the task
             # closes the connection instead of leaving a pool behind per session.
@@ -220,7 +262,10 @@ class SessionWatchingStore(OcSessionStore):
         self._readers = readers
 
     async def resolve(self, application_id: str) -> str:
+        previous = await self._memory.get_oc_session(application_id)
         session_id = await super().resolve(application_id)
+        if previous is not None and previous.session_id != session_id:
+            self._readers.discard(application_id, previous.session_id)
         self._readers.ensure(application_id, session_id)
         return session_id
 
@@ -333,10 +378,20 @@ async def wire_opencode(
     readers = SessionReaders(spec, cfg.resolved_workspace(), broker, turns)
     store = SessionWatchingStore(memory, client, cfg, readers)
     backend = OpencodeSessionBackend(spec, OpencodeWiring(client=client, store=store, cfg=cfg))
-    await _reattach(readers, memory)
     status = await _validated(backend, spec, reachable=bool(health and health.reachable))
     if not status.wired:
+        # Order matters: `_reattach` starts a reader per already-bound session, and
+        # a reader is a task holding an SSE connection. Attaching BEFORE this gate
+        # meant that a refusal here -- which is the ORDINARY outcome on a machine
+        # whose opencode does not serve the configured model -- returned None with
+        # those tasks still running, and `main.py` only stops the readers when it
+        # gets a route back. Nobody held a reference, so they reconnected for the
+        # life of the process. The client was leaked the same way.
+        await readers.aclose()
+        with suppress(Exception):
+            await client.aclose()
         return None
+    await _reattach(readers, memory)
     wiring = HybridWiring(spec=spec, client=client, store=store, backend=backend,
                           broker=broker, turns=turns)
     decide(status)
@@ -398,6 +453,7 @@ async def _reap_forever(store: OcSessionStore, interval_s: float = REAP_INTERVAL
     while True:
         await asyncio.sleep(interval_s)
         await store.reap()
+        await store.forget_unused()
 
 
 async def _reattach(readers: SessionReaders, memory: Memory) -> None:
